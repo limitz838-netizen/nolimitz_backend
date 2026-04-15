@@ -15,8 +15,7 @@ mt5_lock = threading.Lock()
 MT5_TERMINAL_PATH = r"C:\Users\user\Desktop\NolimitzMT5Verifier\terminal64.exe"
 
 # Add your own secret here and use same secret from backend
-VERIFIER_SECRET = "nolimitz_super_secure_9283_!@#_mt5_bridge"
-
+VERIFIER_SECRET = "nolimitz_super_secret_123"
 
 class MT5VerifyRequest(BaseModel):
     login: str

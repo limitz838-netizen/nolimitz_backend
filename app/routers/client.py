@@ -88,6 +88,9 @@ def verify_mt5_credentials(mt_login: str, mt_password: str, mt_server: str):
                 "password": mt_password,
                 "server": mt_server,
             },
+            headers={
+                "x-api-key": "nolimitz_super_secret_123"
+            },
             timeout=MT5_VERIFY_TIMEOUT_SECONDS,
         )
     except Exception as e:
