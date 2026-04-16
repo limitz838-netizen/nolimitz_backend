@@ -82,9 +82,6 @@ def get_ea_by_code_for_admin(ea_code: str, current_admin: Admin, db: Session) ->
     if not ea:
         raise HTTPException(status_code=404, detail="EA code not found or inactive")
 
-    if ea.mode_type != "robot":
-        raise HTTPException(status_code=400, detail="Copier endpoints only work with robot mode EAs")
-
     return ea
 
 

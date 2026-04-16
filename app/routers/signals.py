@@ -52,9 +52,6 @@ def push_signal(
     if not ea:
         raise HTTPException(status_code=404, detail="EA not found or inactive")
 
-    if ea.mode_type != "signal":
-        raise HTTPException(status_code=400, detail="Only signal mode EAs can push manual signals")
-
     symbol = payload.symbol.upper().strip()
     action = payload.action.lower().strip()
 
