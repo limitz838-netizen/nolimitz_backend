@@ -396,7 +396,9 @@ def save_master_account(
             mt_login=str(mt_login),
             mt_password=str(mt_password),
             mt_server=str(mt_server),
-            is_verified=False,
+            is_connected=False,
+            account_name=None,
+            broker_name=None,
         )
         db.add(account)
     else:
@@ -404,7 +406,7 @@ def save_master_account(
         account.mt_login = str(mt_login)
         account.mt_password = str(mt_password)
         account.mt_server = str(mt_server)
-        account.is_verified = False
+        account.is_connected = False
         account.account_name = None
         account.broker_name = None
 
@@ -435,7 +437,7 @@ def mark_master_connected(
     account_name = data.get("account_name")
     broker_name = data.get("broker_name")
 
-    account.is_verified = True
+    account.is_connected = True
     account.account_name = account_name
     account.broker_name = broker_name
 
@@ -461,13 +463,13 @@ def get_master_account_status(
     if not account:
         return {
             "connected": False,
-            "is_verified": False,
+            "is_connected": False,
             "message": "No master account saved yet",
         }
 
     return {
-        "connected": bool(account.is_verified),
-        "is_verified": bool(account.is_verified),
+        "connected": bool(account.is_connected),
+        "is_connected": bool(account.is_connected),
         "ea_id": account.ea_id,
         "mt_login": account.mt_login,
         "mt_password": account.mt_password,
@@ -485,11 +487,11 @@ def get_master_account(
     account = db.query(MasterAccount).filter_by(admin_id=current_admin.id).first()
 
     if not account:
-        return {"connected": False}
+        return {"connected": False, "is_connected": False}
 
     return {
-        "connected": bool(account.is_verified),
-        "is_verified": bool(account.is_verified),
+        "connected": bool(account.is_connected),
+        "is_connected": bool(account.is_connected),
         "ea_id": account.ea_id,
         "mt_login": account.mt_login,
         "mt_server": account.mt_server,

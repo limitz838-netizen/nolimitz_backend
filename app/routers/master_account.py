@@ -74,115 +74,128 @@ def get_current_admin(
     return admin
 
 
-@router.post("/save")
+@router.post("/master-account/save")
 def save_master_account(
-    payload: MasterAccountSaveRequest,
-    current_admin: Admin = Depends(get_current_admin),
+    data: dict,
+    current_admin: Admin = Depends(get_current_approved_admin),
+    db: Session = Depends(get_db),
 ):
-    data = read_storage()
-    admin_key = str(current_admin.id)
+    ea_id = data.get("ea_id")
+    mt_login = data.get("mt_login")
+    mt_password = data.get("mt_password")
+    mt_server = data.get("mt_server")
 
-    existing = data.get(admin_key, {})
+    if not ea_id or not mt_login or not mt_password or not mt_server:
+        raise HTTPException(status_code=400, detail="All fields are required")
 
-    data[admin_key] = {
-        "admin_id": current_admin.id,
-        "ea_id": payload.ea_id,
-        "mt_login": str(payload.mt_login).strip(),
-        "mt_password": str(payload.mt_password).strip(),
-        "mt_server": str(payload.mt_server).strip(),
-        "connected": existing.get("connected", False),
-        "account_name": existing.get("account_name"),
-        "broker_name": existing.get("broker_name"),
-        "verified": existing.get("verified", False),
-        "last_verified_at": existing.get("last_verified_at"),
-        "updated_at": datetime.utcnow().isoformat(),
-    }
+    account = db.query(MasterAccount).filter_by(admin_id=current_admin.id).first()
 
-    write_storage(data)
-
-    return {
-        "success": True,
-        "message": "Master account saved successfully",
-        "connected": data[admin_key]["connected"],
-    }
-
-
-@router.post("/verify")
-def verify_master_account(
-    payload: MasterAccountVerifyRequest,
-    current_admin: Admin = Depends(get_current_admin),
-):
-    mt_login = str(payload.mt_login).strip()
-    mt_password = str(payload.mt_password).strip()
-    mt_server = str(payload.mt_server).strip()
-
-    if not mt_login or not mt_password or not mt_server:
-        raise HTTPException(
-            status_code=400,
-            detail="MT login, password and server are required",
+    if not account:
+        account = MasterAccount(
+            admin_id=current_admin.id,
+            ea_id=int(ea_id),
+            mt_login=str(mt_login),
+            mt_password=str(mt_password),
+            mt_server=str(mt_server),
+            is_connected=False,
+            account_name=None,
+            broker_name=None,
         )
+        db.add(account)
+    else:
+        account.ea_id = int(ea_id)
+        account.mt_login = str(mt_login)
+        account.mt_password = str(mt_password)
+        account.mt_server = str(mt_server)
+        account.is_connected = False
+        account.account_name = None
+        account.broker_name = None
 
-    data = read_storage()
-    admin_key = str(current_admin.id)
-
-    # For now this is a working backend version that marks the account verified
-    # once all fields are provided. Later you can connect this to a real MT5
-    # bridge/verification service.
-    account_name = f"Master {mt_login}"
-    broker_name = mt_server
-
-    data[admin_key] = {
-        "admin_id": current_admin.id,
-        "ea_id": payload.ea_id,
-        "mt_login": mt_login,
-        "mt_password": mt_password,
-        "mt_server": mt_server,
-        "connected": True,
-        "account_name": account_name,
-        "broker_name": broker_name,
-        "verified": True,
-        "last_verified_at": datetime.utcnow().isoformat(),
-        "updated_at": datetime.utcnow().isoformat(),
-    }
-
-    write_storage(data)
+    db.commit()
+    db.refresh(account)
 
     return {
         "success": True,
-        "connected": True,
-        "account_name": account_name,
-        "broker_name": broker_name,
-        "message": "Master MT5 account verified successfully",
+        "message": "Master account saved. Waiting for bridge connection...",
+        "connected": False,
+        "ea_id": account.ea_id,
+        "mt_login": account.mt_login,
+        "mt_server": account.mt_server,
     }
 
 
-@router.get("/status")
-def master_account_status(
-    current_admin: Admin = Depends(get_current_admin),
+@router.post("/master-account/connected")
+def mark_master_connected(
+    data: dict,
+    current_admin: Admin = Depends(get_current_approved_admin),
+    db: Session = Depends(get_db),
 ):
-    data = read_storage()
-    admin_key = str(current_admin.id)
-    item = data.get(admin_key)
+    account = db.query(MasterAccount).filter_by(admin_id=current_admin.id).first()
 
-    if not item:
+    if not account:
+        raise HTTPException(status_code=404, detail="Master account not found")
+
+    account_name = data.get("account_name")
+    broker_name = data.get("broker_name")
+
+    account.is_connected = True
+    account.account_name = account_name
+    account.broker_name = broker_name
+
+    db.commit()
+    db.refresh(account)
+
+    return {
+        "success": True,
+        "message": "Master account connected",
+        "connected": True,
+        "account_name": account.account_name,
+        "broker_name": account.broker_name,
+    }
+
+
+@router.get("/master-account/status")
+def get_master_account_status(
+    current_admin: Admin = Depends(get_current_approved_admin),
+    db: Session = Depends(get_db),
+):
+    account = db.query(MasterAccount).filter_by(admin_id=current_admin.id).first()
+
+    if not account:
         return {
             "connected": False,
-            "account_name": None,
-            "broker_name": None,
-            "ea_id": None,
-            "mt_login": None,
-            "mt_server": None,
-            "verified": False,
-            "last_verified_at": None,
+            "is_connected": False,
+            "message": "No master account saved yet",
         }
 
     return {
-        "connected": bool(item.get("connected", False)),
-        "account_name": item.get("account_name"),
-        "broker_name": item.get("broker_name"),
-        "ea_id": item.get("ea_id"),
-        "mt_login": item.get("mt_login"),
-        "mt_server": item.get("mt_server"),
-        "verified": bool(item.get("verified", False)),
-        "last_verified_at": item.get("last_verified_at"),
+        "connected": bool(account.is_connected),
+        "is_connected": bool(account.is_connected),
+        "ea_id": account.ea_id,
+        "mt_login": account.mt_login,
+        "mt_password": account.mt_password,
+        "mt_server": account.mt_server,
+        "account_name": account.account_name,
+        "broker_name": account.broker_name,
+    }
+
+
+@router.get("/master-account")
+def get_master_account(
+    current_admin: Admin = Depends(get_current_approved_admin),
+    db: Session = Depends(get_db),
+):
+    account = db.query(MasterAccount).filter_by(admin_id=current_admin.id).first()
+
+    if not account:
+        return {"connected": False, "is_connected": False}
+
+    return {
+        "connected": bool(account.is_connected),
+        "is_connected": bool(account.is_connected),
+        "ea_id": account.ea_id,
+        "mt_login": account.mt_login,
+        "mt_server": account.mt_server,
+        "account_name": account.account_name,
+        "broker_name": account.broker_name,
     }
