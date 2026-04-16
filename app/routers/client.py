@@ -1,7 +1,6 @@
 from datetime import datetime, timezone
 from typing import Optional
 
-import requests
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -14,7 +13,6 @@ from app.models import (
     EASymbol,
     ExpertAdvisor,
     License,
-    MT5VerificationJob,
     TradeExecution,
 )
 from app.schemas import (
@@ -31,12 +29,10 @@ from app.schemas import (
     ClientTradeHistoryRequest,
     ClientTradeHistoryItem,
 )
-from app.security import decrypt_text, encrypt_text
+from app.security import encrypt_text
+from app.services.metaapi_service import MetaApiService
 
 router = APIRouter(prefix="/client", tags=["Client"])
-
-MT5_VERIFY_URL = "https://dazedly-nondark-lise.ngrok-free.dev/verify-mt5"
-MT5_VERIFY_TIMEOUT_SECONDS = 31
 
 
 # =========================
@@ -77,49 +73,6 @@ def get_license_by_key(license_key: str, db: Session) -> License:
         raise HTTPException(status_code=404, detail="Invalid license key")
 
     return ensure_license_is_valid(license_row)
-
-
-def verify_mt5_credentials(mt_login: str, mt_password: str, mt_server: str):
-    try:
-        res = requests.post(
-            MT5_VERIFY_URL,
-            json={
-                "login": str(mt_login),
-                "password": mt_password,
-                "server": mt_server,
-            },
-            headers={
-                "x-api-key": "nolimitz_mt5_secret_2026",
-            },
-            timeout=MT5_VERIFY_TIMEOUT_SECONDS,
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"MT5 verification service is unavailable: {str(e)}",
-        )
-
-    try:
-        data = res.json()
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Invalid response from MT5 verification service: {str(e)}",
-        )
-
-    if res.status_code != 200:
-        raise HTTPException(
-            status_code=res.status_code,
-            detail=data.get("detail", "Unable to verify MT5 credentials"),
-        )
-
-    if not data.get("success"):
-        raise HTTPException(
-            status_code=400,
-            detail=data.get("message", "Invalid MT5 credentials"),
-        )
-
-    return data
 
 
 def build_mt5_response(message: str, license_row: License, row: ClientMT5Account) -> ClientMT5Response:
@@ -297,7 +250,7 @@ def activate_client_license(
 # MT5
 # =========================
 @router.post("/mt5/save", response_model=ClientMT5Response)
-def save_client_mt5(
+async def save_client_mt5(
     payload: ClientMT5SaveRequest,
     db: Session = Depends(get_db)
 ):
@@ -325,47 +278,60 @@ def save_client_mt5(
         db.commit()
         db.refresh(row)
 
-    # reset visible account state before verification
+    # Reset account state before reconnecting
     row.account_name = None
     row.broker_name = None
     row.balance = None
     row.equity = None
     row.last_verified_at = None
+    row.last_sync_at = None
     row.verification_error = None
     row.is_verified = False
     row.is_active = False
+
+    row.metaapi_account_id = None
+    row.metaapi_state = None
+    row.metaapi_connection_status = None
+    row.metaapi_region = None
+    row.metaapi_type = None
+    row.metaapi_reliability = None
 
     db.commit()
     db.refresh(row)
 
     now = utc_now()
+    service = MetaApiService()
 
     try:
-        verified_data = verify_mt5_credentials(
-            mt_login=row.mt_login,
-            mt_password=payload.mt_password.strip(),
-            mt_server=row.mt_server,
+        account = await service.create_mt5_account(
+            login=row.mt_login,
+            password=payload.mt_password.strip(),
+            server=row.mt_server,
+            name=f"Nolimitz-{license_row.license_key}"
         )
 
-        row.account_name = verified_data.get("name")
-        row.broker_name = verified_data.get("broker_name") or verified_data.get("server")
-        row.balance = str(verified_data.get("balance")) if verified_data.get("balance") is not None else None
-        row.equity = str(verified_data.get("equity")) if verified_data.get("equity") is not None else None
+        await service.deploy_account_and_wait(account)
+
+        result = await service.get_account_info(account.id)
+        info = result["info"]
+        account_obj = result["account"]
+
+        row.metaapi_account_id = account.id
+        row.metaapi_state = getattr(account_obj, "state", None)
+        row.metaapi_connection_status = getattr(account_obj, "connection_status", None)
+        row.metaapi_region = getattr(account_obj, "region", None)
+        row.metaapi_type = getattr(account_obj, "type", "cloud-g2")
+        row.metaapi_reliability = getattr(account_obj, "reliability", None)
+
+        row.account_name = info.get("name")
+        row.broker_name = info.get("broker")
+        row.balance = info.get("balance")
+        row.equity = info.get("equity")
         row.last_verified_at = now
+        row.last_sync_at = now
         row.verification_error = None
         row.is_verified = True
         row.is_active = True
-
-        # optional: cancel old unfinished verification jobs
-        old_jobs = db.query(MT5VerificationJob).filter(
-            MT5VerificationJob.license_id == license_row.id,
-            MT5VerificationJob.status.in_(["pending", "processing", "retry"])
-        ).all()
-
-        for old_job in old_jobs:
-            old_job.status = "cancelled"
-            old_job.error_message = "Cancelled because MT5 was verified directly"
-            old_job.finished_at = now
 
         db.commit()
         db.refresh(row)
@@ -376,62 +342,28 @@ def save_client_mt5(
             row,
         )
 
-    except HTTPException as e:
-        row.account_name = None
-        row.broker_name = None
-        row.balance = None
-        row.equity = None
-        row.last_verified_at = now
-        row.verification_error = str(e.detail)
-        row.is_verified = False
-        row.is_active = False
-
-        old_jobs = db.query(MT5VerificationJob).filter(
-            MT5VerificationJob.license_id == license_row.id,
-            MT5VerificationJob.status.in_(["pending", "processing", "retry"])
-        ).all()
-
-        for old_job in old_jobs:
-            old_job.status = "cancelled"
-            old_job.error_message = "Cancelled because MT5 verification was handled directly"
-            old_job.finished_at = now
-
-        db.commit()
-        db.refresh(row)
-
-        raise HTTPException(status_code=e.status_code, detail=str(e.detail))
-
     except Exception as e:
         row.account_name = None
         row.broker_name = None
         row.balance = None
         row.equity = None
         row.last_verified_at = now
-        row.verification_error = f"MT5 verification failed: {str(e)}"
+        row.last_sync_at = now
+        row.verification_error = str(e)
         row.is_verified = False
         row.is_active = False
-
-        old_jobs = db.query(MT5VerificationJob).filter(
-            MT5VerificationJob.license_id == license_row.id,
-            MT5VerificationJob.status.in_(["pending", "processing", "retry"])
-        ).all()
-
-        for old_job in old_jobs:
-            old_job.status = "cancelled"
-            old_job.error_message = "Cancelled because MT5 verification was handled directly"
-            old_job.finished_at = now
 
         db.commit()
         db.refresh(row)
 
         raise HTTPException(
             status_code=400,
-            detail="MT5 verification failed. Please check your login, password, and server.",
+            detail=f"MT5 connection failed: {str(e)}",
         )
 
 
 @router.post("/mt5/status", response_model=ClientMT5StatusResponse)
-def client_mt5_status(payload: ClientMT5StatusRequest, db: Session = Depends(get_db)):
+async def client_mt5_status(payload: ClientMT5StatusRequest, db: Session = Depends(get_db)):
     license_row = db.query(License).filter(
         License.license_key == payload.license_key.strip()
     ).first()
@@ -443,7 +375,56 @@ def client_mt5_status(payload: ClientMT5StatusRequest, db: Session = Depends(get
         ClientMT5Account.license_id == license_row.id
     ).first()
 
-    if row and row.is_verified:
+    if not row:
+        return build_mt5_status_response(
+            license_row=license_row,
+            row=None,
+            status="not_connected",
+            message="No MT5 account connected",
+        )
+
+    if not row.metaapi_account_id:
+        if row.verification_error:
+            return build_mt5_status_response(
+                license_row=license_row,
+                row=row,
+                status="failed",
+                message=row.verification_error,
+            )
+
+        return build_mt5_status_response(
+            license_row=license_row,
+            row=row,
+            status="not_connected",
+            message="No MetaApi account connected",
+        )
+
+    service = MetaApiService()
+
+    try:
+        result = await service.get_account_info(row.metaapi_account_id)
+        info = result["info"]
+        account_obj = result["account"]
+
+        row.account_name = info.get("name")
+        row.broker_name = info.get("broker")
+        row.balance = info.get("balance")
+        row.equity = info.get("equity")
+        row.last_verified_at = utc_now()
+        row.last_sync_at = utc_now()
+        row.verification_error = None
+        row.is_verified = True
+        row.is_active = True
+
+        row.metaapi_state = getattr(account_obj, "state", row.metaapi_state)
+        row.metaapi_connection_status = getattr(account_obj, "connection_status", row.metaapi_connection_status)
+        row.metaapi_region = getattr(account_obj, "region", row.metaapi_region)
+        row.metaapi_type = getattr(account_obj, "type", row.metaapi_type)
+        row.metaapi_reliability = getattr(account_obj, "reliability", row.metaapi_reliability)
+
+        db.commit()
+        db.refresh(row)
+
         return build_mt5_status_response(
             license_row=license_row,
             row=row,
@@ -451,24 +432,25 @@ def client_mt5_status(payload: ClientMT5StatusRequest, db: Session = Depends(get
             message="MT5 account connected successfully",
         )
 
-    if row and row.verification_error:
+    except Exception as e:
+        row.last_verified_at = utc_now()
+        row.last_sync_at = utc_now()
+        row.verification_error = str(e)
+        row.is_verified = False
+        row.is_active = False
+        db.commit()
+        db.refresh(row)
+
         return build_mt5_status_response(
             license_row=license_row,
             row=row,
             status="failed",
-            message=row.verification_error,
+            message=str(e),
         )
-
-    return build_mt5_status_response(
-        license_row=license_row,
-        row=row,
-        status="not_connected",
-        message="No verified MT5 account connected",
-    )
 
 
 @router.post("/mt5/reverify", response_model=ClientMT5Response)
-def reverify_client_mt5(payload: ClientMT5ReverifyRequest, db: Session = Depends(get_db)):
+async def reverify_client_mt5(payload: ClientMT5ReverifyRequest, db: Session = Depends(get_db)):
     license_row = get_license_by_key(payload.license_key, db)
 
     row = db.query(ClientMT5Account).filter(
@@ -478,25 +460,32 @@ def reverify_client_mt5(payload: ClientMT5ReverifyRequest, db: Session = Depends
     if not row:
         raise HTTPException(status_code=404, detail="No MT5 account saved for this license")
 
+    if not row.metaapi_account_id:
+        raise HTTPException(status_code=400, detail="No MetaApi account linked to this MT5 account")
+
     now = utc_now()
+    service = MetaApiService()
 
     try:
-        real_password = decrypt_text(row.mt_password)
+        result = await service.get_account_info(row.metaapi_account_id)
+        info = result["info"]
+        account_obj = result["account"]
 
-        verified_data = verify_mt5_credentials(
-            mt_login=row.mt_login,
-            mt_password=real_password,
-            mt_server=row.mt_server,
-        )
-
-        row.account_name = verified_data.get("name")
-        row.broker_name = verified_data.get("broker_name") or verified_data.get("server")
-        row.balance = str(verified_data.get("balance")) if verified_data.get("balance") is not None else None
-        row.equity = str(verified_data.get("equity")) if verified_data.get("equity") is not None else None
+        row.account_name = info.get("name")
+        row.broker_name = info.get("broker")
+        row.balance = info.get("balance")
+        row.equity = info.get("equity")
         row.last_verified_at = now
+        row.last_sync_at = now
         row.verification_error = None
         row.is_verified = True
         row.is_active = True
+
+        row.metaapi_state = getattr(account_obj, "state", row.metaapi_state)
+        row.metaapi_connection_status = getattr(account_obj, "connection_status", row.metaapi_connection_status)
+        row.metaapi_region = getattr(account_obj, "region", row.metaapi_region)
+        row.metaapi_type = getattr(account_obj, "type", row.metaapi_type)
+        row.metaapi_reliability = getattr(account_obj, "reliability", row.metaapi_reliability)
 
         db.commit()
         db.refresh(row)
@@ -507,19 +496,9 @@ def reverify_client_mt5(payload: ClientMT5ReverifyRequest, db: Session = Depends
             row,
         )
 
-    except HTTPException as e:
-        row.last_verified_at = now
-        row.verification_error = str(e.detail)
-        row.is_verified = False
-        row.is_active = False
-
-        db.commit()
-        db.refresh(row)
-
-        raise HTTPException(status_code=e.status_code, detail=str(e.detail))
-
     except Exception as e:
         row.last_verified_at = now
+        row.last_sync_at = now
         row.verification_error = f"MT5 reverify failed: {str(e)}"
         row.is_verified = False
         row.is_active = False

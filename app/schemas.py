@@ -232,8 +232,8 @@ class ClientMT5Response(BaseModel):
     verified: bool
     account_name: Optional[str] = None
     broker_name: Optional[str] = None
-    balance: Optional[str] = None
-    equity: Optional[str] = None
+    balance: Optional[float] = None
+    equity: Optional[float] = None
     last_verified_at: Optional[datetime] = None
 
 
@@ -245,8 +245,8 @@ class ClientMT5StatusResponse(BaseModel):
     verified: bool
     account_name: Optional[str] = None
     broker_name: Optional[str] = None
-    balance: Optional[str] = None
-    equity: Optional[str] = None
+    balance: Optional[float] = None
+    equity: Optional[float] = None
     last_verified_at: Optional[datetime] = None
     status: str
     message: str

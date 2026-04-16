@@ -1,18 +1,16 @@
+import asyncio
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
-import MetaTrader5 as mt5
 import requests
+
+from app.services.metaapi_service import MetaApiService
 
 BACKEND_URL = "https://nolimitz-backend-yfne.onrender.com"
 POLL_SECONDS = 5
 CLAIM_LIMIT = 10
 MAX_OPEN_EVENT_AGE_SECONDS = 60
-WORKER_MAGIC = 20260401
-
-# CHANGE THIS to your real MT5 terminal path
-MT5_TERMINAL_PATH = r"C:\Users\user\Desktop\NolimitzMT5Verifier\terminal64.exe"
 
 
 # =========================
@@ -56,6 +54,21 @@ def backend_claim_pending_executions():
 
 
 def backend_get_execution_account(execution_id: int):
+    """
+    IMPORTANT:
+    This endpoint must now return metaapi_account_id instead of decrypted MT5 password.
+    Expected response shape:
+    {
+        "execution_id": ...,
+        "license_id": ...,
+        "license_key": "...",
+        "mt_login": "...",
+        "mt_server": "...",
+        "metaapi_account_id": "...",
+        "is_active": true,
+        "is_verified": true
+    }
+    """
     res = requests.get(
         f"{BACKEND_URL}/copier/executions/{execution_id}/account",
         timeout=30,
@@ -175,95 +188,40 @@ def backend_mark_ticket_map_closed(
 
 
 # =========================
-# MT5 HELPERS
+# METAAPI HELPERS
 # =========================
-def initialize_and_login(mt_login: str, mt_password: str, mt_server: str):
-    if not mt5.initialize(path=MT5_TERMINAL_PATH):
-        raise Exception(f"MT5 initialize failed: {mt5.last_error()}")
-
-    authorized = mt5.login(
-        login=int(mt_login),
-        password=mt_password,
-        server=mt_server,
-    )
-    if not authorized:
-        raise Exception(f"MT5 login failed: {mt5.last_error()}")
+metaapi_service = MetaApiService()
 
 
-def shutdown_mt5():
-    try:
-        mt5.shutdown()
-    except Exception:
-        pass
+def run_async(coro):
+    return asyncio.run(coro)
 
 
-def find_broker_symbol(requested_symbol: str) -> str:
-    requested = requested_symbol.upper().strip()
-    symbols = mt5.symbols_get()
-
-    if not symbols:
-        raise Exception("No broker symbols returned from MT5")
-
-    all_names = [s.name for s in symbols]
-
-    for name in all_names:
-        if name.upper() == requested:
-            return name
-
-    for name in all_names:
-        upper_name = name.upper()
-
-        if upper_name.startswith(requested):
-            return name
-        if upper_name.endswith(requested):
-            return name
-        if requested in upper_name:
-            return name
-
-    if requested in ["XAUUSD", "XAUUSDM"]:
-        gold_candidates = []
-        for name in all_names:
-            upper_name = name.upper()
-            if "XAUUSD" in upper_name or "GOLD" in upper_name:
-                gold_candidates.append(name)
-
-        if gold_candidates:
-            return gold_candidates[0]
-
-    raise Exception(f"Symbol not found on broker for requested symbol: {requested_symbol}")
+def require_metaapi_account_id(account: dict) -> str:
+    account_id = account.get("metaapi_account_id")
+    if not account_id:
+        raise Exception("No MetaApi account linked to this execution account")
+    return str(account_id)
 
 
-def ensure_symbol_ready(symbol: str):
-    symbol_info = mt5.symbol_info(symbol)
-    if symbol_info is None:
-        raise Exception(f"Mapped symbol not found: {symbol}")
-
-    if not symbol_info.visible:
-        if not mt5.symbol_select(symbol, True):
-            raise Exception(f"Failed to select symbol: {symbol}")
-
-    return symbol_info
-
-
-def count_open_positions_for_symbol(broker_symbol: str) -> int:
-    positions = mt5.positions_get(symbol=broker_symbol)
+def count_open_positions_for_symbol(account: dict, broker_symbol: str) -> int:
+    account_id = require_metaapi_account_id(account)
+    positions = run_async(metaapi_service.get_positions(account_id))
     if not positions:
         return 0
-    return len(positions)
+
+    count = 0
+    for pos in positions:
+        pos_symbol = str(pos.get("symbol", "")).upper().strip()
+        if pos_symbol == broker_symbol.upper().strip():
+            count += 1
+    return count
 
 
 def mapped_ticket_still_open(account: dict, client_ticket: str) -> bool:
-    initialize_and_login(
-        mt_login=account["mt_login"],
-        mt_password=account["mt_password"],
-        mt_server=account["mt_server"],
-    )
-
-    try:
-        positions = mt5.positions_get(ticket=int(client_ticket))
-        return bool(positions)
-    finally:
-        shutdown_mt5()
+    account_id = require_metaapi_account_id(account)
+    position = run_async(metaapi_service.get_position(account_id, str(client_ticket)))
+    return bool(position)
 
 
 def get_open_mapped_tickets_for_execution(account: dict, execution: dict) -> list[dict]:
@@ -277,24 +235,16 @@ def get_open_mapped_tickets_for_execution(account: dict, execution: dict) -> lis
         return []
 
     alive_mappings: list[dict] = []
+    account_id = require_metaapi_account_id(account)
 
-    initialize_and_login(
-        mt_login=account["mt_login"],
-        mt_password=account["mt_password"],
-        mt_server=account["mt_server"],
-    )
+    for mapping in mappings:
+        client_ticket = mapping.get("client_ticket")
+        if not client_ticket:
+            continue
 
-    try:
-        for mapping in mappings:
-            client_ticket = mapping.get("client_ticket")
-            if not client_ticket:
-                continue
-
-            positions = mt5.positions_get(ticket=int(client_ticket))
-            if positions:
-                alive_mappings.append(mapping)
-    finally:
-        shutdown_mt5()
+        position = run_async(metaapi_service.get_position(account_id, str(client_ticket)))
+        if position:
+            alive_mappings.append(mapping)
 
     return alive_mappings
 
@@ -322,8 +272,6 @@ def mark_execution_as_manual_close_if_needed(account: dict, execution: dict) -> 
 
     alive_maps = get_open_mapped_tickets_for_execution(account, execution)
 
-    # If backend thinks trades are open, but none exist in MT5 anymore,
-    # then client most likely closed them manually.
     if len(open_maps) > 0 and len(alive_maps) == 0:
         backend_mark_ticket_map_closed(execution, manually_closed=True)
         print(
@@ -333,6 +281,7 @@ def mark_execution_as_manual_close_if_needed(account: dict, execution: dict) -> 
         return True
 
     return False
+
 
 def get_symbol_setting_for_execution(account: dict, execution: dict):
     requested_symbol = execution["symbol"].upper().strip()
@@ -347,287 +296,207 @@ def get_symbol_setting_for_execution(account: dict, execution: dict):
 
 def build_trade_comment(execution: dict) -> str:
     raw_comment = str(execution.get("comment") or "").strip()
-
     if raw_comment:
         return raw_comment[:30]
-
     return "Nolimitz Copier"
+
+
+def normalize_optional_price(value):
+    if value in [None, "", "0", 0]:
+        return None
+    return float(value)
+
 
 # =========================
 # TRADE EXECUTION
 # =========================
 def execute_single_open_trade(execution: dict, account: dict) -> str:
-    initialize_and_login(
-        mt_login=account["mt_login"],
-        mt_password=account["mt_password"],
-        mt_server=account["mt_server"],
+    account_id = require_metaapi_account_id(account)
+
+    requested_symbol = execution["symbol"]
+    symbol = run_async(metaapi_service.find_broker_symbol(account_id, requested_symbol))
+
+    symbol_setting = get_symbol_setting_for_execution(account, execution)
+    if not symbol_setting:
+        raise Exception(f"No client symbol setting found for {requested_symbol}")
+
+    max_open_trades = int(symbol_setting.get("max_open_trades", 1))
+    current_open_count = count_open_positions_for_symbol(account, symbol)
+
+    print(
+        f"Symbol setting: requested={requested_symbol}, broker={symbol}, "
+        f"current_open={current_open_count}, max_open={max_open_trades}"
     )
 
-    try:
-        requested_symbol = execution["symbol"]
-        symbol = find_broker_symbol(requested_symbol)
-
-        symbol_setting = get_symbol_setting_for_execution(account, execution)
-        if not symbol_setting:
-            raise Exception(f"No client symbol setting found for {requested_symbol}")
-
-        max_open_trades = int(symbol_setting.get("max_open_trades", 1))
-        current_open_count = count_open_positions_for_symbol(symbol)
-
-        print(
-            f"Symbol setting: requested={requested_symbol}, broker={symbol}, "
-            f"current_open={current_open_count}, max_open={max_open_trades}"
+    if current_open_count >= max_open_trades:
+        raise Exception(
+            f"Max open trades reached for {requested_symbol}: "
+            f"{current_open_count}/{max_open_trades}"
         )
 
-        if current_open_count >= max_open_trades:
-            raise Exception(
-                f"Max open trades reached for {requested_symbol}: "
-                f"{current_open_count}/{max_open_trades}"
+    action = str(execution["action"]).lower().strip()
+    lot_size = float(execution["lot_size"] or "0.01")
+
+    sl = normalize_optional_price(execution.get("sl"))
+    tp = normalize_optional_price(execution.get("tp"))
+    comment = build_trade_comment(execution)
+
+    client_id = f"NL_{execution['id']}_{int(time.time())}"
+
+    if action == "buy":
+        result = run_async(
+            metaapi_service.create_market_buy_order(
+                account_id=account_id,
+                symbol=symbol,
+                volume=lot_size,
+                stop_loss=sl,
+                take_profit=tp,
+                comment=comment,
+                client_id=client_id,
             )
+        )
+    else:
+        result = run_async(
+            metaapi_service.create_market_sell_order(
+                account_id=account_id,
+                symbol=symbol,
+                volume=lot_size,
+                stop_loss=sl,
+                take_profit=tp,
+                comment=comment,
+                client_id=client_id,
+            )
+        )
 
-        action = str(execution["action"]).lower().strip()
-        lot_size = float(execution["lot_size"] or "0.01")
+    position_id = result.get("positionId") or result.get("orderId") or result.get("stringCode")
+    if not position_id:
+        raise Exception(f"MetaApi open order did not return positionId/orderId: {result}")
 
-        sl_raw = execution.get("sl")
-        tp_raw = execution.get("tp")
-
-        sl = float(sl_raw) if sl_raw not in [None, "", "0", 0] else 0.0
-        tp = float(tp_raw) if tp_raw not in [None, "", "0", 0] else 0.0
-
-        comment = build_trade_comment(execution)
-
-        ensure_symbol_ready(symbol)
-
-        tick = mt5.symbol_info_tick(symbol)
-        if tick is None:
-            raise Exception(f"No tick data for symbol: {symbol}")
-
-        order_type = mt5.ORDER_TYPE_BUY if action == "buy" else mt5.ORDER_TYPE_SELL
-        price = tick.ask if action == "buy" else tick.bid
-
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": lot_size,
-            "type": order_type,
-            "price": price,
-            "sl": sl,
-            "tp": tp,
-            "deviation": 20,
-            "magic": WORKER_MAGIC,
-            "comment": comment,
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        }
-
-        print(f"Requested symbol: {requested_symbol} -> Broker symbol: {symbol}")
-
-        result = mt5.order_send(request)
-        if result is None:
-            raise Exception(f"order_send returned None: {mt5.last_error()}")
-
-        if result.retcode != mt5.TRADE_RETCODE_DONE:
-            raise Exception(f"order_send failed retcode={result.retcode}")
-
-        return str(result.order or result.deal)
-
-    finally:
-        shutdown_mt5()
+    return str(position_id)
 
 
 def execute_open_trade(execution: dict, account: dict) -> list[str]:
-    initialize_and_login(
-        mt_login=account["mt_login"],
-        mt_password=account["mt_password"],
-        mt_server=account["mt_server"],
+    account_id = require_metaapi_account_id(account)
+
+    requested_symbol = execution["symbol"]
+    symbol = run_async(metaapi_service.find_broker_symbol(account_id, requested_symbol))
+
+    symbol_setting = get_symbol_setting_for_execution(account, execution)
+    if not symbol_setting:
+        raise Exception(f"No client symbol setting found for {requested_symbol}")
+
+    if not symbol_setting.get("enabled", True):
+        raise Exception(f"Symbol is disabled for client: {requested_symbol}")
+
+    max_open_trades = int(symbol_setting.get("max_open_trades", 1))
+    trades_per_signal = int(symbol_setting.get("trades_per_signal", 1))
+    current_open_count = count_open_positions_for_symbol(account, symbol)
+
+    print(
+        f"Symbol setting: requested={requested_symbol}, broker={symbol}, "
+        f"current_open={current_open_count}, max_open={max_open_trades}, "
+        f"trades_per_signal={trades_per_signal}"
     )
 
-    try:
-        requested_symbol = execution["symbol"]
-        symbol = find_broker_symbol(requested_symbol)
-
-        symbol_setting = get_symbol_setting_for_execution(account, execution)
-        if not symbol_setting:
-            raise Exception(f"No client symbol setting found for {requested_symbol}")
-
-        if not symbol_setting.get("enabled", True):
-            raise Exception(f"Symbol is disabled for client: {requested_symbol}")
-
-        max_open_trades = int(symbol_setting.get("max_open_trades", 1))
-        trades_per_signal = int(symbol_setting.get("trades_per_signal", 1))
-        current_open_count = count_open_positions_for_symbol(symbol)
-
-        print(
-            f"Symbol setting: requested={requested_symbol}, broker={symbol}, "
-            f"current_open={current_open_count}, max_open={max_open_trades}, "
-            f"trades_per_signal={trades_per_signal}"
+    available_slots = max_open_trades - current_open_count
+    if available_slots <= 0:
+        raise Exception(
+            f"Max open trades reached for {requested_symbol}: "
+            f"{current_open_count}/{max_open_trades}"
         )
 
-        available_slots = max_open_trades - current_open_count
-        if available_slots <= 0:
-            raise Exception(
-                f"Max open trades reached for {requested_symbol}: "
-                f"{current_open_count}/{max_open_trades}"
-            )
+    actual_trades_to_open = min(trades_per_signal, available_slots)
+    tickets: list[str] = []
 
-        actual_trades_to_open = min(trades_per_signal, available_slots)
-        tickets: list[str] = []
+    for _ in range(actual_trades_to_open):
+        ticket = execute_single_open_trade(execution, account)
+        tickets.append(str(ticket))
 
-        shutdown_mt5()
-
-        for _ in range(actual_trades_to_open):
-            ticket = execute_single_open_trade(execution, account)
-            tickets.append(str(ticket))
-
-        return tickets
-
-    finally:
-        shutdown_mt5()
+    return tickets
 
 
 def execute_modify_trade(execution: dict, account: dict) -> list[str]:
-    initialize_and_login(
-        mt_login=account["mt_login"],
-        mt_password=account["mt_password"],
-        mt_server=account["mt_server"],
-    )
-
+    account_id = require_metaapi_account_id(account)
     modified_tickets: list[str] = []
 
-    try:
-        mappings = backend_get_open_ticket_maps_by_keys(
-            license_id=execution["license_id"],
-            ea_id=execution["ea_id"],
-            master_ticket=execution["master_ticket"],
-        )
+    mappings = backend_get_open_ticket_maps_by_keys(
+        license_id=execution["license_id"],
+        ea_id=execution["ea_id"],
+        master_ticket=execution["master_ticket"],
+    )
 
-        if not mappings:
-            raise Exception("No open ticket maps found for this master ticket")
+    if not mappings:
+        raise Exception("No open ticket maps found for this master ticket")
 
-        sl_raw = execution.get("sl")
-        tp_raw = execution.get("tp")
+    sl = normalize_optional_price(execution.get("sl"))
+    tp = normalize_optional_price(execution.get("tp"))
 
-        sl = float(sl_raw) if sl_raw not in [None, "", "0", 0] else 0.0
-        tp = float(tp_raw) if tp_raw not in [None, "", "0", 0] else 0.0
+    for mapping in mappings:
+        client_ticket = str(mapping["client_ticket"])
+        position = run_async(metaapi_service.get_position(account_id, client_ticket))
+        if not position:
+            print(f"[SKIP MODIFY] client trade {client_ticket} not found")
+            continue
 
-        for mapping in mappings:
-            client_ticket = int(mapping["client_ticket"])
+        try:
+            run_async(
+                metaapi_service.modify_position(
+                    account_id=account_id,
+                    position_id=client_ticket,
+                    stop_loss=sl,
+                    take_profit=tp,
+                )
+            )
+            modified_tickets.append(client_ticket)
+        except Exception as e:
+            print(f"[FAIL MODIFY] {client_ticket}: {e}")
 
-            positions = mt5.positions_get(ticket=client_ticket)
-            if not positions:
-                print(f"[SKIP MODIFY] client trade {client_ticket} not found")
-                continue
-
-            request = {
-                "action": mt5.TRADE_ACTION_SLTP,
-                "position": client_ticket,
-                "sl": sl,
-                "tp": tp,
-            }
-
-            result = mt5.order_send(request)
-            if result is None:
-                print(f"[FAIL MODIFY] {client_ticket}: modify returned None {mt5.last_error()}")
-                continue
-
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                print(f"[FAIL MODIFY] {client_ticket}: retcode={result.retcode}")
-                continue
-
-            modified_tickets.append(str(client_ticket))
-
-        return modified_tickets
-
-    finally:
-        shutdown_mt5()
+    return modified_tickets
 
 
 def execute_close_trade(execution: dict, account: dict) -> list[str]:
-    initialize_and_login(
-        mt_login=account["mt_login"],
-        mt_password=account["mt_password"],
-        mt_server=account["mt_server"],
-    )
-
+    account_id = require_metaapi_account_id(account)
     closed_tickets: list[str] = []
 
-    try:
-        mappings = backend_get_open_ticket_maps_by_keys(
-            license_id=execution["license_id"],
-            ea_id=execution["ea_id"],
-            master_ticket=execution["master_ticket"],
-        )
+    mappings = backend_get_open_ticket_maps_by_keys(
+        license_id=execution["license_id"],
+        ea_id=execution["ea_id"],
+        master_ticket=execution["master_ticket"],
+    )
 
-        if not mappings:
-            raise Exception("No open ticket maps found for this master ticket")
+    if not mappings:
+        raise Exception("No open ticket maps found for this master ticket")
 
-        for mapping in mappings:
-            client_ticket = int(mapping["client_ticket"])
+    for mapping in mappings:
+        client_ticket = str(mapping["client_ticket"])
+        position = run_async(metaapi_service.get_position(account_id, client_ticket))
+        if not position:
+            print(f"[SKIP CLOSE] client trade {client_ticket} already closed manually")
+            continue
 
-            positions = mt5.positions_get(ticket=client_ticket)
-            if not positions:
-                print(f"[SKIP CLOSE] client trade {client_ticket} already closed manually")
-                continue
-
-            position = positions[0]
-            symbol = position.symbol
-            volume = position.volume
-
-            tick = mt5.symbol_info_tick(symbol)
-            if tick is None:
-                print(f"[FAIL CLOSE] {client_ticket}: no tick data for {symbol}")
-                continue
-
-            if position.type == mt5.POSITION_TYPE_BUY:
-                order_type = mt5.ORDER_TYPE_SELL
-                price = tick.bid
-            else:
-                order_type = mt5.ORDER_TYPE_BUY
-                price = tick.ask
-
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": volume,
-                "type": order_type,
-                "position": client_ticket,
-                "price": price,
-                "deviation": 20,
-                "magic": WORKER_MAGIC,
-                "comment": execution.get("comment") or "Nolimitz Copier Close",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            }
-
-            result = mt5.order_send(request)
-            if result is None:
-                print(f"[FAIL CLOSE] {client_ticket}: order_send returned None {mt5.last_error()}")
-                continue
-
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                print(f"[FAIL CLOSE] {client_ticket}: retcode={result.retcode}")
-                continue
-
-            closed_tickets.append(str(client_ticket))
-
-       # If at least one mapped ticket was closed by worker, mark backend maps closed normally.
-        if closed_tickets:
-            backend_mark_ticket_map_closed(execution, manually_closed=False)
-        else:
-            # If nothing was closable and client already removed them manually,
-            # mark as manually closed so they never reopen.
-            alive_maps = get_open_mapped_tickets_for_execution(account, execution)
-            if not alive_maps:
-                backend_mark_ticket_map_closed(execution, manually_closed=True)
-                print(
-                    f"[INFO] close execution {execution['id']}: "
-                    f"all mapped tickets already missing, marked manually_closed=True"
+        try:
+            run_async(
+                metaapi_service.close_position(
+                    account_id=account_id,
+                    position_id=client_ticket,
                 )
+            )
+            closed_tickets.append(client_ticket)
+        except Exception as e:
+            print(f"[FAIL CLOSE] {client_ticket}: {e}")
 
-        return closed_tickets
+    if closed_tickets:
+        backend_mark_ticket_map_closed(execution, manually_closed=False)
+    else:
+        alive_maps = get_open_mapped_tickets_for_execution(account, execution)
+        if not alive_maps:
+            backend_mark_ticket_map_closed(execution, manually_closed=True)
+            print(
+                f"[INFO] close execution {execution['id']}: "
+                f"all mapped tickets already missing, marked manually_closed=True"
+            )
 
-    finally:
-        shutdown_mt5()
+    return closed_tickets
 
 
 # =========================
@@ -650,7 +519,6 @@ def process_execution(execution: dict):
                 print(f"[SKIP] execution {execution_id}: old open event")
                 return
 
-            # Bulletproof manual-close protection
             if mark_execution_as_manual_close_if_needed(account, execution):
                 backend_update_execution(
                     execution_id=execution_id,
@@ -687,8 +555,6 @@ def process_execution(execution: dict):
                     print(f"[SKIP] execution {execution_id}: duplicate open prevented")
                     return
 
-                # If maps exist but no live trade exists and they were not manually closed,
-                # then they are stale maps from an old failed/open state.
                 try:
                     backend_mark_ticket_map_closed(execution, manually_closed=False)
                     print(
@@ -780,7 +646,7 @@ def process_execution(execution: dict):
 # LOOP
 # =========================
 def main():
-    print("Nolimitz MT5 Execution Worker started...")
+    print("Nolimitz MetaApi Execution Worker started...")
     while True:
         try:
             executions = backend_claim_pending_executions()

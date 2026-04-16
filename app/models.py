@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -37,12 +37,18 @@ class MasterAccount(Base):
     id = Column(Integer, primary_key=True, index=True)
 
     admin_id = Column(Integer, ForeignKey("admins.id"), nullable=False)
-
     ea_id = Column(Integer, ForeignKey("expert_advisors.id"), nullable=False, index=True)
 
     mt_login = Column(String, nullable=False)
     mt_password = Column(String, nullable=False)
     mt_server = Column(String, nullable=False)
+
+    metaapi_account_id = Column(String, nullable=True, unique=True, index=True)
+    metaapi_state = Column(String, nullable=True)
+    metaapi_connection_status = Column(String, nullable=True)
+    metaapi_region = Column(String, nullable=True)
+    metaapi_type = Column(String, nullable=True)
+    metaapi_reliability = Column(String, nullable=True)
 
     is_connected = Column(Boolean, default=False)
     account_name = Column(String, nullable=True)
@@ -190,15 +196,28 @@ class ClientMT5Account(Base):
     id = Column(Integer, primary_key=True, index=True)
     license_id = Column(Integer, ForeignKey("licenses.id"), unique=True, nullable=False, index=True)
 
+    # Original MT5 credentials entered by client
     mt_login = Column(String, nullable=False, index=True)
     mt_password = Column(String, nullable=False)
     mt_server = Column(String, nullable=False, index=True)
 
+    # MetaApi cloud account details
+    metaapi_account_id = Column(String, nullable=True, unique=True, index=True)
+    metaapi_state = Column(String, nullable=True)  # CREATED / DEPLOYING / DEPLOYED / etc
+    metaapi_connection_status = Column(String, nullable=True)  # CONNECTED / DISCONNECTED / DISCONNECTED_FROM_BROKER
+    metaapi_region = Column(String, nullable=True)
+    metaapi_type = Column(String, nullable=True)  # usually cloud-g2
+    metaapi_reliability = Column(String, nullable=True)  # regular / high
+
+    # Account info fetched after successful sync
     account_name = Column(String, nullable=True)
     broker_name = Column(String, nullable=True)
-    balance = Column(String, nullable=True)
-    equity = Column(String, nullable=True)
+    balance = Column(Float, nullable=True, default=0)
+    equity = Column(Float, nullable=True, default=0)
+
+    # Verification / sync info
     last_verified_at = Column(DateTime(timezone=True), nullable=True)
+    last_sync_at = Column(DateTime(timezone=True), nullable=True)
     verification_error = Column(String, nullable=True)
 
     is_active = Column(Boolean, nullable=False, default=True)

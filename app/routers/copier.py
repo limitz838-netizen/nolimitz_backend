@@ -404,21 +404,19 @@ def get_execution_account(
         if not mt5:
             raise HTTPException(status_code=404, detail="No MT5 account found for this execution")
 
-        if not mt5.mt_password:
-            raise HTTPException(status_code=400, detail="Saved MT5 password is missing")
-
-        try:
-            real_password = decrypt_text(mt5.mt_password)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Could not decrypt MT5 password: {str(e)}")
+        if not mt5.metaapi_account_id:
+           raise HTTPException(
+           status_code=400,
+           detail="MetaApi account is not linked for this execution"
+        )
 
         return {
             "execution_id": row.id,
             "license_id": row.license_id,
             "license_key": license_row.license_key,
             "mt_login": mt5.mt_login,
-            "mt_password": real_password,
             "mt_server": mt5.mt_server,
+            "metaapi_account_id": mt5.metaapi_account_id,
             "is_active": mt5.is_active,
             "is_verified": mt5.is_verified,
         }
