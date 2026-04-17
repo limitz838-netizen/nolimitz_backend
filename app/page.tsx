@@ -129,13 +129,11 @@ export default function HomePage() {
             className="mt-10 flex flex-col items-center justify-center gap-3 sm:flex-row"
           >
             <a
-              href="/nolimitzbots.apk"
-              download
-              className="inline-flex min-w-[185px] items-center justify-center gap-2 rounded-2xl border border-cyan-200/70 bg-gradient-to-r from-cyan-400/85 to-blue-500/85 px-4 py-3 text-sm font-semibold text-white shadow-[0_10px_30px_rgba(59,130,246,0.18)] backdrop-blur-md transition hover:scale-[1.02]"
-            >
-              <FaAndroid size={18} />
-              Android Download
-            </a>
+  href="/downloads/nolimitzbots.apk"
+  className="inline-flex items-center justify-center gap-3 rounded-full bg-gradient-to-r from-cyan-400 to-blue-500 px-6 py-3 text-base font-semibold text-white shadow-lg transition hover:scale-[1.02]"
+>
+  Android Download
+</a>
 
             <button
               onClick={handleIosClick}
