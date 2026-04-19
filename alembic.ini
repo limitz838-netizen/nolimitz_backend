@@ -11,11 +11,13 @@ from app.database import Base, SessionLocal, engine
 from app.models import Admin, AdminProfile
 from app.routers import mt5_workers
 from app.routers.admin import router as admin_router
+from app.routers.client import router as client_router
 from app.routers.copier import router as copier_router
+from app.routers.ea import router as ea_router
+from app.routers.license import router as license_router
 from app.routers.master_account import router as master_account_router
 from app.routers.robot import router as robot_router
 from app.routers.signals import router as signals_router
-from app.routers import mt5_workers
 
 Base.metadata.create_all(bind=engine)
 
@@ -78,6 +80,9 @@ app.add_middleware(
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 app.include_router(admin_router)
+app.include_router(ea_router)
+app.include_router(license_router)
+app.include_router(client_router)
 app.include_router(signals_router)
 app.include_router(robot_router)
 app.include_router(copier_router)
