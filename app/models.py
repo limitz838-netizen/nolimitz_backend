@@ -105,7 +105,6 @@ class ExpertAdvisor(Base):
     robot_trades = relationship("RobotTrade", back_populates="ea")
     copier_events = relationship("CopierTradeEvent", back_populates="ea")
     trade_executions = relationship("TradeExecution", back_populates="ea")
-    ticket_maps = relationship("TradeTicketMap", back_populates="ea")
 
 
 class AdminEALink(Base):
@@ -168,6 +167,9 @@ class License(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
+    execution_enabled = Column(Boolean, nullable=False, default=False)
+    execution_started_at = Column(DateTime(timezone=True), nullable=True)
+
     admin = relationship("Admin", back_populates="licenses")
     ea = relationship("ExpertAdvisor", back_populates="licenses")
     activation = relationship("ClientActivation", back_populates="license", uselist=False, cascade="all, delete-orphan")
@@ -175,7 +177,6 @@ class License(Base):
     verification_jobs = relationship("MT5VerificationJob", back_populates="license", cascade="all, delete-orphan")
     symbol_settings = relationship("ClientSymbolSetting", back_populates="license", cascade="all, delete-orphan")
     executions = relationship("TradeExecution", back_populates="license")
-    ticket_maps = relationship("TradeTicketMap", back_populates="license")
 
 
 class ClientActivation(Base):
@@ -407,28 +408,22 @@ class TradeExecution(Base):
 
 
 class TradeTicketMap(Base):
-    __tablename__ = "trade_ticket_maps"
+    __tablename__ = "ticket_maps"
 
     id = Column(Integer, primary_key=True, index=True)
 
-    license_id = Column(Integer, ForeignKey("licenses.id"), nullable=False, index=True)
-    ea_id = Column(Integer, ForeignKey("expert_advisors.id"), nullable=False, index=True)
+    license_id = Column(Integer, index=True, nullable=False)
+    execution_id = Column(Integer, index=True, nullable=True)
 
-    master_ticket = Column(String, nullable=False, index=True)
-    child_ticket_index = Column(Integer, nullable=False, default=1)
-    client_ticket = Column(String, nullable=False, index=True)
+    master_ticket = Column(String, index=True, nullable=False)
+    client_ticket = Column(String, index=True, nullable=True)
 
-    symbol = Column(String, nullable=False, index=True)
-    action = Column(String, nullable=True)
+    symbol = Column(String, index=True, nullable=False)
 
-    is_open = Column(Boolean, nullable=False, default=True)
-    manually_closed = Column(Boolean, nullable=False, default=False)
+    is_closed = Column(Boolean, default=False, nullable=False)
+    closed_by_client = Column(Boolean, default=False, nullable=False)
 
-    opened_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    closed_at = Column(DateTime(timezone=True), nullable=True)
+    closed_at = Column(DateTime, nullable=True)
+    last_error = Column(String, nullable=True)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
-
-    license = relationship("License", back_populates="ticket_maps")
-    ea = relationship("ExpertAdvisor", back_populates="ticket_maps")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

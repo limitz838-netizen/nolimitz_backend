@@ -41,10 +41,14 @@ class MetaApiService:
         connect_timeout_seconds: int = 180,
     ):
         await account.deploy()
-        await asyncio.wait_for(
-            account.wait_connected(),
-            timeout=connect_timeout_seconds,
-        )
+
+        # wait until MetaApi fully marks account deployed
+        if hasattr(account, "wait_deployed"):
+            await asyncio.wait_for(account.wait_deployed(), timeout=connect_timeout_seconds)
+
+        # then wait until connected
+        await asyncio.wait_for(account.wait_connected(), timeout=connect_timeout_seconds)
+
         return account
 
     async def undeploy_account(self, account_id: str):
@@ -54,6 +58,24 @@ class MetaApiService:
 
     async def get_rpc_connection(self, account_id: str):
         account = await self.get_account(account_id)
+
+        # auto-deploy if account is not deployed yet
+        state = getattr(account, "state", None)
+        if state not in ["DEPLOYED", "DEPLOYING", "CONNECTED"]:
+            await self.deploy_account_and_wait(account)
+
+        # if it is deploying, wait for it
+        if hasattr(account, "wait_deployed"):
+            try:
+                await asyncio.wait_for(account.wait_deployed(), timeout=180)
+            except Exception:
+                pass
+
+        try:
+            await asyncio.wait_for(account.wait_connected(), timeout=180)
+        except Exception:
+            pass
+
         connection = account.get_rpc_connection()
         await connection.connect()
         await connection.wait_synchronized()
@@ -140,16 +162,23 @@ class MetaApiService:
         _, connection = await self.get_rpc_connection(account_id)
 
         options = {"comment": comment}
-        if client_id:
-            options["clientId"] = client_id
 
-        return await connection.create_market_buy_order(
-            symbol=symbol,
-            volume=volume,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            options=options,
-        )
+        try:
+            result = await connection.create_market_buy_order(
+                symbol=symbol,
+                volume=volume,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                options=options,
+            )
+            print("✅ BUY RESULT:", result)
+            return result
+
+        except Exception as e:
+            print("🚨 FULL BUY ERROR:", e)
+            if hasattr(e, "details"):
+                print("🚨 BUY ERROR DETAILS:", e.details)
+            raise
 
     async def create_market_sell_order(
         self,
@@ -164,16 +193,23 @@ class MetaApiService:
         _, connection = await self.get_rpc_connection(account_id)
 
         options = {"comment": comment}
-        if client_id:
-            options["clientId"] = client_id
 
-        return await connection.create_market_sell_order(
-            symbol=symbol,
-            volume=volume,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            options=options,
-        )
+        try:
+            result = await connection.create_market_sell_order(
+                symbol=symbol,
+                volume=volume,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                options=options,
+            )
+            print("✅ SELL RESULT:", result)
+            return result
+
+        except Exception as e:
+            print("🚨 FULL SELL ERROR:", e)
+            if hasattr(e, "details"):
+               print("🚨 SELL ERROR DETAILS:", e.details)
+            raise
 
     async def modify_position(
         self,

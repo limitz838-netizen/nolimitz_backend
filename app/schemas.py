@@ -301,6 +301,11 @@ class ClientSymbolSettingOut(BaseModel):
         from_attributes = True
 
 
+class ClientRemoveSymbolRequest(BaseModel):
+    license_key: str
+    symbol_name: str
+
+
 class ClientTradeHistoryRequest(BaseModel):
     license_key: str
     limit: int = 30
@@ -516,3 +521,14 @@ class MasterAccountResponse(BaseModel):
     is_connected: bool
     account_name: Optional[str] = None
     broker_name: Optional[str] = None
+
+
+class ClientRobotControlRequest(BaseModel):
+    license_key: str
+
+
+class ClientRobotControlResponse(BaseModel):
+    message: str
+    license_key: str
+    execution_enabled: bool
+    execution_started_at: Optional[datetime] = None

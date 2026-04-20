@@ -28,6 +28,8 @@ from app.schemas import (
     ClientSymbolSettingSave,
     ClientTradeHistoryRequest,
     ClientTradeHistoryItem,
+    ClientRobotControlRequest,
+    ClientRobotControlResponse,
 )
 from app.security import encrypt_text
 from app.services.metaapi_service import MetaApiService
@@ -173,6 +175,10 @@ def activate_client_license(
     ).first()
 
     license_row = ensure_license_is_valid(license_row)
+
+    # 🔥 Ensure robot is OFF by default
+    if license_row.execution_enabled is None:
+        license_row.execution_enabled = False
 
     ea = db.query(ExpertAdvisor).filter(
         ExpertAdvisor.id == license_row.ea_id
@@ -596,7 +602,8 @@ def list_client_symbol_settings(payload: ClientLicenseRequest, db: Session = Dep
     license_row = get_license_by_key(payload.license_key, db)
 
     rows = db.query(ClientSymbolSetting).filter(
-        ClientSymbolSetting.license_id == license_row.id
+        ClientSymbolSetting.license_id == license_row.id,
+        ClientSymbolSetting.enabled == True,
     ).order_by(ClientSymbolSetting.id.desc()).all()
 
     return [build_symbol_setting_response(row) for row in rows]
@@ -621,3 +628,83 @@ def get_allowed_symbols(payload: ClientLicenseRequest, db: Session = Depends(get
         "mode_type": license_row.mode_type,
         "allowed_symbols": [s.symbol_name for s in symbols],
     }
+
+
+@router.post("/symbols/remove")
+def remove_client_symbol_setting(payload: ClientRemoveSymbolRequest, db: Session = Depends(get_db)):
+    license_row = get_license_by_key(payload.license_key, db)
+
+    normalized_symbol = normalize_symbol(payload.symbol_name)
+
+    row = db.query(ClientSymbolSetting).filter(
+        ClientSymbolSetting.license_id == license_row.id,
+        ClientSymbolSetting.symbol_name == normalized_symbol,
+    ).first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Symbol setting not found")
+
+    row.enabled = False
+    db.commit()
+
+    return {
+        "message": "Symbol removed successfully",
+        "symbol_name": normalized_symbol,
+        "enabled": False,
+    }
+
+
+# =========================
+# ROBOT START / STOP
+# =========================
+@router.post("/robot/start", response_model=ClientRobotControlResponse)
+def start_client_robot(
+    payload: ClientRobotControlRequest,
+    db: Session = Depends(get_db),
+):
+    license_row = get_license_by_key(payload.license_key, db)
+
+    mt5_row = db.query(ClientMT5Account).filter(
+        ClientMT5Account.license_id == license_row.id
+    ).first()
+
+    if not mt5_row:
+        raise HTTPException(status_code=400, detail="No MT5 account connected")
+
+    if not mt5_row.is_active or not mt5_row.is_verified:
+        raise HTTPException(status_code=400, detail="MT5 account is not active and verified")
+
+    license_row.execution_enabled = True
+    license_row.execution_started_at = utc_now()
+    license_row.last_seen_at = utc_now()
+
+    db.commit()
+    db.refresh(license_row)
+
+    return ClientRobotControlResponse(
+        message="Robot started successfully",
+        license_key=license_row.license_key,
+        execution_enabled=license_row.execution_enabled,
+        execution_started_at=license_row.execution_started_at,
+    )
+
+
+@router.post("/robot/stop", response_model=ClientRobotControlResponse)
+def stop_client_robot(
+    payload: ClientRobotControlRequest,
+    db: Session = Depends(get_db),
+):
+    license_row = get_license_by_key(payload.license_key, db)
+
+    license_row.execution_enabled = False
+    license_row.last_seen_at = utc_now()
+
+    db.commit()
+    db.refresh(license_row)
+
+    return ClientRobotControlResponse(
+        message="Robot stopped successfully",
+        license_key=license_row.license_key,
+        execution_enabled=license_row.execution_enabled,
+        execution_started_at=license_row.execution_started_at,
+    )
