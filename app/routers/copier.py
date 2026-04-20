@@ -140,6 +140,19 @@ def normalize_symbol(symbol: str) -> str:
     return symbol.strip().upper()
 
 
+def license_can_receive_execution(license_row: License) -> bool:
+    if not license_row.is_active:
+        return False
+
+    if hasattr(license_row, "execution_enabled") and not license_row.execution_enabled:
+        return False
+
+    if hasattr(license_row, "execution_started_at") and license_row.execution_started_at is None:
+        return False
+
+    return True
+
+
 def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> List[TradeExecution]:
     licenses = db.query(License).filter(
         License.ea_id == event.ea_id,
@@ -147,8 +160,13 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
     ).all()
 
     created_rows: List[TradeExecution] = []
+    normalized_symbol = normalize_symbol(event.symbol)
 
     for license_row in licenses:
+        # Only queue executions for licenses whose robot is actually started/enabled
+        if not license_can_receive_execution(license_row):
+            continue
+
         mt5 = db.query(ClientMT5Account).filter(
             ClientMT5Account.license_id == license_row.id,
             ClientMT5Account.is_active == True,
@@ -160,18 +178,32 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
 
         symbol_setting = db.query(ClientSymbolSetting).filter(
             ClientSymbolSetting.license_id == license_row.id,
-            ClientSymbolSetting.symbol_name == event.symbol,
+            ClientSymbolSetting.symbol_name == normalized_symbol,
             ClientSymbolSetting.enabled == True,
         ).first()
 
         if not symbol_setting:
             continue
 
-        # Direction filter only matters for OPEN events
+        # OPEN: respect client direction settings
         if event.event_type == "open":
-            if event.action == "buy" and symbol_setting.trade_direction == "sell":
+            client_direction = (symbol_setting.trade_direction or "both").strip().lower()
+            event_action = (event.action or "").strip().lower()
+
+            if event_action == "buy" and client_direction == "sell":
                 continue
-            if event.action == "sell" and symbol_setting.trade_direction == "buy":
+            if event_action == "sell" and client_direction == "buy":
+                continue
+
+        # CLOSE: only create a close execution if this license actually has open mapped trades
+        if event.event_type == "close":
+            open_map = db.query(TradeTicketMap).filter(
+                TradeTicketMap.license_id == license_row.id,
+                TradeTicketMap.master_ticket == event.master_ticket,
+                TradeTicketMap.is_closed == False,
+            ).first()
+
+            if not open_map:
                 continue
 
         execution = TradeExecution(
@@ -180,9 +212,9 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
             ea_id=event.ea_id,
             master_ticket=event.master_ticket,
             client_ticket=None,
-            symbol=event.symbol,
+            symbol=normalized_symbol,
             action=event.action,
-            lot_size=symbol_setting.lot_size,  # client controls lot size
+            lot_size=symbol_setting.lot_size,
             sl=event.sl,
             tp=event.tp,
             price=event.price,
