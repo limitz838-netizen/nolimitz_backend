@@ -139,6 +139,20 @@ def serialize_ticket_map(row: TradeTicketMap) -> TradeTicketMapItem:
 def normalize_symbol(symbol: str) -> str:
     return symbol.strip().upper()
 
+def get_symbol_aliases(symbol: str) -> list[str]:
+    base = normalize_symbol(symbol)
+
+    alias_map = {
+        "XAUUSD": ["XAUUSD", "XAUUSDM", "GOLD", "GOLDM", "XAUUSD.", "XAUUSDm"],
+        "BTCUSD": ["BTCUSD", "BTCUSDM", "BTCUSDT", "BTCUSD.", "BTCUSDm"],
+        "ETHUSD": ["ETHUSD", "ETHUSDM", "ETHUSDT", "ETHUSD.", "ETHUSDm"],
+        "EURUSD": ["EURUSD", "EURUSDM", "EURUSD.", "EURUSDm"],
+        "GBPUSD": ["GBPUSD", "GBPUSDM", "GBPUSD.", "GBPUSDm"],
+        "USDJPY": ["USDJPY", "USDJPYM", "USDJPY.", "USDJPYm"],
+    }
+
+    return [normalize_symbol(x) for x in alias_map.get(base, [base])]
+
 
 def license_can_receive_execution(license_row: License) -> bool:
     if not license_row.is_active:
@@ -161,10 +175,11 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
 
     created_rows: List[TradeExecution] = []
     normalized_symbol = normalize_symbol(event.symbol)
+    symbol_aliases = get_symbol_aliases(normalized_symbol)
 
     for license_row in licenses:
-        # Only queue executions for licenses whose robot is actually started/enabled
         if not license_can_receive_execution(license_row):
+            print(f"[COPIER SKIP] license={license_row.id} reason=robot_not_started")
             continue
 
         mt5 = db.query(ClientMT5Account).filter(
@@ -174,28 +189,34 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
         ).first()
 
         if not mt5:
+            print(f"[COPIER SKIP] license={license_row.id} reason=no_active_verified_mt5")
             continue
 
         symbol_setting = db.query(ClientSymbolSetting).filter(
             ClientSymbolSetting.license_id == license_row.id,
-            ClientSymbolSetting.symbol_name == normalized_symbol,
+            ClientSymbolSetting.symbol_name.in_(symbol_aliases),
             ClientSymbolSetting.enabled == True,
         ).first()
 
         if not symbol_setting:
+            print(
+                f"[COPIER SKIP] license={license_row.id} reason=symbol_not_enabled "
+                f"event_symbol={normalized_symbol} aliases={symbol_aliases}"
+            )
             continue
 
-        # OPEN: respect client direction settings
         if event.event_type == "open":
             client_direction = (symbol_setting.trade_direction or "both").strip().lower()
             event_action = (event.action or "").strip().lower()
 
             if event_action == "buy" and client_direction == "sell":
-                continue
-            if event_action == "sell" and client_direction == "buy":
+                print(f"[COPIER SKIP] license={license_row.id} reason=direction_blocked buy_vs_sell")
                 continue
 
-        # CLOSE: only create a close execution if this license actually has open mapped trades
+            if event_action == "sell" and client_direction == "buy":
+                print(f"[COPIER SKIP] license={license_row.id} reason=direction_blocked sell_vs_buy")
+                continue
+
         if event.event_type == "close":
             open_map = db.query(TradeTicketMap).filter(
                 TradeTicketMap.license_id == license_row.id,
@@ -204,6 +225,7 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
             ).first()
 
             if not open_map:
+                print(f"[COPIER SKIP] license={license_row.id} reason=no_open_map_for_close")
                 continue
 
         execution = TradeExecution(
@@ -225,6 +247,7 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
         )
         db.add(execution)
         created_rows.append(execution)
+        print(f"[COPIER OK] license={license_row.id} symbol_setting={symbol_setting.symbol_name}")
 
     db.commit()
 
