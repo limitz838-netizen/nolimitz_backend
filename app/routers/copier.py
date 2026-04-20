@@ -178,9 +178,9 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
     symbol_aliases = get_symbol_aliases(normalized_symbol)
 
     for license_row in licenses:
-        if not license_can_receive_execution(license_row):
-            print(f"[COPIER SKIP] license={license_row.id} reason=robot_not_started")
-            continue
+
+        # 🚨 CRITICAL FIX: REMOVE OVER-FILTERING
+        # Only check MT5 + symbol, NOT execution_enabled or start time
 
         mt5 = db.query(ClientMT5Account).filter(
             ClientMT5Account.license_id == license_row.id,
@@ -189,7 +189,7 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
         ).first()
 
         if not mt5:
-            print(f"[COPIER SKIP] license={license_row.id} reason=no_active_verified_mt5")
+            print(f"[SKIP] license={license_row.id} reason=no_active_verified_mt5")
             continue
 
         symbol_setting = db.query(ClientSymbolSetting).filter(
@@ -199,24 +199,19 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
         ).first()
 
         if not symbol_setting:
-            print(
-                f"[COPIER SKIP] license={license_row.id} reason=symbol_not_enabled "
-                f"event_symbol={normalized_symbol} aliases={symbol_aliases}"
-            )
+            print(f"[SKIP] license={license_row.id} reason=symbol_not_enabled")
             continue
 
+        # ✅ Direction check ONLY for OPEN
         if event.event_type == "open":
-            client_direction = (symbol_setting.trade_direction or "both").strip().lower()
-            event_action = (event.action or "").strip().lower()
+            client_direction = (symbol_setting.trade_direction or "both").lower()
+            event_action = (event.action or "").lower()
 
-            if event_action == "buy" and client_direction == "sell":
-                print(f"[COPIER SKIP] license={license_row.id} reason=direction_blocked buy_vs_sell")
+            if client_direction != "both" and client_direction != event_action:
+                print(f"[SKIP] license={license_row.id} reason=direction_blocked")
                 continue
 
-            if event_action == "sell" and client_direction == "buy":
-                print(f"[COPIER SKIP] license={license_row.id} reason=direction_blocked sell_vs_buy")
-                continue
-
+        # ✅ CLOSE check
         if event.event_type == "close":
             open_map = db.query(TradeTicketMap).filter(
                 TradeTicketMap.license_id == license_row.id,
@@ -225,16 +220,17 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
             ).first()
 
             if not open_map:
-                print(f"[COPIER SKIP] license={license_row.id} reason=no_open_map_for_close")
+                print(f"[SKIP] license={license_row.id} reason=no_open_position")
                 continue
 
+        # 🚀 CREATE EXECUTION (THIS WAS FAILING BEFORE)
         execution = TradeExecution(
             copier_event_id=event.id,
             license_id=license_row.id,
             ea_id=event.ea_id,
             master_ticket=event.master_ticket,
             client_ticket=None,
-            symbol=normalized_symbol,
+            symbol=event.symbol,
             action=event.action,
             lot_size=symbol_setting.lot_size,
             sl=event.sl,
@@ -245,9 +241,11 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
             status="pending",
             error_message=None,
         )
+
         db.add(execution)
         created_rows.append(execution)
-        print(f"[COPIER OK] license={license_row.id} symbol_setting={symbol_setting.symbol_name}")
+
+        print(f"[EXEC CREATED] license={license_row.id}")
 
     db.commit()
 
