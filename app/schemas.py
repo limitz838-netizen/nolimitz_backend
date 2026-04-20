@@ -306,6 +306,11 @@ class ClientRemoveSymbolRequest(BaseModel):
     symbol_name: str
 
 
+class ClientRemoveSymbolResponse(BaseModel):
+    message: str
+    symbol_name: str
+    enabled: bool
+
 class ClientTradeHistoryRequest(BaseModel):
     license_key: str
     limit: int = 30

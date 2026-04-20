@@ -26,6 +26,8 @@ from app.schemas import (
     ClientMT5StatusResponse,
     ClientSymbolSettingOut,
     ClientSymbolSettingSave,
+    ClientRemoveSymbolRequest,
+    ClientRemoveSymbolResponse,
     ClientTradeHistoryRequest,
     ClientTradeHistoryItem,
     ClientRobotControlRequest,
