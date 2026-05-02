@@ -438,3 +438,19 @@ class TradeTicketMap(Base):
     last_error = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class LicenseQuotaRequest(Base):
+    __tablename__ = "license_quota_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    admin_id = Column(Integer, ForeignKey("admins.id"), nullable=False)
+    requested_amount = Column(Integer, nullable=False)
+
+    status = Column(String, default="pending")  # pending / approved / rejected
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    processed_at = Column(DateTime(timezone=True), nullable=True)
+
+    admin = relationship("Admin")    

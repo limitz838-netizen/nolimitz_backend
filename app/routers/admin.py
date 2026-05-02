@@ -1,6 +1,7 @@
 import os
 import shutil
 from typing import List, Optional
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
 from sqlalchemy.orm import Session
@@ -12,6 +13,7 @@ from app.auth import (
     verify_password,
 )
 from app.database import get_db
+from app.models import LicenseQuotaRequest
 from app.models import Admin, AdminProfile, License, MasterAccount
 from app.schemas import (
     AdminApprovalResponse,
@@ -529,3 +531,72 @@ def set_license_quota(
         "admin_id": admin.id,
         "license_quota": admin.license_quota,
     }
+
+
+@router.post("/request-license-quota")
+def request_license_quota(
+    data: dict,
+    current_admin: Admin = Depends(get_current_approved_admin),
+    db: Session = Depends(get_db),
+):
+    amount = data.get("amount")
+
+    if not amount or int(amount) <= 0:
+        raise HTTPException(status_code=400, detail="Invalid amount")
+
+    request = LicenseQuotaRequest(
+        admin_id=current_admin.id,
+        requested_amount=int(amount),
+        status="pending"
+    )
+
+    db.add(request)
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "Request submitted successfully"
+    }
+
+
+@router.get("/license-requests")
+def get_license_requests(
+    current_admin: Admin = Depends(get_current_super_admin),
+    db: Session = Depends(get_db),
+):
+    requests = db.query(LicenseQuotaRequest).order_by(LicenseQuotaRequest.id.desc()).all()
+
+    return [
+        {
+            "id": r.id,
+            "admin_id": r.admin_id,
+            "requested_amount": r.requested_amount,
+            "status": r.status
+        }
+        for r in requests
+    ]
+
+
+@router.post("/approve-request/{request_id}")
+def approve_request(
+    request_id: int,
+    current_admin: Admin = Depends(get_current_super_admin),
+    db: Session = Depends(get_db),
+):
+    req = db.query(LicenseQuotaRequest).filter_by(id=request_id).first()
+
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    if req.status != "pending":
+        raise HTTPException(status_code=400, detail="Already processed")
+
+    admin = db.query(Admin).filter_by(id=req.admin_id).first()
+
+    admin.license_quota += req.requested_amount
+    req.status = "approved"
+    req.processed_at = datetime.utcnow()
+
+    db.commit()
+
+    return {"success": True}

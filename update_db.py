@@ -5,8 +5,16 @@ DATABASE_URL = "postgresql://nolimitzuser:8CdrbHNlWrXw7OVN2NrZfg3yaRDqLZYC@dpg-d
 engine = create_engine(DATABASE_URL)
 
 with engine.connect() as conn:
-    conn.execute(text("ALTER TABLE admins ADD COLUMN IF NOT EXISTS license_quota INTEGER DEFAULT 0;"))
-    conn.execute(text("ALTER TABLE admins ADD COLUMN IF NOT EXISTS license_used INTEGER DEFAULT 0;"))
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS license_quota_requests (
+            id SERIAL PRIMARY KEY,
+            admin_id INTEGER NOT NULL,
+            requested_amount INTEGER NOT NULL,
+            status VARCHAR DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT NOW(),
+            processed_at TIMESTAMP
+        );
+    """))
     conn.commit()
 
 print("DONE ✅")
