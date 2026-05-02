@@ -125,6 +125,10 @@ def build_admin_list_item(admin: Admin) -> AdminListItem:
         role=admin.role,
         is_approved=admin.is_approved,
         is_active=admin.is_active,
+
+        # ✅ ADD THESE
+        license_quota=admin.license_quota,
+        license_used=admin.license_used,
     )
 
 
@@ -496,4 +500,32 @@ def get_master_account(
         "mt_server": account.mt_server,
         "account_name": account.account_name,
         "broker_name": account.broker_name,
+    }
+
+
+@router.post("/set-quota/{admin_id}")
+def set_license_quota(
+    admin_id: int,
+    data: dict,
+    current_admin: Admin = Depends(get_current_super_admin),
+    db: Session = Depends(get_db),
+):
+    quota = data.get("quota")
+
+    if quota is None or int(quota) < 0:
+        raise HTTPException(status_code=400, detail="Invalid quota")
+
+    admin = db.query(Admin).filter(Admin.id == admin_id).first()
+
+    if not admin:
+        raise HTTPException(status_code=404, detail="Admin not found")
+
+    admin.license_quota = int(quota)
+
+    db.commit()
+
+    return {
+        "success": True,
+        "admin_id": admin.id,
+        "license_quota": admin.license_quota,
     }

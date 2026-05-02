@@ -68,6 +68,8 @@ class AdminListItem(BaseModel):
     role: str
     is_approved: bool
     is_active: bool
+    license_quota: int
+    license_used: int
 
 
 class LogoUploadResponse(BaseModel):

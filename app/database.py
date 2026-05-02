@@ -12,11 +12,15 @@ print("DB USED =", DATABASE_URL)
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
+# Fix postgres:// issue
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 engine_kwargs = {
-    "pool_pre_ping": True,
+    "pool_pre_ping": True,     # ✅ checks dead connections
+    "pool_recycle": 300,       # 🔥 FIXES YOUR ERROR (VERY IMPORTANT)
+    "pool_size": 5,            # ✅ prevents too many connections
+    "max_overflow": 10,        # ✅ allows burst safely
 }
 
 if DATABASE_URL.startswith("sqlite"):

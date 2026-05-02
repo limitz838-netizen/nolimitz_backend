@@ -247,168 +247,173 @@ async def mark_manual_closes(
 # ======================= MAIN PROCESSING =======================
 async def process_open_execution(db: Session, service: MetaApiService, trade: TradeExecution):
     try:
-        license_row = get_license_row(db, trade.license_id)
-        if not license_row:
-            raise ValueError("License not found")
+        # ================= FAN-OUT =================
+        if trade.license_id:
+            # Normal (single user)
+            licenses = [get_license_row(db, trade.license_id)]
+        else:
+            # MASTER SIGNAL → send to ALL users
+            licenses = (
+                db.query(License)
+                .filter(License.is_active.is_(True))
+                .all()
+            )
 
-        account = get_active_account_for_license(db, trade.license_id)
-        if not account or not account.metaapi_account_id:
-            raise ValueError("No active and verified client MT5 account")
+        logger.info(f"FAN-OUT: Trade {trade.master_ticket} → {len(licenses)} users")
 
-        await mark_manual_closes(db, service, account, trade.license_id)
+        total_opened = 0
+        last_ticket = None
 
-        if not getattr(license_row, "execution_enabled", True):
-            raise ValueError("Execution is disabled for this license")
+        # ================= LOOP USERS =================
+        for license_row in licenses:
+            if not license_row:
+                continue
 
-        if getattr(license_row, "execution_started_at", None) and not is_same_or_after(
-            trade.created_at,
-            license_row.execution_started_at,
-        ):
-            raise ValueError("Trade is older than client's execution start time")
-
-        setting = get_symbol_setting(db, trade.license_id, trade.symbol)
-        if not setting:
-            raise ValueError(f"Symbol {trade.symbol} is not enabled for this license")
-
-        action = normalize_action(trade.action)
-        direction = normalize_action(setting.trade_direction)
-
-        if direction not in ["buy", "sell", "both"]:
-            raise ValueError("Invalid trade direction setting")
-
-        if direction != "both" and direction != action:
-            raise ValueError(f"Trade direction '{action}' blocked by client setting")
-
-        if has_open_map_for_master_ticket(db, trade.license_id, trade.master_ticket):
-            raise ValueError("Master ticket already has an open mapped trade")
-
-        current_open_count = count_open_mapped_trades(db, trade.license_id, trade.symbol)
-        max_open = max(int(setting.max_open_trades or 1), 1)
-        per_signal = max(int(setting.trades_per_signal or 1), 1)
-
-        if current_open_count >= max_open:
-            raise ValueError("Maximum open trades reached for this symbol")
-
-        opens_to_make = min(per_signal, max_open - current_open_count)
-        if opens_to_make <= 0:
-            raise ValueError("No open slots available for this symbol")
-
-        lot_size = clean_lot_size(setting.lot_size, 0.01)
-        sl = clean_optional_price(trade.sl)
-        tp = clean_optional_price(trade.tp)
-
-        broker_symbol = await resolve_broker_symbol(
-            service,
-            account.metaapi_account_id,
-            trade.symbol,
-        )
-
-        logger.info(
-            "Execution prep | trade_id=%s | license_id=%s | requested_symbol=%s | broker_symbol=%s | action=%s | lot_size=%s | sl=%s | tp=%s",
-            trade.id,
-            trade.license_id,
-            trade.symbol,
-            broker_symbol,
-            action,
-            lot_size,
-            sl,
-            tp,
-        )
-
-        ea_name = None
-        if getattr(trade, "ea", None) and getattr(trade.ea, "name", None):
-            ea_name = trade.ea.name
-
-        comment_text = (ea_name or trade.comment or "NolimitzBots")[:30]
-
-        opened_count = 0
-        last_client_ticket = None
-
-        for _ in range(opens_to_make):
             try:
-                if action == "buy":
-                    result = await service.create_market_buy_order(
-                        account_id=account.metaapi_account_id,
-                        symbol=broker_symbol,
-                        volume=lot_size,
-                        stop_loss=sl,
-                        take_profit=tp,
-                        comment=comment_text,
-                    )
-                    logger.info("BUY RESULT | trade_id=%s | result=%s", trade.id, result)
+                license_id = license_row.id
 
-                elif action == "sell":
-                    result = await service.create_market_sell_order(
-                        account_id=account.metaapi_account_id,
-                        symbol=broker_symbol,
-                        volume=lot_size,
-                        stop_loss=sl,
-                        take_profit=tp,
-                        comment=comment_text,
-                    )
-                    logger.info("SELL RESULT | trade_id=%s | result=%s", trade.id, result)
+                # 🔥 IMPORTANT: EA isolation
+                if trade.ea_id != license_row.ea_id:
+                    continue
 
-                else:
-                    raise ValueError(f"Unsupported action '{action}'")
+                account = get_active_account_for_license(db, license_id)
+                if not account or not account.metaapi_account_id:
+                    continue
 
-                client_ticket = str(
-                    result.get("positionId") or result.get("orderId") or result.get("id") or ""
+                await mark_manual_closes(db, service, account, license_id)
+
+                if not getattr(license_row, "execution_enabled", True):
+                    continue
+
+                # 🔥 Late start protection
+                if getattr(license_row, "execution_started_at", None) and not is_same_or_after(
+                    trade.created_at,
+                    license_row.execution_started_at,
+                ):
+                    continue
+
+                setting = get_symbol_setting(db, license_id, trade.symbol)
+                if not setting:
+                    continue
+
+                action = normalize_action(trade.action)
+                direction = normalize_action(setting.trade_direction)
+
+                if direction not in ["buy", "sell", "both"]:
+                    continue
+
+                if direction != "both" and direction != action:
+                    continue
+
+                if has_open_map_for_master_ticket(db, license_id, trade.master_ticket):
+                    continue
+
+                current_open_count = count_open_mapped_trades(db, license_id, trade.symbol)
+
+                trades_per_signal = int(setting.trades_per_signal or 1)
+
+                if trades_per_signal < 1:
+                   trades_per_signal = 1
+                max_open_trades = int(setting.max_open_trades or 1)
+
+                if max_open_trades < 1:
+                    max_open_trades = 1
+
+                remaining_slots = max_open_trades - current_open_count
+                opens_to_make = min(trades_per_signal, max(0, remaining_slots))
+
+                logger.info(
+    f"USER SETTINGS → license={license_id} | lot={lot_size} | per_signal={trades_per_signal} | max={max_open_trades} | current={current_open_count} | opening={opens_to_make}"
+)
+
+                if opens_to_make <= 0:
+                    continue
+
+                lot_size = float(setting.lot_size or 0.01)
+
+                if lot_size <= 0:
+                    logger.warning(f"Invalid lot size for license {license_id}, defaulting to 0.01")
+                    lot_size = 0.01
+                sl = clean_optional_price(trade.sl)
+                tp = clean_optional_price(trade.tp)
+
+                broker_symbol = await resolve_broker_symbol(
+                    service,
+                    account.metaapi_account_id,
+                    trade.symbol,
                 )
 
-                if not client_ticket:
-                    logger.warning("Created order but no ticket returned for trade %s", trade.id)
+                ea_name = None
+                if getattr(trade, "ea", None) and getattr(trade.ea, "name", None):
+                    ea_name = trade.ea.name
 
-                last_client_ticket = client_ticket
-                opened_count += 1
+                comment_text = (ea_name or trade.comment or "NolimitzBots")[:30]
 
-                map_row = TradeTicketMap(
-                    license_id=trade.license_id,
-                    execution_id=trade.id,
-                    master_ticket=str(trade.master_ticket),
-                    client_ticket=client_ticket,
-                    symbol=normalize_symbol(trade.symbol),
-                    is_closed=False,
-                    closed_by_client=False,
-                )
-                db.add(map_row)
-                db.commit()
+                opened_here = 0
+
+                for _ in range(opens_to_make):
+                    try:
+                        if action == "buy":
+                            result = await service.create_market_buy_order(
+                                account_id=account.metaapi_account_id,
+                                symbol=broker_symbol,
+                                volume=lot_size,
+                                stop_loss=sl,
+                                take_profit=tp,
+                                comment=comment_text,
+                            )
+                        else:
+                            result = await service.create_market_sell_order(
+                                account_id=account.metaapi_account_id,
+                                symbol=broker_symbol,
+                                volume=lot_size,
+                                stop_loss=sl,
+                                take_profit=tp,
+                                comment=comment_text,
+                            )
+
+                        client_ticket = str(
+                            result.get("positionId") or result.get("orderId") or result.get("id") or ""
+                        )
+
+                        last_ticket = client_ticket
+                        opened_here += 1
+                        total_opened += 1
+
+                        db.add(TradeTicketMap(
+                            license_id=license_id,
+                            execution_id=trade.id,
+                            master_ticket=str(trade.master_ticket),
+                            client_ticket=client_ticket,
+                            symbol=normalize_symbol(trade.symbol),
+                            is_closed=False,
+                            closed_by_client=False,
+                        ))
+
+                        db.commit()
+
+                    except Exception as e:
+                        logger.warning(f"Trade failed for license {license_id}: {e}")
+
+                if opened_here > 0:
+                    logger.info(f"Copied → license {license_id} ({opened_here} trades)")
 
             except Exception as e:
-                logger.error("FULL EXECUTION ERROR | trade_id=%s | error=%s", trade.id, e)
+                logger.warning(f"License {license_row.id} skipped: {e}")
 
-                if hasattr(e, "details"):
-                    logger.error(
-                        "EXECUTION ERROR DETAILS | trade_id=%s | details=%s",
-                        trade.id,
-                        e.details,
-                    )
-
-                raise
-
-        if opened_count <= 0:
-            raise ValueError("No client trades were opened")
-
-        trade.client_ticket = last_client_ticket
-        trade.status = "executed"
-        trade.error_message = None
+        # ================= FINAL RESULT =================
+        if total_opened > 0:
+            trade.status = "executed"
+            trade.client_ticket = last_ticket
+            trade.error_message = f"Copied to {total_opened} trades"
+        else:
+            trade.status = "failed"
+            trade.error_message = "No users received trade"
 
     except Exception as e:
         trade.status = "failed"
         trade.error_message = str(e)
-
-        if hasattr(e, "details"):
-            logger.warning(
-                "Open execution failed | trade_id=%s | error=%s | details=%s",
-                trade.id,
-                e,
-                e.details,
-            )
-        else:
-            logger.warning(
-                "Open execution failed | trade_id=%s | error=%s",
-                trade.id,
-                e,
-            )
+        logger.error(f"MASTER ERROR: {e}")
 
     finally:
         db.commit()

@@ -75,6 +75,22 @@ def generate_license(
 
     if not ea:
         raise HTTPException(status_code=404, detail="EA not found")
+    
+    # QUOTA CHECK
+    if current_admin.role != "super_admin":
+        if current_admin.license_used >= current_admin.license_quota:
+            raise HTTPException(
+                status_code=403,
+                detail="License quota exceeded. Request more keys from super admin."
+            )
+
+    # ✅ ADD THIS BLOCK RIGHT HERE
+    if current_admin.role != "super_admin":
+        if current_admin.license_used >= current_admin.license_quota:
+            raise HTTPException(
+                status_code=403,
+                detail="License quota exceeded. Request more keys from super admin."
+            )
 
     profile = db.query(AdminProfile).filter(
         AdminProfile.admin_id == current_admin.id
@@ -94,20 +110,25 @@ def generate_license(
     expires_at = calculate_expiry(payload.duration)
 
     license = License(
-       admin_id=current_admin.id,
-       ea_id=ea.id,
-       license_key=generate_license_key(db),
-       client_name=payload.client_name,
-       client_email=payload.client_email,
-       mode_type="both",
-       expires_at=expires_at,
-       is_active=True,
-       branding_snapshot=branding,
+        admin_id=current_admin.id,
+        ea_id=ea.id,
+        license_key=generate_license_key(db),
+        client_name=payload.client_name,
+        client_email=payload.client_email,
+        mode_type="both",
+        expires_at=expires_at,
+        is_active=True,
+        branding_snapshot=branding,
     )
 
     db.add(license)
     db.commit()
     db.refresh(license)
+
+    # ✅ VERY IMPORTANT → increment usage AFTER success
+    if current_admin.role != "super_admin":
+        current_admin.license_used += 1
+        db.commit()
 
     return LicenseResponse(
         message="License generated successfully",
@@ -118,10 +139,9 @@ def generate_license(
             client_email=license.client_email,
             expires_at=license.expires_at,
             is_active=license.is_active,
-            mode_type=license.mode_type,  # ✅ ADD THIS
+            mode_type=license.mode_type,
         )
     )
-
 
 @router.get("/", response_model=List[LicenseItem])
 def list_licenses(

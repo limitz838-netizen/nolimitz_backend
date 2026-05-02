@@ -21,15 +21,12 @@ class Admin(Base):
     is_approved = Column(Boolean, nullable=False, default=False)
     is_active = Column(Boolean, nullable=False, default=True)
 
+    # ✅ ADD THESE 👇
+    license_quota = Column(Integer, nullable=False, default=0)   # total allowed
+    license_used = Column(Integer, nullable=False, default=0)    # used count
+
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
-
-    profile = relationship("AdminProfile", back_populates="admin", uselist=False, cascade="all, delete-orphan")
-    eas = relationship("ExpertAdvisor", back_populates="admin", cascade="all, delete-orphan")
-    licenses = relationship("License", back_populates="admin")
-    signals = relationship("Signal", back_populates="admin")
-    robot_trades = relationship("RobotTrade", back_populates="admin")
-    source_copier_events = relationship("CopierTradeEvent", back_populates="source_admin")
 
 class MasterAccount(Base):
     __tablename__ = "master_accounts"
