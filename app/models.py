@@ -398,6 +398,8 @@ class TradeExecution(Base):
     master_ticket = Column(String, nullable=False, index=True)
     client_ticket = Column(String, nullable=True, index=True)
 
+    retry_count = Column(Integer, default=0)
+
     symbol = Column(String, nullable=False, index=True)
     action = Column(String, nullable=True)
     lot_size = Column(String, nullable=True)

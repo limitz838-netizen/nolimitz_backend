@@ -1,3 +1,5 @@
+import asyncio
+from app.execution_dispatcher import dispatch_trade
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -251,6 +253,9 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
 
     for row in created_rows:
         db.refresh(row)
+
+        # 🚀 INSTANT EXECUTION
+        asyncio.create_task(dispatch_trade(row.id))
 
     return created_rows
 

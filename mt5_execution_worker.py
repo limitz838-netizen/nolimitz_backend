@@ -24,7 +24,7 @@ logging.getLogger("socketio").setLevel(logging.WARNING)
 logging.getLogger("engineio").setLevel(logging.WARNING)
 
 # ========================= CONFIG =========================
-POLL_SECONDS = float(os.getenv("WORKER_POLL_SECONDS", "0.7"))
+POLL_SECONDS = float(os.getenv("WORKER_POLL_SECONDS", "0.3"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # ========================= LOGGING =========================
@@ -37,6 +37,19 @@ logger = logging.getLogger(__name__)
 
 
 # ========================= HELPERS =========================
+def symbols_match(master_symbol: str, client_symbol: str) -> bool:
+    m = normalize_symbol(master_symbol)
+    c = normalize_symbol(client_symbol)
+
+    if m == c:
+        return True
+
+    # Handles XAUUSD → XAUUSDc, EURUSD → EURUSD.m etc
+    if c.startswith(m) or c.endswith(m) or m in c:
+        return True
+
+    return False
+
 def utc_now():
     return datetime.now(timezone.utc)
 
@@ -110,7 +123,7 @@ async def resolve_broker_symbol(
     requested = normalize_symbol(requested_symbol)
 
     alias_map = {
-        "XAUUSD": ["XAUUSD", "XAUUSDM", "GOLD", "GOLDM", "XAUUSD.", "XAUUSDm"],
+        "XAUUSD": ["XAUUSD", "XAUUSDM", "GOLD", "GOLDM", "XAUUSD.", "XAUUSDm", "XAUUSDc"],
         "BTCUSD": ["BTCUSD", "BTCUSDM", "BTCUSDT", "BTCUSD.", "BTCUSDm"],
         "ETHUSD": ["ETHUSD", "ETHUSDM", "ETHUSDT", "ETHUSD.", "ETHUSDm"],
         "EURUSD": ["EURUSD", "EURUSDM", "EURUSD.", "EURUSDm"],
@@ -130,9 +143,16 @@ async def resolve_broker_symbol(
 
         for s in symbols:
             us = str(s).upper()
+
+            # remove common suffixes
+            clean_us = us.replace(".", "").replace("M", "").replace("C", "")
+
             for candidate in candidates:
                 cu = candidate.upper()
-                if us.startswith(cu) or us.endswith(cu) or cu in us:
+
+                clean_cu = cu.replace(".", "").replace("M", "").replace("C", "")
+
+                if clean_cu in clean_us:
                     return str(s)
 
         return await service.find_broker_symbol(account_id, requested)
@@ -238,7 +258,7 @@ async def mark_manual_closes(
                 changed = True
 
         if changed:
-            db.commit()
+            db.flush()
 
     except Exception as e:
         logger.warning("Failed to mark manual closes for license %s: %s", license_id, e)
@@ -286,14 +306,33 @@ async def process_open_execution(db: Session, service: MetaApiService, trade: Tr
                     continue
 
                 # 🔥 Late start protection
-                if getattr(license_row, "execution_started_at", None) and not is_same_or_after(
-                    trade.created_at,
-                    license_row.execution_started_at,
-                ):
-                    continue
+                start_time = getattr(license_row, "execution_started_at", None)
 
-                setting = get_symbol_setting(db, license_id, trade.symbol)
+                if start_time:
+                    trade_time = trade.created_at
+
+                    if trade_time is None or trade_time < start_time:
+                        logger.info(f"⏩ Skipping old trade for license {license_row.id}")
+                        continue
+
+                all_settings = (
+                    db.query(ClientSymbolSetting)
+                    .filter(
+                        ClientSymbolSetting.license_id == license_id,
+                        ClientSymbolSetting.enabled.is_(True),
+                    )
+                    .all()
+                )
+
+                setting = None
+
+                for s in all_settings:
+                    if symbols_match(trade.symbol, s.symbol_name):
+                        setting = s
+                        break
+
                 if not setting:
+                    logger.warning(f"No symbol match → master={trade.symbol} | license={license_id}")
                     continue
 
                 action = normalize_action(trade.action)
@@ -308,7 +347,11 @@ async def process_open_execution(db: Session, service: MetaApiService, trade: Tr
                 if has_open_map_for_master_ticket(db, license_id, trade.master_ticket):
                     continue
 
-                current_open_count = count_open_mapped_trades(db, license_id, trade.symbol)
+                current_open_count = count_open_mapped_trades(
+                    db,
+                    license_id,
+                    setting.symbol_name,
+                )
 
                 trades_per_signal = int(setting.trades_per_signal or 1)
 
@@ -322,14 +365,15 @@ async def process_open_execution(db: Session, service: MetaApiService, trade: Tr
                 remaining_slots = max_open_trades - current_open_count
                 opens_to_make = min(trades_per_signal, max(0, remaining_slots))
 
+                lot_size = float(setting.lot_size or 0.01)
+
                 logger.info(
-    f"USER SETTINGS → license={license_id} | lot={lot_size} | per_signal={trades_per_signal} | max={max_open_trades} | current={current_open_count} | opening={opens_to_make}"
-)
+                    f"USER SETTINGS → license={license_id} | lot={lot_size} | per_signal={trades_per_signal} | max={max_open_trades} | current={current_open_count} | opening={opens_to_make}"
+                )
 
                 if opens_to_make <= 0:
                     continue
 
-                lot_size = float(setting.lot_size or 0.01)
 
                 if lot_size <= 0:
                     logger.warning(f"Invalid lot size for license {license_id}, defaulting to 0.01")
@@ -340,7 +384,7 @@ async def process_open_execution(db: Session, service: MetaApiService, trade: Tr
                 broker_symbol = await resolve_broker_symbol(
                     service,
                     account.metaapi_account_id,
-                    trade.symbol,
+                    setting.symbol_name,  # 🔥 IMPORTANT
                 )
 
                 ea_name = None
@@ -385,7 +429,7 @@ async def process_open_execution(db: Session, service: MetaApiService, trade: Tr
                             execution_id=trade.id,
                             master_ticket=str(trade.master_ticket),
                             client_ticket=client_ticket,
-                            symbol=normalize_symbol(trade.symbol),
+                            symbol=normalize_symbol(setting.symbol_name),
                             is_closed=False,
                             closed_by_client=False,
                         ))
@@ -394,6 +438,17 @@ async def process_open_execution(db: Session, service: MetaApiService, trade: Tr
 
                     except Exception as e:
                         logger.warning(f"Trade failed for license {license_id}: {e}")
+
+                        trade.retry_count = (trade.retry_count or 0) + 1
+
+                        if trade.retry_count <= 3:
+                            trade.status = "retry"
+                            trade.error_message = f"Retry {trade.retry_count}: {str(e)}"
+                        else:
+                            trade.status = "failed"
+                            trade.error_message = f"Final failure after retries: {str(e)}"
+
+                        db.commit()
 
                 if opened_here > 0:
                     logger.info(f"Copied → license {license_id} ({opened_here} trades)")
@@ -480,24 +535,33 @@ async def run_worker():
     service = MetaApiService()
 
     while True:
-        db: Session = SessionLocal()
+        db_factory = SessionLocal
+        db = db_factory()
 
         try:
             pending_trades = (
                 db.query(TradeExecution)
-                .filter(TradeExecution.status == "pending")
+                .filter(
+                    TradeExecution.status.in_(["pending", "retry"])
+                    (TradeExecution.retry_count == None) | (TradeExecution.retry_count < 3)
+                )
                 .order_by(TradeExecution.id.asc())
                 .limit(30)
                 .all()
             )
 
+            tasks = []
+
             for trade in pending_trades:
                 event_type = normalize_action(getattr(trade, "event_type", "open"))
 
                 if event_type == "close":
-                    await process_close_execution(db, service, trade)
+                    tasks.append(process_close_execution(db_factory(), service, trade))
                 else:
-                    await process_open_execution(db, service, trade)
+                    tasks.append(process_open_execution(db_factory(), service, trade))
+
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         except Exception as e:
             logger.error("Unexpected error in worker loop: %s", e, exc_info=True)
