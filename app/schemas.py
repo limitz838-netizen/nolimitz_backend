@@ -54,6 +54,8 @@ class AdminMeResponse(BaseModel):
     whatsapp: Optional[str] = None
     company_name: Optional[str] = None
     license_balance: int = 0
+    license_quota: int = 0
+    license_used: int = 0
     licenses_generated: int = 0
     licenses_remaining: int = 0
 
