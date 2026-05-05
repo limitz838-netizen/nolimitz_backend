@@ -53,6 +53,9 @@ class AdminMeResponse(BaseModel):
     telegram: Optional[str] = None
     whatsapp: Optional[str] = None
     company_name: Optional[str] = None
+    license_balance: int = 0
+    licenses_generated: int = 0
+    licenses_remaining: int = 0
 
 
 class AdminApprovalResponse(BaseModel):

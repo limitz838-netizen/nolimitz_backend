@@ -100,7 +100,13 @@ def generate_admin_code(db: Session) -> int:
     return int(last_admin.admin_code) + 1
 
 
-def build_admin_me_response(admin: Admin, profile: Optional[AdminProfile]) -> AdminMeResponse:
+def build_admin_me_response(admin: Admin, profile: Optional[AdminProfile], db: Session) -> AdminMeResponse:
+    generated = db.query(func.count(License.id)).filter(
+        License.admin_id == admin.id
+    ).scalar() or 0
+
+    balance = getattr(admin, "license_balance", 0) or 0
+
     return AdminMeResponse(
         admin_id=admin.id,
         admin_code=admin.admin_code,
@@ -116,6 +122,9 @@ def build_admin_me_response(admin: Admin, profile: Optional[AdminProfile]) -> Ad
         telegram=profile.telegram if profile else None,
         whatsapp=profile.whatsapp if profile else None,
         company_name=profile.company_name if profile else None,
+        license_balance=balance,
+        licenses_generated=generated,
+        licenses_remaining=balance - generated,
     )
 
 
@@ -209,7 +218,7 @@ def admin_me(
         AdminProfile.admin_id == current_admin.id
     ).first()
 
-    return build_admin_me_response(current_admin, profile)
+    return build_admin_me_response(current_admin, profile, db)
 
 
 @router.put("/profile", response_model=BasicMessageResponse)
