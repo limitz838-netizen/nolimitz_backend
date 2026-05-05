@@ -22,9 +22,9 @@ class Admin(Base):
     is_active = Column(Boolean, nullable=False, default=True)
 
     # ✅ ADD THESE 👇
-    license_quota = Column(Integer, nullable=False, default=0)   # total allowed
-    license_used = Column(Integer, nullable=False, default=0)    # used count
-    license_balance = Column(Integer, default=0)
+    license_quota = Column(Integer, nullable=False, default=0)
+    license_used = Column(Integer, nullable=False, default=0)
+    license_balance = Column(Integer, nullable=False, default=0)
 
     # relationships
     profile = relationship(

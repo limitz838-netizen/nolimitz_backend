@@ -122,9 +122,12 @@ def build_admin_me_response(admin: Admin, profile: Optional[AdminProfile], db: S
         telegram=profile.telegram if profile else None,
         whatsapp=profile.whatsapp if profile else None,
         company_name=profile.company_name if profile else None,
-        license_balance=balance,
-        licenses_generated=generated,
-        licenses_remaining=balance - generated,
+        license_quota = admin.license_quota or 0,
+        license_used = admin.license_used or 0,
+        license_balance = admin.license_balance or 0,
+
+        licenses_generated = generated,
+        licenses_remaining = (admin.license_balance or 0) - generated,
     )
 
 
