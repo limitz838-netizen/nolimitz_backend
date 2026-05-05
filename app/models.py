@@ -399,6 +399,7 @@ class TradeExecution(Base):
     client_ticket = Column(String, nullable=True, index=True)
 
     retry_count = Column(Integer, default=0)
+    retry_at = Column(DateTime(timezone=True), nullable=True)
 
     symbol = Column(String, nullable=False, index=True)
     action = Column(String, nullable=True)
