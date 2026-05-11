@@ -55,13 +55,6 @@ class MasterAccount(Base):
     mt_password = Column(String, nullable=False)
     mt_server = Column(String, nullable=False)
 
-    metaapi_account_id = Column(String, nullable=True, unique=True, index=True)
-    metaapi_state = Column(String, nullable=True)
-    metaapi_connection_status = Column(String, nullable=True)
-    metaapi_region = Column(String, nullable=True)
-    metaapi_type = Column(String, nullable=True)
-    metaapi_reliability = Column(String, nullable=True)
-
     is_connected = Column(Boolean, default=False)
     account_name = Column(String, nullable=True)
     broker_name = Column(String, nullable=True)
