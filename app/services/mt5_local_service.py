@@ -1,72 +1,84 @@
-import shutil
-from pathlib import Path
-import MetaTrader5 as mt5
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import ClientMT5Account
+
+router = APIRouter(
+    prefix="/worker",
+    tags=["MT5 Workers"]
+)
 
 
-BASE_DIR = Path(r"C:\Users\user\Desktop\Nolimitz")
-TERMINALS_DIR = BASE_DIR / "terminals"
+def utc_now():
+    return datetime.now(timezone.utc)
 
 
-class MT5LocalService:
+@router.get("/pending-mt5")
+def get_pending_mt5_accounts(db: Session = Depends(get_db)):
 
-    def __init__(self):
-        pass
+    rows = db.query(ClientMT5Account).filter(
+        ClientMT5Account.is_verified == False
+    ).all()
+
+    results = []
+
+    for row in rows:
+        results.append({
+            "id": row.id,
+            "license_id": row.license_id,
+            "mt_login": row.mt_login,
+            "mt_password": row.mt_password,
+            "mt_server": row.mt_server,
+        })
+
+    return {
+        "count": len(results),
+        "accounts": results,
+    }
 
 
-    def create_terminal(self):
+@router.post("/update-mt5-status")
+def update_mt5_status(
+    payload: dict,
+    db: Session = Depends(get_db)
+):
 
-        existing = [
-            p for p in TERMINALS_DIR.iterdir()
-            if p.is_dir() and p.name.startswith("terminal_")
-        ]
+    row = db.query(ClientMT5Account).filter(
+        ClientMT5Account.id == payload.get("id")
+    ).first()
 
-        next_id = len(existing) + 1
+    if not row:
+        raise HTTPException(status_code=404, detail="MT5 account not found")
 
-        new_name = f"terminal_{next_id:03}"
+    success = payload.get("success", False)
 
-        source = TERMINALS_DIR / "terminal_001"
-        destination = TERMINALS_DIR / new_name
+    row.last_verified_at = utc_now()
 
-        shutil.copytree(source, destination)
+    if success:
+        row.is_verified = True
+        row.is_active = True
+        row.verification_error = None
 
-        return new_name
+        row.account_name = payload.get("account_name")
+        row.broker_name = payload.get("broker_name")
+        row.balance = payload.get("balance")
+        row.equity = payload.get("equity")
 
-
-    def connect_account(
-        self,
-        terminal_name,
-        login,
-        password,
-        server
-    ):
-
-        terminal_path = (
-            TERMINALS_DIR
-            / terminal_name
-            / "terminal64.exe"
+    else:
+        row.is_verified = False
+        row.is_active = False
+        row.verification_error = payload.get(
+            "error",
+            "Verification failed"
         )
 
-        connected = mt5.initialize(
-            path=str(terminal_path),
-            login=login,
-            password=password,
-            server=server,
-            timeout=60000,
-        )
+    db.commit()
+    db.refresh(row)
 
-        if not connected:
-
-            return {
-                "success": False,
-                "error": mt5.last_error()
-            }
-
-        account = mt5.account_info()
-
-        return {
-            "success": True,
-            "login": account.login,
-            "server": account.server,
-            "balance": account.balance,
-            "terminal": terminal_name,
-        }
+    return {
+        "message": "MT5 status updated",
+        "verified": row.is_verified,
+    }

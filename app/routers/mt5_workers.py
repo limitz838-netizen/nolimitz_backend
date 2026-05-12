@@ -4,66 +4,81 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import MT5Worker
-from app.schemas import MT5WorkerRegisterRequest, MT5WorkerResponse
+from app.models import ClientMT5Account
 
-router = APIRouter(prefix="/mt5-workers", tags=["MT5 Workers"])
+router = APIRouter(
+    prefix="/worker",
+    tags=["MT5 Workers"]
+)
 
 
 def utc_now():
     return datetime.now(timezone.utc)
 
 
-@router.post("/register", response_model=MT5WorkerResponse)
-def register_mt5_worker(payload: MT5WorkerRegisterRequest, db: Session = Depends(get_db)):
-    existing = db.query(MT5Worker).filter(
-        MT5Worker.worker_name == payload.worker_name.strip()
-    ).first()
+@router.get("/pending-mt5")
+def get_pending_mt5_accounts(db: Session = Depends(get_db)):
 
-    if existing:
-        existing.worker_type = payload.worker_type.strip()
-        existing.terminal_path = payload.terminal_path.strip()
-        existing.data_path = payload.data_path.strip() if payload.data_path else None
-        existing.is_active = True
-        existing.last_heartbeat = utc_now()
-        existing.last_error = None
+    rows = db.query(ClientMT5Account).filter(
+        ClientMT5Account.is_verified == False
+    ).all()
 
-        db.commit()
-        db.refresh(existing)
-        return existing
+    results = []
 
-    row = MT5Worker(
-        worker_name=payload.worker_name.strip(),
-        worker_type=payload.worker_type.strip(),
-        terminal_path=payload.terminal_path.strip(),
-        data_path=payload.data_path.strip() if payload.data_path else None,
-        is_active=True,
-        is_busy=False,
-        last_heartbeat=utc_now(),
-        last_error=None,
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return row
+    for row in rows:
+        results.append({
+            "id": row.id,
+            "license_id": row.license_id,
+            "mt_login": row.mt_login,
+            "mt_password": row.mt_password,
+            "mt_server": row.mt_server,
+        })
+
+    return {
+        "count": len(results),
+        "accounts": results,
+    }
 
 
-@router.get("/", response_model=list[MT5WorkerResponse])
-def list_mt5_workers(db: Session = Depends(get_db)):
-    return db.query(MT5Worker).order_by(MT5Worker.id.asc()).all()
+@router.post("/update-mt5-status")
+def update_mt5_status(
+    payload: dict,
+    db: Session = Depends(get_db)
+):
 
-
-@router.post("/{worker_name}/heartbeat", response_model=MT5WorkerResponse)
-def heartbeat_mt5_worker(worker_name: str, db: Session = Depends(get_db)):
-    row = db.query(MT5Worker).filter(
-        MT5Worker.worker_name == worker_name.strip()
+    row = db.query(ClientMT5Account).filter(
+        ClientMT5Account.id == payload.get("id")
     ).first()
 
     if not row:
-        raise HTTPException(status_code=404, detail="Worker not found")
+        raise HTTPException(status_code=404, detail="MT5 account not found")
 
-    row.last_heartbeat = utc_now()
-    row.is_active = True
+    success = payload.get("success", False)
+
+    row.last_verified_at = utc_now()
+
+    if success:
+        row.is_verified = True
+        row.is_active = True
+        row.verification_error = None
+
+        row.account_name = payload.get("account_name")
+        row.broker_name = payload.get("broker_name")
+        row.balance = payload.get("balance")
+        row.equity = payload.get("equity")
+
+    else:
+        row.is_verified = False
+        row.is_active = False
+        row.verification_error = payload.get(
+            "error",
+            "Verification failed"
+        )
+
     db.commit()
     db.refresh(row)
-    return row
+
+    return {
+        "message": "MT5 status updated",
+        "verified": row.is_verified,
+    }

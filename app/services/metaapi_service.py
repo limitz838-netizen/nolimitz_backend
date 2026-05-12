@@ -77,8 +77,17 @@ class MetaApiService:
             pass
 
         connection = account.get_rpc_connection()
-        await connection.connect()
-        await connection.wait_synchronized()
+
+        try:
+            await connection.connect()
+        except Exception:
+            await asyncio.sleep(2)
+            await connection.connect()
+
+        await asyncio.wait_for(
+            connection.wait_synchronized(),
+            timeout=120
+        )
         return account, connection
 
     async def get_account_info(self, account_id: str) -> Dict[str, Any]:
