@@ -325,13 +325,22 @@ async def save_client_mt5(
         return build_mt5_response("MT5 connected successfully", license_row, row)
 
     except Exception as e:
+
+        print("METAAPI ERROR:", str(e))
+
         error_msg = str(e)[:500]
+
         row.is_verified = False
         row.is_active = False
         row.verification_error = error_msg
         row.last_verified_at = utc_now()
+
         db.commit()
-        raise HTTPException(status_code=400, detail=error_msg)
+
+        raise HTTPException(
+            status_code=400,
+            detail=error_msg
+        )
 
 
 # =========================

@@ -7,11 +7,15 @@ from metaapi_cloud_sdk import MetaApi
 
 class MetaApiService:
     def __init__(self):
-        token = os.getenv("METAAPI_TOKEN")
-        if not token:
-            raise RuntimeError("METAAPI_TOKEN is missing")
+        self.token = "YOUR_METAAPI_TOKEN"
 
-        self.api = MetaApi(token)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        self.api = MetaApi(self.token)
 
     async def create_mt5_account(
         self,
