@@ -1,3 +1,5 @@
+import logging
+
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -35,6 +37,7 @@ from app.security import encrypt_text, decrypt_text
 from app.services.metaapi_service import MetaApiService
 
 router = APIRouter(prefix="/client", tags=["Client"])
+logger = logging.getLogger(__name__)
 
 
 # =========================
@@ -250,11 +253,13 @@ async def save_client_mt5(
 ):
     license_row = get_license_by_key(payload.license_key, db)
 
+    # Get or create MT5 account record
     row = db.query(ClientMT5Account).filter(
         ClientMT5Account.license_id == license_row.id
     ).first()
 
     if row:
+        # Update existing credentials
         row.mt_login = payload.mt_login.strip()
         row.mt_password = encrypt_text(payload.mt_password)
         row.mt_server = payload.mt_server.strip()
@@ -262,6 +267,7 @@ async def save_client_mt5(
         row.is_active = False
         row.verification_error = None
     else:
+        # Create new record
         row = ClientMT5Account(
             license_id=license_row.id,
             mt_login=payload.mt_login.strip(),
@@ -276,6 +282,7 @@ async def save_client_mt5(
     db.refresh(row)
 
     try:
+        # Create MetaAPI account if it doesn't exist
         if not row.metaapi_account_id:
             account = await metaapi_service.create_mt5_account(
                 login=payload.mt_login,
@@ -285,15 +292,52 @@ async def save_client_mt5(
             )
             row.metaapi_account_id = account.id
             db.commit()
+            db.refresh(row)
         else:
-            account = await metaapi_service.get_account(row.metaapi_account_id)
+            try:
+                account = await metaapi_service.get_account(row.metaapi_account_id)
 
-        if getattr(account, "state", None) not in ["DEPLOYED", "CONNECTED"]:
-            await metaapi_service.deploy_account_and_wait(account)
+            except Exception:
+                logger.warning(
+                    f"MetaApi account missing. Recreating for {license_row.license_key}"
+                )
 
-        result = await metaapi_service.get_account_info(account.id)
-        info = result["info"]
+                account = await metaapi_service.create_mt5_account(
+                    login=payload.mt_login,
+                    password=payload.mt_password,
+                    server=payload.mt_server,
+                    name=f"Nolimitz-{license_row.license_key[:12]}"
+                )
 
+                row.metaapi_account_id = account.id
+                db.commit()
+                db.refresh(row)
+
+        # === IMPROVED DEPLOYMENT ===
+        logger.info(
+            f"MetaApi state before deploy: {getattr(account, 'state', 'UNKNOWN')}"
+        )
+
+        logger.info(
+            f"Deploying account {row.metaapi_account_id}..."
+        )
+
+        await metaapi_service.deploy_account_and_wait(
+            account,
+            timeout_seconds=300
+        )
+
+        logger.info(
+            f"MetaApi deployment successful: {row.metaapi_account_id}"
+        )
+
+        # Get account info
+        result = await metaapi_service.get_account_info(
+            row.metaapi_account_id
+        )
+        info = result.get("info") or {}
+
+        # Update success state
         row.is_verified = True
         row.is_active = True
         row.account_name = info.get("name")
@@ -306,16 +350,28 @@ async def save_client_mt5(
         db.commit()
         db.refresh(row)
 
-        return build_mt5_response("MT5 connected successfully", license_row, row)
+        logger.info(f"MT5 Account {row.mt_login} successfully connected for license {license_row.license_key}")
+        
+        return build_mt5_response(
+            "MT5 connected successfully", 
+            license_row, 
+            row
+        )
 
     except Exception as e:
         error_msg = str(e)[:500]
+        logger.error(f"MT5 connection failed for license {license_row.license_key}: {error_msg}")
+
         row.is_verified = False
         row.is_active = False
         row.verification_error = error_msg
         row.last_verified_at = utc_now()
         db.commit()
-        raise HTTPException(status_code=400, detail=error_msg)
+
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Failed to connect to broker: {error_msg}"
+        )
 
 
 @router.post("/mt5/status", response_model=ClientMT5StatusResponse)
