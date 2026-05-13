@@ -31,7 +31,7 @@ from app.schemas import (
     ClientRobotControlRequest,
     ClientRobotControlResponse,
 )
-from app.security import encrypt_text
+from app.security import encrypt_text, decrypt_text
 from app.services.metaapi_service import MetaApiService
 
 router = APIRouter(prefix="/client", tags=["Client"])
@@ -41,7 +41,7 @@ router = APIRouter(prefix="/client", tags=["Client"])
 # DEPENDENCIES
 # =========================
 def get_metaapi_service() -> MetaApiService:
-    """Dependency for MetaApiService"""
+    """Dependency Injection for MetaApiService"""
     return MetaApiService()
 
 
@@ -74,6 +74,7 @@ def ensure_license_is_valid(license_row: Optional[License]) -> License:
 
 
 def get_license_by_key(license_key: str, db: Session) -> License:
+    """Centralized license retrieval + validation"""
     license_row = db.query(License).filter(
         License.license_key == license_key.strip()
     ).first()
@@ -195,17 +196,12 @@ def activate_client_license(
         license_row.activated_device_name = device_name
         license_row.first_activated_at = now
     elif license_row.activated_device_id != device_id:
-        raise HTTPException(
-            status_code=403,
-            detail="License key already used on another device"
-        )
+        raise HTTPException(status_code=403, detail="License key already used on another device")
 
     license_row.activated_device_name = device_name
     license_row.last_seen_at = now
 
-    if not db.query(ClientActivation).filter(
-        ClientActivation.license_id == license_row.id
-    ).first():
+    if not db.query(ClientActivation).filter(ClientActivation.license_id == license_row.id).first():
         db.add(ClientActivation(
             license_id=license_row.id,
             activated=True,
@@ -250,7 +246,6 @@ async def save_client_mt5(
 ):
     license_row = get_license_by_key(payload.license_key, db)
 
-    # Get or create MT5 account record
     row = db.query(ClientMT5Account).filter(
         ClientMT5Account.license_id == license_row.id
     ).first()
@@ -259,6 +254,8 @@ async def save_client_mt5(
         row.mt_login = payload.mt_login.strip()
         row.mt_password = encrypt_text(payload.mt_password)
         row.mt_server = payload.mt_server.strip()
+        row.is_verified = False
+        row.is_active = False
         row.verification_error = None
     else:
         row = ClientMT5Account(
@@ -275,7 +272,6 @@ async def save_client_mt5(
     db.refresh(row)
 
     try:
-        # Create MetaAPI account if it doesn't exist
         if not row.metaapi_account_id:
             account = await metaapi_service.create_mt5_account(
                 login=payload.mt_login,
@@ -286,30 +282,14 @@ async def save_client_mt5(
             row.metaapi_account_id = account.id
             db.commit()
         else:
-            try:
-                account = await metaapi_service.get_account(
-                    row.metaapi_account_id
-                )
+            account = await metaapi_service.get_account(row.metaapi_account_id)
 
-            except Exception:
-
-                # recreate MetaApi account if missing
-                account = await metaapi_service.create_mt5_account(
-                    login=payload.mt_login,
-                    password=payload.mt_password,
-                    server=payload.mt_server,
-                    name=f"Nolimitz-{license_row.license_key[:12]}"
-                )
-
-                row.metaapi_account_id = account.id
-                db.commit()
-
-        await metaapi_service.deploy_account_and_wait(account)
+        if getattr(account, "state", None) not in ["DEPLOYED", "CONNECTED"]:
+            await metaapi_service.deploy_account_and_wait(account)
 
         result = await metaapi_service.get_account_info(account.id)
         info = result["info"]
 
-        # Update success data
         row.is_verified = True
         row.is_active = True
         row.account_name = info.get("name")
@@ -325,27 +305,15 @@ async def save_client_mt5(
         return build_mt5_response("MT5 connected successfully", license_row, row)
 
     except Exception as e:
-
-        print("METAAPI ERROR:", str(e))
-
         error_msg = str(e)[:500]
-
         row.is_verified = False
         row.is_active = False
         row.verification_error = error_msg
         row.last_verified_at = utc_now()
-
         db.commit()
-
-        raise HTTPException(
-            status_code=400,
-            detail=error_msg
-        )
+        raise HTTPException(status_code=400, detail=error_msg)
 
 
-# =========================
-# REMAINING ENDPOINTS
-# =========================
 @router.post("/mt5/status", response_model=ClientMT5StatusResponse)
 def client_mt5_status(
     payload: ClientMT5StatusRequest,
@@ -366,6 +334,9 @@ def client_mt5_status(
     return build_mt5_status_response(license_row, row, "pending", "MT5 verification pending")
 
 
+# =========================
+# TRADE HISTORY
+# =========================
 @router.post("/trade-history", response_model=list[ClientTradeHistoryItem])
 def get_client_trade_history(
     payload: ClientTradeHistoryRequest,
@@ -381,15 +352,121 @@ def get_client_trade_history(
     return [build_trade_history_item(row) for row in rows]
 
 
-# Add the rest of your endpoints (symbols, robot, worker) here...
-# You can copy them from the previous complete version.
-
-@router.post("/robot/start", response_model=ClientRobotControlResponse)
-def start_client_robot(
-    payload: ClientRobotControlRequest,
-    db: Session = Depends(get_db)
+# =========================
+# SYMBOL SETTINGS
+# =========================
+@router.post("/symbols/save", response_model=ClientSymbolSettingOut)
+def save_client_symbol_setting(
+    payload: ClientSymbolSettingSave, db: Session = Depends(get_db)
 ):
     license_row = get_license_by_key(payload.license_key, db)
+
+    ea = db.query(ExpertAdvisor).filter(ExpertAdvisor.id == license_row.ea_id).first()
+    if not ea:
+        raise HTTPException(status_code=404, detail="EA not found")
+
+    normalized_symbol = normalize_symbol(payload.symbol_name)
+    direction = payload.trade_direction.strip().lower()
+
+    if direction not in ["buy", "sell", "both"]:
+        raise HTTPException(status_code=400, detail="trade_direction must be buy, sell, or both")
+
+    if payload.max_open_trades < 1 or payload.trades_per_signal < 1:
+        raise HTTPException(status_code=400, detail="max_open_trades and trades_per_signal must be at least 1")
+
+    if not db.query(EASymbol).filter(
+        EASymbol.ea_id == ea.id,
+        EASymbol.symbol_name == normalized_symbol,
+        EASymbol.enabled == True,
+    ).first():
+        raise HTTPException(status_code=403, detail="Symbol is not allowed for this EA")
+
+    existing = db.query(ClientSymbolSetting).filter(
+        ClientSymbolSetting.license_id == license_row.id,
+        ClientSymbolSetting.symbol_name == normalized_symbol,
+    ).first()
+
+    if existing:
+        existing.trade_direction = direction
+        existing.lot_size = payload.lot_size
+        existing.max_open_trades = payload.max_open_trades
+        existing.trades_per_signal = payload.trades_per_signal
+        existing.enabled = payload.enabled
+        db.commit()
+        db.refresh(existing)
+        return build_symbol_setting_response(existing)
+
+    new_row = ClientSymbolSetting(
+        license_id=license_row.id,
+        symbol_name=normalized_symbol,
+        trade_direction=direction,
+        lot_size=payload.lot_size,
+        max_open_trades=payload.max_open_trades,
+        trades_per_signal=payload.trades_per_signal,
+        enabled=payload.enabled,
+    )
+    db.add(new_row)
+    db.commit()
+    db.refresh(new_row)
+    return build_symbol_setting_response(new_row)
+
+
+@router.post("/symbols/list", response_model=list[ClientSymbolSettingOut])
+def list_client_symbol_settings(payload: ClientLicenseRequest, db: Session = Depends(get_db)):
+    license_row = get_license_by_key(payload.license_key, db)
+
+    rows = db.query(ClientSymbolSetting).filter(
+        ClientSymbolSetting.license_id == license_row.id,
+        ClientSymbolSetting.enabled == True,
+    ).order_by(ClientSymbolSetting.id.desc()).all()
+
+    return [build_symbol_setting_response(row) for row in rows]
+
+
+@router.post("/symbols/allowed")
+def get_allowed_symbols(payload: ClientLicenseRequest, db: Session = Depends(get_db)):
+    license_row = get_license_by_key(payload.license_key, db)
+    ea = db.query(ExpertAdvisor).filter(ExpertAdvisor.id == license_row.ea_id).first()
+
+    symbols = db.query(EASymbol).filter(
+        EASymbol.ea_id == ea.id,
+        EASymbol.enabled == True,
+    ).order_by(EASymbol.id.asc()).all()
+
+    return {
+        "license_key": license_row.license_key,
+        "ea_name": ea.name,
+        "mode_type": license_row.mode_type,
+        "allowed_symbols": [s.symbol_name for s in symbols],
+    }
+
+
+@router.post("/symbols/remove")
+def remove_client_symbol_setting(payload: ClientRemoveSymbolRequest, db: Session = Depends(get_db)):
+    license_row = get_license_by_key(payload.license_key, db)
+    normalized = normalize_symbol(payload.symbol_name)
+
+    row = db.query(ClientSymbolSetting).filter(
+        ClientSymbolSetting.license_id == license_row.id,
+        ClientSymbolSetting.symbol_name == normalized,
+    ).first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Symbol setting not found")
+
+    row.enabled = False
+    db.commit()
+
+    return {"message": "Symbol removed successfully", "symbol_name": normalized, "enabled": False}
+
+
+# =========================
+# ROBOT CONTROL
+# =========================
+@router.post("/robot/start", response_model=ClientRobotControlResponse)
+def start_client_robot(payload: ClientRobotControlRequest, db: Session = Depends(get_db)):
+    license_row = get_license_by_key(payload.license_key, db)
+
     mt5 = db.query(ClientMT5Account).filter(
         ClientMT5Account.license_id == license_row.id
     ).first()
@@ -412,11 +489,9 @@ def start_client_robot(
 
 
 @router.post("/robot/stop", response_model=ClientRobotControlResponse)
-def stop_client_robot(
-    payload: ClientRobotControlRequest,
-    db: Session = Depends(get_db)
-):
+def stop_client_robot(payload: ClientRobotControlRequest, db: Session = Depends(get_db)):
     license_row = get_license_by_key(payload.license_key, db)
+
     license_row.execution_enabled = False
     license_row.last_seen_at = utc_now()
     db.commit()
@@ -428,3 +503,51 @@ def stop_client_robot(
         execution_enabled=False,
         execution_started_at=license_row.execution_started_at,
     )
+
+
+# =========================
+# WORKER ENDPOINTS
+# =========================
+@router.get("/worker/pending-mt5")
+def worker_pending_mt5(db: Session = Depends(get_db)):
+    rows = db.query(ClientMT5Account).filter(ClientMT5Account.is_verified == False).all()
+    result = []
+    for row in rows:
+        license_row = db.get(License, row.license_id)
+        if license_row:
+            result.append({
+                "license_key": license_row.license_key,
+                "mt_login": row.mt_login,
+                "mt_password": decrypt_text(row.mt_password),
+                "mt_server": row.mt_server,
+            })
+    return result
+
+
+@router.post("/worker/update-mt5-status")
+def worker_update_mt5_status(payload: dict, db: Session = Depends(get_db)):
+    license_key = payload.get("license_key")
+    if not license_key:
+        raise HTTPException(status_code=400, detail="license_key is required")
+
+    license_row = db.query(License).filter(License.license_key == license_key).first()
+    if not license_row:
+        raise HTTPException(status_code=404, detail="License not found")
+
+    row = db.query(ClientMT5Account).filter(
+        ClientMT5Account.license_id == license_row.id
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="MT5 account not found")
+
+    row.is_verified = payload.get("verified", False)
+    row.is_active = row.is_verified
+    row.account_name = payload.get("account_name")
+    row.broker_name = payload.get("broker_name")
+    row.balance = payload.get("balance")
+    row.equity = payload.get("equity")
+    row.verification_error = payload.get("error")
+    row.last_verified_at = utc_now()
+
+    db.commit()
+    return {"success": True}
