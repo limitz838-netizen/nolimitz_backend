@@ -40,9 +40,13 @@ router = APIRouter(prefix="/client", tags=["Client"])
 # =========================
 # DEPENDENCIES
 # =========================
-def get_metaapi_service() -> MetaApiService:
-    """Dependency Injection for MetaApiService"""
-    return MetaApiService()
+# In app/routers/client.py
+
+async def get_metaapi_service() -> MetaApiService:
+    """Async dependency for MetaApiService"""
+    service = MetaApiService()
+    await service.initialize()          # ← Important
+    return service
 
 
 # =========================
