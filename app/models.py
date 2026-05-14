@@ -241,6 +241,8 @@ class ClientMT5Account(Base):
 
     license = relationship("License", back_populates="mt5_account")
     verification_jobs = relationship("MT5VerificationJob", back_populates="mt5_account", cascade="all, delete-orphan")
+     
+    ai_enabled = Column(Boolean, default=False)
 
     ai_auto_trade = Column(Boolean, default=False)
 
