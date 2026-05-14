@@ -1,5 +1,4 @@
 from fastapi import APIRouter, Query
-import MetaTrader5 as mt5
 
 from app.ai.services.ai_market_reader import AIMarketReader
 from app.ai.services.ai_scanner import AIScanner
