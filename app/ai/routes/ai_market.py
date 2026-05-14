@@ -1,6 +1,5 @@
 from fastapi import APIRouter, Query
 
-from app.ai.services.ai_market_reader import AIMarketReader
 from app.ai.services.ai_scanner import AIScanner
 from app.models import AISignal
 from app.database import SessionLocal
