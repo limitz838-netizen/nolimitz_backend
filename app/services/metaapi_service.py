@@ -104,6 +104,8 @@ class MetaApiService:
         for attempt in range(max_retries):
             try:
                 account = await self.get_account(account_id)
+
+                await account.reload()
                 
                 # Ensure account is deployed
                 state = getattr(account, 'state', None)
@@ -125,6 +127,11 @@ class MetaApiService:
             except Exception as e:
                 if attempt == max_retries - 1:
                     raise RuntimeError(f"Failed to get RPC connection after {max_retries} attempts: {e}")
+                
+                logger.warning(
+                    f"RPC connection retry {attempt + 1}/{max_retries} failed: {e}"
+                )
+
                 await asyncio.sleep(10 * (attempt + 1))
 
         raise RuntimeError("Could not establish RPC connection")
@@ -164,8 +171,11 @@ class MetaApiService:
             "actionType": "ORDER_TYPE_SELL",
             "comment": str(comment)[:50],
         }
-        if stop_loss: request["stopLoss"] = float(stop_loss)
-        if take_profit: request["takeProfit"] = float(take_profit)
+        if stop_loss is not None:
+            request["stopLoss"] = float(stop_loss)
+
+        if take_profit is not None:
+            request["takeProfit"] = float(take_profit)
 
         return await connection.create_market_sell_order(request)
 

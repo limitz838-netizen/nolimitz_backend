@@ -5,6 +5,8 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from app.database import Base
+from app.ai.models.ai_user import AIUser
+from app.ai.models.ai_market_state import AIMarketState
 
 
 class Admin(Base):
@@ -18,6 +20,11 @@ class Admin(Base):
     password_hash = Column(String, nullable=False)
 
     role = Column(String, nullable=False, default="admin")
+
+    plan = Column(String, nullable=False, default="FREE")
+
+    is_super_admin = Column(Boolean, default=False)
+
     is_approved = Column(Boolean, nullable=False, default=False)
     is_active = Column(Boolean, nullable=False, default=True)
 
@@ -235,6 +242,15 @@ class ClientMT5Account(Base):
     license = relationship("License", back_populates="mt5_account")
     verification_jobs = relationship("MT5VerificationJob", back_populates="mt5_account", cascade="all, delete-orphan")
 
+    ai_auto_trade = Column(Boolean, default=False)
+
+    max_ai_trades = Column(Integer, default=1)
+
+    risk_percent = Column(Float, default=2.0)
+
+    allow_buy = Column(Boolean, default=True)
+
+    allow_sell = Column(Boolean, default=True)
 
 class MT5Worker(Base):
     __tablename__ = "mt5_workers"
@@ -451,3 +467,44 @@ class LicenseQuotaRequest(Base):
     processed_at = Column(DateTime(timezone=True), nullable=True)
 
     admin = relationship("Admin")    
+
+
+class AISignal(Base):
+    __tablename__ = "ai_signals"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    symbol = Column(String)
+    timeframe = Column(String)
+
+    signal = Column(String)
+
+    confidence = Column(Integer)
+
+    entry_price = Column(Float)
+
+    stop_loss = Column(Float)
+
+    take_profit = Column(Float)
+
+    trend = Column(String)
+
+    status = Column(String, default="PENDING")
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AISettings(Base):
+    __tablename__ = "ai_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    auto_lot = Column(Boolean, default=True)
+
+    fixed_lot = Column(Float, default=0.01)
+
+    risk_percent = Column(Float, default=2)
+
+    max_trades = Column(Integer, default=1)
+
+    aggressive_mode = Column(Boolean, default=False)

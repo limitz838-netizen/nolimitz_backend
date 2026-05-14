@@ -23,6 +23,14 @@ from app.routers import mt5_workers
 from app.routers.client import router as client_router
 from app.routers.ea import router as ea_router
 from app.routers.license import router as license_router
+from app.ai.routes.ai_auth import router as ai_auth_router
+from app.ai.routes.ai_market import router as ai_market_router
+from app.ai.routes.ai_image_scan import router as ai_image_scan_router
+from app.ai.routes.ai_assistant import router as ai_assistant_router
+from app.ai.routes.live_market import router as live_market_router
+from app.ai.routes.performance import (
+    router as performance_router
+)
 
 Base.metadata.create_all(bind=engine)
 
@@ -96,6 +104,15 @@ app.include_router(robot_router)
 app.include_router(copier_router)
 app.include_router(mt5_workers.router)
 app.include_router(master_account_router)
+
+app.include_router(ai_auth_router)
+app.include_router(ai_market_router)
+app.include_router(ai_image_scan_router)
+app.include_router(ai_assistant_router)
+app.include_router(live_market_router)
+app.include_router(
+    performance_router
+)
 
 
 @app.get("/")
