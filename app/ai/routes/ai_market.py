@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Query
 
+from app.ai.services.ai_market_reader import AIMarketReader
 from app.ai.services.ai_scanner import AIScanner
 from app.models import AISignal
 from app.database import SessionLocal
@@ -12,12 +13,12 @@ router = APIRouter(
 
 
 TIMEFRAME_MAP = {
-    "M1": mt5.TIMEFRAME_M1,
-    "M5": mt5.TIMEFRAME_M5,
-    "M15": mt5.TIMEFRAME_M15,
-    "M30": mt5.TIMEFRAME_M30,
-    "H1": mt5.TIMEFRAME_H1,
-    "H4": mt5.TIMEFRAME_H4
+    "M1": "M1",
+    "M5": "M5",
+    "M15": "M15",
+    "M30": "M30",
+    "H1": "H1",
+    "H4": "H4"
 }
 
 
@@ -31,7 +32,7 @@ def get_candles(
 
     tf = TIMEFRAME_MAP.get(
         timeframe.upper(),
-        mt5.TIMEFRAME_M5
+        "M5"
     )
 
     candles = reader.get_candles(
@@ -57,7 +58,7 @@ def scan_market(
 
     tf = TIMEFRAME_MAP.get(
         timeframe.upper(),
-        mt5.TIMEFRAME_M5
+        "M5"
     )
 
     candles = reader.get_candles(
@@ -88,9 +89,9 @@ def multi_timeframe_scan(
     scanner = AIScanner()
 
     timeframes = {
-        "M5": mt5.TIMEFRAME_M5,
-        "M15": mt5.TIMEFRAME_M15,
-        "H1": mt5.TIMEFRAME_H1
+        "M5": "M5",
+        "M15": "M15",
+        "H1": "H1"
     }
 
     results = {}
