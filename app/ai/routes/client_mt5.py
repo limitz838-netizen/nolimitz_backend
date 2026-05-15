@@ -4,8 +4,6 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import ClientMT5Account
 
-from mt5_service import verify_mt5_credentials_direct
-
 router = APIRouter(
     prefix="/api/client",
     tags=["Client MT5"]
@@ -16,17 +14,21 @@ def save_mt5_account(
     data: dict,
     db: Session = Depends(get_db)
 ):
-
+    
     # =========================
-    # VERIFY MT5 LIVE
+    # VPS VERIFICATION PENDING
     # =========================
 
-    mt5_info = verify_mt5_credentials_direct(
-        mt_login=data["login"],
-        mt_password=data["password"],
-        mt_server=data["server"],
-        terminal_path=r"C:\Users\user\Desktop\NolimitzMT5Verifier\terminal64.exe"
-    )
+    mt5_info = {
+
+        "broker_name": "Pending VPS Verification",
+
+        "name": f"MT5-{data['login']}",
+
+        "balance": 0,
+
+        "equity": 0
+    }
 
     # =========================
     # CHECK EXISTING ACCOUNT
