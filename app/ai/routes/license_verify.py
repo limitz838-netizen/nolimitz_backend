@@ -19,6 +19,8 @@ def verify_license(
 
     license_key = data.get("license_key")
 
+    device_id = data.get("device_id")
+
     if not license_key:
 
         raise HTTPException(
@@ -68,6 +70,25 @@ def verify_license(
             status_code=403,
             detail="License expired"
         )
+    
+    # =========================
+    # DEVICE LOCK
+    # =========================
+
+    if not license.device_id:
+
+        license.device_id = device_id
+
+        db.commit()
+
+    else:
+
+         if license.device_id != device_id:
+
+              return {
+                 "success": False,
+                 "message": "License already used on another device"
+              }
 
     # =========================
     # RETURN FEATURES
