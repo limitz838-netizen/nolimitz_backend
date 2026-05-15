@@ -41,3 +41,33 @@ yarn-error.log*
 next-env.d.ts
 nolimitz-admin/
 nolimitzbots-client/
+
+# =========================
+# VPS MT5 WORKERS
+# =========================
+
+ai_market_scanner.py
+ai_execution_worker.py
+ai_trade_manager.py
+ai_close_manager.py
+
+# MT5
+terminal64.exe
+MQL5/
+profiles/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# local scripts
+test_*.py
+fix_*.py
+enable_*.py
+set_*.py
+add_*.py
+update_*.py
+check_*.py

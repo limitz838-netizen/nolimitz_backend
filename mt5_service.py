@@ -52,7 +52,7 @@ def verify_mt5_credentials_direct(
         raise Exception(f"MT5 login failed: {error}")
 
     # WAIT
-    time.sleep(3)
+    time.sleep(8)
 
     account_info = mt5.account_info()
 

@@ -190,6 +190,12 @@ class License(Base):
     symbol_settings = relationship("ClientSymbolSetting", back_populates="license", cascade="all, delete-orphan")
     executions = relationship("TradeExecution", back_populates="license")
 
+    ai_enabled = Column(Boolean, default=False)
+
+    mt5_enabled = Column(Boolean, default=False)
+
+    auto_trade_enabled = Column(Boolean, default=False)
+
 
 class ClientActivation(Base):
     __tablename__ = "client_activations"
@@ -207,44 +213,54 @@ class ClientMT5Account(Base):
     __tablename__ = "client_mt5_accounts"
 
     id = Column(Integer, primary_key=True, index=True)
-    license_id = Column(Integer, ForeignKey("licenses.id"), unique=True, nullable=False, index=True)
 
-    # Original MT5 credentials entered by client
-    mt_login = Column(String, nullable=False, index=True)
-    mt_password = Column(String, nullable=False)
-    mt_server = Column(String, nullable=False, index=True)
+    # Optional for future premium/copier linking
+    license_id = Column(
+        Integer,
+        ForeignKey("licenses.id"),
+        unique=True,
+        nullable=True,
+        index=True
+    )
 
-    # MetaApi cloud account details
-    metaapi_account_id = Column(String, nullable=True, unique=True, index=True)
-    metaapi_state = Column(String, nullable=True)  # CREATED / DEPLOYING / DEPLOYED / etc
-    metaapi_connection_status = Column(String, nullable=True)  # CONNECTED / DISCONNECTED / DISCONNECTED_FROM_BROKER
-    metaapi_region = Column(String, nullable=True)
-    metaapi_type = Column(String, nullable=True)  # usually cloud-g2
-    metaapi_reliability = Column(String, nullable=True)  # regular / high
+    # MT5 credentials
+    login = Column(String, unique=True, nullable=False)
+    password = Column(String, nullable=False)
+    server = Column(String, nullable=False)
 
-    # Account info fetched after successful sync
+    # Account info
     account_name = Column(String, nullable=True)
     broker_name = Column(String, nullable=True)
-    balance = Column(Float, nullable=True, default=0)
-    equity = Column(Float, nullable=True, default=0)
 
-    # Verification / sync info
+    balance = Column(Float, default=0)
+    equity = Column(Float, default=0)
+
+    # MetaApi info
+    metaapi_account_id = Column(String, nullable=True, unique=True)
+    metaapi_state = Column(String, nullable=True)
+    metaapi_connection_status = Column(String, nullable=True)
+
+    metaapi_region = Column(String, nullable=True)
+    metaapi_type = Column(String, nullable=True)
+    metaapi_reliability = Column(String, nullable=True)
+
+    # Verification
     last_verified_at = Column(DateTime(timezone=True), nullable=True)
     last_sync_at = Column(DateTime(timezone=True), nullable=True)
+
     verification_error = Column(String, nullable=True)
 
-    is_active = Column(Boolean, nullable=False, default=True)
-    is_verified = Column(Boolean, nullable=False, default=False)
+    is_verified = Column(Boolean, default=False)
+    is_active = Column(Boolean, default=True)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    lot_size = Column(Float, default=0.01)
 
-    license = relationship("License", back_populates="mt5_account")
-    verification_jobs = relationship("MT5VerificationJob", back_populates="mt5_account", cascade="all, delete-orphan")
-     
+    # AI Settings
     ai_enabled = Column(Boolean, default=False)
 
     ai_auto_trade = Column(Boolean, default=False)
+
+    ai_started_at = Column(DateTime(timezone=True), nullable=True)
 
     max_ai_trades = Column(Integer, default=1)
 
@@ -253,6 +269,59 @@ class ClientMT5Account(Base):
     allow_buy = Column(Boolean, default=True)
 
     allow_sell = Column(Boolean, default=True)
+
+    # Timestamps
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False
+    )
+
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False
+    )
+
+    # Relationships
+    license = relationship(
+        "License",
+        back_populates="mt5_account"
+    )
+
+    verification_jobs = relationship(
+        "MT5VerificationJob",
+        back_populates="mt5_account",
+        cascade="all, delete-orphan"
+    )
+
+
+class AISignal(Base):
+    __tablename__ = "ai_signals"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    symbol = Column(String, nullable=False)
+
+    action = Column(String, nullable=False)
+    # BUY or SELL
+
+    entry_price = Column(Float, nullable=True)
+
+    stop_loss = Column(Float, nullable=True)
+
+    take_profit = Column(Float, nullable=True)
+
+    confidence = Column(Float, default=0)
+
+    is_executed = Column(Boolean, default=False)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )
+
 
 class MT5Worker(Base):
     __tablename__ = "mt5_workers"
@@ -469,31 +538,6 @@ class LicenseQuotaRequest(Base):
     processed_at = Column(DateTime(timezone=True), nullable=True)
 
     admin = relationship("Admin")    
-
-
-class AISignal(Base):
-    __tablename__ = "ai_signals"
-
-    id = Column(Integer, primary_key=True, index=True)
-
-    symbol = Column(String)
-    timeframe = Column(String)
-
-    signal = Column(String)
-
-    confidence = Column(Integer)
-
-    entry_price = Column(Float)
-
-    stop_loss = Column(Float)
-
-    take_profit = Column(Float)
-
-    trend = Column(String)
-
-    status = Column(String, default="PENDING")
-
-    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class AISettings(Base):

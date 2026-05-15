@@ -111,14 +111,32 @@ def generate_license(
 
     license = License(
         admin_id=current_admin.id,
+
         ea_id=ea.id,
+
         license_key=generate_license_key(db),
+
         client_name=payload.client_name,
+
         client_email=payload.client_email,
+
         mode_type="both",
+
         expires_at=expires_at,
+
         is_active=True,
+
         branding_snapshot=branding,
+
+        # =========================
+        # AI PREMIUM FEATURES
+        # =========================
+
+        ai_enabled=True,
+
+        mt5_enabled=True,
+
+        auto_trade_enabled=True,
     )
 
     db.add(license)
