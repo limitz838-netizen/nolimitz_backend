@@ -30,6 +30,7 @@ from app.ai.routes.live_market import router as live_market_router
 from app.ai.routes.performance import (router as performance_router)
 from app.ai.routes.client_mt5 import (router as client_mt5_router)
 from app.ai.routes.license_verify import router as license_verify_router
+from app.ai.routes.worker import router as worker_router
 
 Base.metadata.create_all(bind=engine)
 
@@ -111,6 +112,7 @@ app.include_router(live_market_router)
 app.include_router(performance_router)
 app.include_router(client_mt5_router)
 app.include_router(license_verify_router)
+app.include_router(worker_router)
 
 
 @app.get("/")

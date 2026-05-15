@@ -48,8 +48,8 @@ def save_mt5_account(
 
     if existing:
 
+        existing.login = data["login"]
         existing.password = data["password"]
-
         existing.server = data["server"]
 
         existing.broker_name = mt5_info["broker_name"]
