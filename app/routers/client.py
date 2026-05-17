@@ -6,6 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.database import SessionLocal
 from app.database import get_db
 from app.models import (
     AdminProfile,
@@ -35,6 +36,9 @@ from app.schemas import (
 )
 from app.security import encrypt_text, decrypt_text
 from app.services.metaapi_service import MetaApiService
+
+from app.models import LiveTrade
+from app.ai.models.ai_trade_history import AITradeHistory
 
 router = APIRouter(prefix="/client", tags=["Client"])
 logger = logging.getLogger(__name__)
@@ -611,3 +615,161 @@ def worker_update_mt5_status(payload: dict, db: Session = Depends(get_db)):
 
     db.commit()
     return {"success": True}
+
+
+@router.get("/api/client/mt5-status")
+def get_mt5_status(
+    license_key: str
+):
+
+    db = SessionLocal()
+
+    try:
+
+        account = (
+            db.query(ClientMT5Account)
+            .filter(
+                ClientMT5Account.license_key
+                == license_key
+            )
+            .first()
+        )
+
+        if not account:
+
+            return {
+                "connected": False
+            }
+
+        return {
+
+            "connected": True,
+
+            "account_name":
+                account.account_name,
+
+            "broker_name":
+                account.broker_name,
+
+            "balance":
+                account.balance,
+
+            "equity":
+                account.equity,
+
+            "verified":
+                account.verified
+        }
+
+    finally:
+
+        db.close()  
+
+
+@router.get("/client/live-trades")
+def get_live_trades(
+    license_key: str = ""
+):
+
+    db = SessionLocal()
+
+    try:
+
+        live_trades = (
+            db.query(LiveTrade)
+            .filter(
+                LiveTrade.status == "OPEN"
+            )
+            .order_by(
+                LiveTrade.id.desc()
+            )
+            .all()
+        )
+
+        results = []
+
+        for trade in live_trades:
+
+            results.append({
+
+                "id": trade.id,
+
+                "symbol": trade.symbol,
+
+                "trade_type": trade.trade_type,
+
+                "lot_size": trade.lot_size,
+
+                "entry_price": trade.entry_price,
+
+                "stop_loss": trade.stop_loss,
+
+                "take_profit": trade.take_profit,
+
+                "profit": trade.profit,
+
+                "status": trade.status,
+
+                "mt5_ticket": trade.mt5_ticket,
+
+                "created_at": trade.created_at,
+            })
+
+        return results
+
+    finally:
+
+        db.close()
+
+
+@router.get("/client/trade-history")
+def get_trade_history(
+    license_key: str = ""
+):
+
+    db = SessionLocal()
+
+    try:
+
+        trades = (
+            db.query(AITradeHistory)
+            .order_by(
+                AITradeHistory.id.desc()
+            )
+            .all()
+        )
+
+        results = []
+
+        for trade in trades:
+
+            results.append({
+
+                "id": trade.id,
+
+                "symbol": trade.symbol,
+
+                "signal": trade.signal,
+
+                "trend": trade.trend,
+
+                "entry_price": trade.entry_price,
+
+                "stop_loss": trade.stop_loss,
+
+                "take_profit": trade.take_profit,
+
+                "profit": trade.profit,
+
+                "result": trade.result,
+
+                "confidence": trade.confidence,
+
+                "created_at": trade.created_at,
+            })
+
+        return results
+
+    finally:
+
+        db.close()       
