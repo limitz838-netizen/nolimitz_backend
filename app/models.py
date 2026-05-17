@@ -255,6 +255,8 @@ class ClientMT5Account(Base):
 
     lot_size = Column(Float, default=0.01)
 
+    verification_status = Column(String, default="PENDING")
+
     # AI Settings
     ai_enabled = Column(Boolean, default=False)
 

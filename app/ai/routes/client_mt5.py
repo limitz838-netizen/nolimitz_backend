@@ -60,7 +60,9 @@ def save_mt5_account(
 
         existing.equity = mt5_info["equity"]
 
-        existing.is_verified = True
+        existing.is_verified = False
+
+        existing.verification_status = "PENDING"
 
         existing.is_active = True
 
@@ -101,7 +103,9 @@ def save_mt5_account(
 
         equity=mt5_info["equity"],
 
-        is_verified=True,
+        is_verified=False,
+
+        verification_status="PENDING",
 
         ai_enabled=False,
 
