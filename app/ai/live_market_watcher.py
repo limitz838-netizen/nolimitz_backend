@@ -132,7 +132,7 @@ def save_market_state():
                 create_new_signal = True
 
             elif (
-                existing_signal.signal
+                existing_signal.action
                 != analysis["signal"]
             ):
 
@@ -154,7 +154,7 @@ def save_market_state():
 
                     timeframe="M5",
 
-                    signal=str(
+                    action=str(
                         analysis["signal"]
                     ),
 

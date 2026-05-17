@@ -21,6 +21,10 @@ class AITradeHistory(Base):
         index=True
     )
 
+    license_id = Column(Integer, nullable=True)
+
+    mt5_login = Column(String, nullable=True)
+
     symbol = Column(
         String,
         nullable=False

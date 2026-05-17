@@ -299,6 +299,48 @@ class ClientMT5Account(Base):
     )
 
 
+class LiveTrade(Base):
+    __tablename__ = "live_trades"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    license_key = Column(String, nullable=True)
+
+    mt5_login = Column(String, nullable=False)
+
+    symbol = Column(String, nullable=False)
+
+    trade_type = Column(String, nullable=False)
+
+    lot_size = Column(Float, default=0.01)
+
+    entry_price = Column(Float, default=0)
+
+    stop_loss = Column(Float, default=0)
+
+    take_profit = Column(Float, default=0)
+
+    status = Column(String, default="OPEN")
+
+    profit = Column(Float, default=0)
+
+    mt5_ticket = Column(String, nullable=True)
+
+    ai_signal_id = Column(Integer, nullable=True)
+
+    opened_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )
+
+    closed_at = Column(
+        DateTime(timezone=True),
+        nullable=True
+    )
+
+    is_ai_trade = Column(Boolean, default=True)    
+
+
 class AISignal(Base):
     __tablename__ = "ai_signals"
 
