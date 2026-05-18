@@ -7,6 +7,7 @@ from app.models import (
     ClientMT5Account,
     License,
     LiveTrade,
+    AITradeHistory,
 )
 
 router = APIRouter(
@@ -275,6 +276,114 @@ def get_mt5_status(
 
         db.close()
 
+
+# =========================================================
+# SAVE AI SETTINGS
+# =========================================================
+
+@router.post("/ai/settings")
+def save_ai_settings(
+    data: dict,
+    db: Session = Depends(get_db)
+):
+
+    license_key = data.get("license_key")
+
+    license_row = (
+        db.query(License)
+        .filter(
+            License.license_key == license_key
+        )
+        .first()
+    )
+
+    if not license_row:
+
+        return {
+            "success": False,
+            "message": "Invalid license"
+        }
+
+    account = (
+        db.query(ClientMT5Account)
+        .filter(
+            ClientMT5Account.license_id == license_row.id
+        )
+        .first()
+    )
+
+    if not account:
+
+        return {
+            "success": False,
+            "message": "MT5 account not connected"
+        }
+
+    account.lot_size = data.get("lot_size", 0.01)
+
+    account.trades_per_signal = data.get("trades_per_signal", 1)
+
+    account.max_open_trades = data.get("max_open_trades", 3)
+
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "AI settings saved"
+    }
+
+
+# =========================================================
+# GET AI SETTINGS
+# =========================================================
+
+@router.get("/ai/settings")
+def get_ai_settings(
+    license_key: str,
+    db: Session = Depends(get_db)
+):
+
+    license_row = (
+        db.query(License)
+        .filter(
+            License.license_key == license_key
+        )
+        .first()
+    )
+
+    if not license_row:
+
+        return {
+            "success": False
+        }
+
+    account = (
+        db.query(ClientMT5Account)
+        .filter(
+            ClientMT5Account.license_id == license_row.id
+        )
+        .first()
+    )
+
+    if not account:
+
+        return {
+            "success": False
+        }
+
+    return {
+
+        "success": True,
+
+        "lot_size":
+            account.lot_size,
+
+        "trades_per_signal":
+            account.trades_per_signal,
+
+        "max_open_trades":
+            account.max_open_trades
+    }
 
 # =========================================================
 # LIVE TRADES
