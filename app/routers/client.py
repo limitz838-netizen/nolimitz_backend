@@ -626,11 +626,34 @@ def get_mt5_status(
 
     try:
 
+        # =========================
+        # FIND LICENSE
+        # =========================
+
+        license_row = (
+            db.query(License)
+            .filter(
+                License.license_key
+                == license_key
+            )
+            .first()
+        )
+
+        if not license_row:
+
+            return {
+                "connected": False
+            }
+
+        # =========================
+        # FIND MT5 ACCOUNT
+        # =========================
+
         account = (
             db.query(ClientMT5Account)
             .filter(
-                ClientMT5Account.license_key
-                == license_key
+                ClientMT5Account.license_id
+                == license_row.id
             )
             .first()
         )
@@ -673,7 +696,6 @@ def get_mt5_status(
     finally:
 
         db.close()
-
 
 @router.get("/ai/live-trades")
 def get_live_trades(
