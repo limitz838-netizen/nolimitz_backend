@@ -299,6 +299,27 @@ class ClientMT5Account(Base):
     )
 
 
+class AISettings(Base):
+
+    __tablename__ = "ai_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    license_id = Column(Integer, unique=True)
+
+    lot_size = Column(Float, default=0.01)
+
+    trades_per_signal = Column(Integer, default=1)
+
+    max_open_trades = Column(Integer, default=3)
+
+    allowed_symbols = Column(Text)
+
+    ai_enabled = Column(Boolean, default=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class LiveTrade(Base):
     __tablename__ = "live_trades"
 
@@ -581,20 +602,4 @@ class LicenseQuotaRequest(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     processed_at = Column(DateTime(timezone=True), nullable=True)
 
-    admin = relationship("Admin")    
-
-
-class AISettings(Base):
-    __tablename__ = "ai_settings"
-
-    id = Column(Integer, primary_key=True, index=True)
-
-    auto_lot = Column(Boolean, default=True)
-
-    fixed_lot = Column(Float, default=0.01)
-
-    risk_percent = Column(Float, default=2)
-
-    max_trades = Column(Integer, default=1)
-
-    aggressive_mode = Column(Boolean, default=False)
+    admin = relationship("Admin")
