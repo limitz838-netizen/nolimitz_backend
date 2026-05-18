@@ -617,7 +617,7 @@ def worker_update_mt5_status(payload: dict, db: Session = Depends(get_db)):
     return {"success": True}
 
 
-@router.get("/api/client/ai/mt5-status")
+@router.get("/ai/mt5-status")
 def get_mt5_status(
     license_key: str
 ):
