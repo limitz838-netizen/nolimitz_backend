@@ -617,7 +617,7 @@ def worker_update_mt5_status(payload: dict, db: Session = Depends(get_db)):
     return {"success": True}
 
 
-@router.get("/api/client/mt5-status")
+@router.get("/ai/mt5-status")
 def get_mt5_status(
     license_key: str
 ):
@@ -687,7 +687,7 @@ def get_mt5_status(
         db.close()
 
 
-@router.get("/client/live-trades")
+@router.get("/ai/live-trades")
 def get_live_trades(
     license_key: str = ""
 ):
@@ -743,7 +743,7 @@ def get_live_trades(
         db.close()
 
 
-@router.get("/client/trade-history")
+@router.get("/ai/trade-history")
 def get_trade_history(
     license_key: str = ""
 ):
