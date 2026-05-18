@@ -7,7 +7,11 @@ from app.models import (
     ClientMT5Account,
     License,
     LiveTrade,
+    AISymbol
 )
+
+from app.models import AISymbol
+from app.ai.models.ai_market_state import AIMarketState
 
 router = APIRouter(
     prefix="/api/client",
@@ -442,3 +446,128 @@ def get_live_trades(
     finally:
 
         db.close()
+
+
+# =========================================================
+# AI STATUS
+# =========================================================
+
+@router.get("/ai/status")
+def ai_status():
+
+    db = SessionLocal()
+
+    try:
+
+        pairs = (
+            db.query(AISymbol)
+            .filter(
+                AISymbol.enabled == True
+            )
+            .count()
+        )
+
+        latest = (
+            db.query(AIMarketState)
+            .order_by(
+                AIMarketState.id.desc()
+            )
+            .first()
+        )
+
+        return {
+
+            "ai_active": True,
+
+            "pairs_tracked": pairs,
+
+            "last_scan":
+                latest.updated_at if latest else None
+        }
+
+    finally:
+
+        db.close()
+
+
+# =========================================================
+# AI SYMBOLS
+# =========================================================
+
+@router.get("/ai/symbols")
+def ai_symbols():
+
+    db = SessionLocal()
+
+    try:
+
+        symbols = db.query(AISymbol).all()
+
+        return [
+
+            {
+                "symbol": s.symbol,
+                "enabled": s.enabled
+            }
+
+            for s in symbols
+        ]
+
+    finally:
+
+        db.close()
+
+
+# =========================================================
+# MARKET DATA
+# =========================================================
+
+@router.get("/ai/market-data")
+def market_data(
+    symbol: str = "XAUUSD"
+):
+
+    db = SessionLocal()
+
+    try:
+
+        state = (
+            db.query(AIMarketState)
+            .filter(
+                AIMarketState.symbol == symbol
+            )
+            .first()
+        )
+
+        if not state:
+
+            return {
+                "success": False
+            }
+
+        return {
+
+            "success": True,
+
+            "symbol": state.symbol,
+
+            "signal": state.signal,
+
+            "trend": state.trend,
+
+            "confidence": state.confidence,
+
+            "entry": state.entry,
+
+            "stop_loss": state.stop_loss,
+
+            "take_profit": state.take_profit,
+
+            "analysis": state.analysis,
+
+            "updated_at": state.updated_at
+        }
+
+    finally:
+
+        db.close()        
