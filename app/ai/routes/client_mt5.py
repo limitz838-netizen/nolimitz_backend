@@ -1,20 +1,52 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from app.database import get_db
-from app.models import ClientMT5Account
+from app.database import get_db, SessionLocal
+
+from app.models import (
+    ClientMT5Account,
+    License,
+    LiveTrade,
+    AITradeHistory
+)
 
 router = APIRouter(
     prefix="/api/client",
     tags=["Client MT5"]
 )
 
+
+# =========================================================
+# SAVE MT5 ACCOUNT
+# =========================================================
+
 @router.post("/mt5-account")
 def save_mt5_account(
     data: dict,
     db: Session = Depends(get_db)
 ):
-    
+
+    # =========================
+    # FIND LICENSE
+    # =========================
+
+    license_key = data.get("license_key")
+
+    license_row = (
+        db.query(License)
+        .filter(
+            License.license_key == license_key
+        )
+        .first()
+    )
+
+    if not license_row:
+
+        return {
+            "success": False,
+            "message": "Invalid license key"
+        }
+
     # =========================
     # VPS VERIFICATION PENDING
     # =========================
@@ -37,7 +69,7 @@ def save_mt5_account(
     existing = (
         db.query(ClientMT5Account)
         .filter(
-            ClientMT5Account.login == data["login"]
+            ClientMT5Account.license_id == license_row.id
         )
         .first()
     )
@@ -48,8 +80,12 @@ def save_mt5_account(
 
     if existing:
 
+        existing.license_id = license_row.id
+
         existing.login = data["login"]
+
         existing.password = data["password"]
+
         existing.server = data["server"]
 
         existing.broker_name = mt5_info["broker_name"]
@@ -71,14 +107,23 @@ def save_mt5_account(
         db.refresh(existing)
 
         return {
+
             "success": True,
+
             "message": "MT5 account updated",
+
             "account": {
+
                 "id": existing.id,
+
                 "name": existing.account_name,
+
                 "broker": existing.broker_name,
+
                 "balance": existing.balance,
+
                 "equity": existing.equity,
+
                 "verified": existing.is_verified
             }
         }
@@ -88,6 +133,8 @@ def save_mt5_account(
     # =========================
 
     new_account = ClientMT5Account(
+
+        license_id=license_row.id,
 
         login=data["login"],
 
@@ -149,3 +196,199 @@ def save_mt5_account(
             "verified": new_account.is_verified
         }
     }
+
+
+# =========================================================
+# MT5 STATUS
+# =========================================================
+
+@router.get("/ai/mt5-status")
+def get_mt5_status(
+    license_key: str
+):
+
+    db = SessionLocal()
+
+    try:
+
+        # =========================
+        # FIND LICENSE
+        # =========================
+
+        license_row = (
+            db.query(License)
+            .filter(
+                License.license_key == license_key
+            )
+            .first()
+        )
+
+        if not license_row:
+
+            return {
+                "connected": False
+            }
+
+        # =========================
+        # FIND MT5 ACCOUNT
+        # =========================
+
+        account = (
+            db.query(ClientMT5Account)
+            .filter(
+                ClientMT5Account.license_id == license_row.id
+            )
+            .first()
+        )
+
+        if not account:
+
+            return {
+                "connected": False
+            }
+
+        return {
+
+            "connected": True,
+
+            "login": account.login,
+
+            "broker": account.broker_name,
+
+            "server": account.server,
+
+            "name": account.account_name,
+
+            "balance": account.balance,
+
+            "equity": account.equity,
+
+            "verified": account.is_verified,
+
+            "verification_status":
+                account.verification_status,
+
+            "last_verified":
+                account.last_verified_at
+        }
+
+    finally:
+
+        db.close()
+
+
+# =========================================================
+# LIVE TRADES
+# =========================================================
+
+@router.get("/ai/live-trades")
+def get_live_trades(
+    license_key: str = ""
+):
+
+    db = SessionLocal()
+
+    try:
+
+        trades = (
+            db.query(LiveTrade)
+            .filter(
+                LiveTrade.status == "OPEN"
+            )
+            .order_by(
+                LiveTrade.id.desc()
+            )
+            .all()
+        )
+
+        results = []
+
+        for trade in trades:
+
+            results.append({
+
+                "id": trade.id,
+
+                "symbol": trade.symbol,
+
+                "trade_type": trade.trade_type,
+
+                "lot_size": trade.lot_size,
+
+                "entry_price": trade.entry_price,
+
+                "stop_loss": trade.stop_loss,
+
+                "take_profit": trade.take_profit,
+
+                "profit": trade.profit,
+
+                "status": trade.status,
+
+                "mt5_ticket": trade.mt5_ticket,
+
+                "created_at": trade.created_at
+            })
+
+        return results
+
+    finally:
+
+        db.close()
+
+
+# =========================================================
+# TRADE HISTORY
+# =========================================================
+
+@router.get("/ai/trade-history")
+def get_trade_history(
+    license_key: str = ""
+):
+
+    db = SessionLocal()
+
+    try:
+
+        trades = (
+            db.query(AITradeHistory)
+            .order_by(
+                AITradeHistory.id.desc()
+            )
+            .all()
+        )
+
+        results = []
+
+        for trade in trades:
+
+            results.append({
+
+                "id": trade.id,
+
+                "symbol": trade.symbol,
+
+                "signal": trade.signal,
+
+                "trend": trade.trend,
+
+                "entry_price": trade.entry_price,
+
+                "stop_loss": trade.stop_loss,
+
+                "take_profit": trade.take_profit,
+
+                "profit": trade.profit,
+
+                "result": trade.result,
+
+                "confidence": trade.confidence,
+
+                "created_at": trade.created_at
+            })
+
+        return results
+
+    finally:
+
+        db.close()
