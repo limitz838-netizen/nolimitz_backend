@@ -3,7 +3,7 @@ import numpy as np
 
 class AIScanner:
 
-    def analyze_market(self, candles: list[dict]) -> dict:
+    def analyze_market(self, candles, htf_candles=None):
         """
         Professional SMC + Price Action Scanner
         Designed to generate real trading signals with strong reasoning.

@@ -675,3 +675,18 @@ class LicenseQuotaRequest(Base):
     processed_at = Column(DateTime(timezone=True), nullable=True)
 
     admin = relationship("Admin")
+
+
+class AISymbol(Base):
+    __tablename__ = "ai_symbols"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    symbol = Column(String, unique=True, nullable=False)
+
+    enabled = Column(Boolean, default=True)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )

@@ -6,17 +6,33 @@ from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.ai.models.ai_market_state import AIMarketState
-from app.models import AISignal
+from app.models import AISignal, AISymbol
 from app.ai.services.ai_scanner import AIScanner   # Updated scanner above
 
 # =========================
 # CONFIGURATION
 # =========================
-SYMBOLS = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY"]
 
 SCANNER = AIScanner()
 MIN_CONFIDENCE = 58
 MIN_RR_RATIO = 1.6
+
+def get_ai_symbols():
+
+    db = SessionLocal()
+
+    try:
+
+        rows = (
+            db.query(AISymbol)
+            .filter(AISymbol.enabled == True)
+            .all()
+        )
+
+        return [r.symbol for r in rows]
+
+    finally:
+        db.close()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -156,7 +172,11 @@ def analyze_symbol(symbol: str):
 def save_market_state():
     db: Session = SessionLocal()
     try:
-        for symbol in SYMBOLS:
+        symbols = get_ai_symbols()
+
+        logging.info(f"ACTIVE AI SYMBOLS: {symbols}")
+
+        for symbol in symbols:
             logging.info(f"🔍 Multi-TF Scan: {symbol}")
 
             analysis = analyze_symbol(symbol)
@@ -187,11 +207,17 @@ def save_market_state():
 
             recent_duplicate = False
 
-            if last_signal:
+            if last_signal and last_signal.created_at:
 
                 signal_age = (
-                    datetime.utcnow() - last_signal.created_at
+                    datetime.datetime.utcnow() - last_signal.created_at
                 ).total_seconds()
+
+                if (
+                    last_signal.action == analysis["signal"]
+                    and signal_age < 900
+                ):
+                    recent_duplicate = True
 
                 if (
                     last_signal.action == analysis["signal"]
@@ -241,7 +267,9 @@ if __name__ == "__main__":
         logging.error("❌ MT5 Connection Failed")
     else:
         logging.info("🚀 Professional Multi-Timeframe AI Watcher Started (MT5)")
-        logging.info(f"Symbols: {SYMBOLS} | HTF: H1 + LTF: M5")
+        logging.info(
+            f"Dynamic AI Symbols Loaded | HTF: H1 + LTF: M5"
+        )
 
         while True:
             start = time.time()
