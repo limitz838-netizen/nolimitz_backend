@@ -379,8 +379,15 @@ class AISignal(Base):
 
     symbol = Column(String, nullable=False)
 
+    timeframe = Column(String, nullable=True)
+
     action = Column(String, nullable=False)
-    # BUY or SELL
+
+    trend = Column(String, nullable=True)
+
+    structure = Column(String, nullable=True)
+
+    confidence = Column(Float, default=0)
 
     entry_price = Column(Float, nullable=True)
 
@@ -388,20 +395,18 @@ class AISignal(Base):
 
     take_profit = Column(Float, nullable=True)
 
-    confidence = Column(Float, default=0)
+    liquidity_sweep = Column(String, nullable=True)
+
+    entry_quality = Column(String, nullable=True)
+
+    risk_reward_ratio = Column(Float, nullable=True)
 
     is_executed = Column(Boolean, default=False)
-
-    status = Column(
-        String,
-        default="NEW"
-    )
 
     created_at = Column(
         DateTime(timezone=True),
         server_default=func.now()
     )
-
 
 class AITradeExecution(Base):
 

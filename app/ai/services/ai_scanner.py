@@ -1,305 +1,236 @@
 import pandas as pd
-
+import numpy as np
 
 class AIScanner:
 
-    def analyze_market(self, candles):
+    def analyze_market(self, candles: list[dict]) -> dict:
+        """
+        Professional SMC + Price Action Scanner
+        Designed to generate real trading signals with strong reasoning.
+        """
+        if not candles or len(candles) < 250:
+            return {"signal": "WAIT", "confidence": 0, "trend": "UNKNOWN", "reason": "Not enough data"}
 
-        # =====================================================
-        # VALIDATION
-        # =====================================================
+        # ====================== DATA PREP ======================
+        df = pd.DataFrame(candles)
+        df = df[['open', 'high', 'low', 'close']].astype(float)
+        
+        closes = df['close']
+        highs = df['high']
+        lows = df['low']
+        opens = df['open']
+        current_price = closes.iloc[-1]
 
-        if not candles or len(candles) < 50:
+        # ====================== MULTI-TIMEFRAME SIMULATION ======================
+        # Higher TF bias (roughly 4-5x slower)
+        len_htf = max(20, len(df) // 4)
+        htf_closes = closes.iloc[-len_htf:]
+        htf_highs = highs.iloc[-len_htf:]
+        htf_lows = lows.iloc[-len_htf:]
 
-            return {
-                "signal": "WAIT",
-                "confidence": 0,
-                "trend": "UNKNOWN",
-                "reason": "Not enough candles"
-            }
+        # ====================== CORE INDICATORS ======================
+        ema21 = closes.ewm(span=21).mean()
+        ema50 = closes.ewm(span=50).mean()
+        ema200 = closes.ewm(span=200).mean()
 
-        # =====================================================
-        # EXTRACT DATA
-        # =====================================================
-
-        closes = [c["close"] for c in candles]
-        highs = [c["high"] for c in candles]
-        lows = [c["low"] for c in candles]
-        opens = [c["open"] for c in candles]
-
-        current_price = closes[-1]
-
-        # =====================================================
-        # PANDAS SERIES
-        # =====================================================
-
-        close_series = pd.Series(closes)
-
-        # =====================================================
-        # EMA TREND
-        # =====================================================
-
-        ema_fast = close_series.ewm(span=20).mean()
-        ema_slow = close_series.ewm(span=50).mean()
-
-        # =====================================================
         # RSI
-        # =====================================================
-
-        delta = close_series.diff()
-
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
-
-        avg_gain = gain.rolling(14).mean()
-        avg_loss = loss.rolling(14).mean()
-
-        rs = avg_gain / avg_loss
-
-        rsi = 100 - (100 / (1 + rs))
-
+        delta = closes.diff()
+        rsi = 100 - (100 / (1 + (delta.where(delta > 0, 0).rolling(14).mean() / 
+                                 -delta.where(delta < 0, 0).rolling(14).mean())))
         latest_rsi = rsi.iloc[-1]
 
-        # =====================================================
-        # TREND DETECTION
-        # =====================================================
+        # MACD
+        macd_line = closes.ewm(span=12).mean() - closes.ewm(span=26).mean()
+        signal_line = macd_line.ewm(span=9).mean()
+        macd_hist = macd_line - signal_line
 
-        trend = "RANGING"
+        # ATR
+        tr = pd.concat([
+            highs - lows,
+            abs(highs - closes.shift()),
+            abs(lows - closes.shift())
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(14).mean()
+        latest_atr = atr.iloc[-1] or 0.0001
 
-        if ema_fast.iloc[-1] > ema_slow.iloc[-1]:
-            trend = "BULLISH"
+        # ADX (Trend Strength)
+        plus_dm = highs.diff()
+        minus_dm = lows.diff() * -1
 
-        elif ema_fast.iloc[-1] < ema_slow.iloc[-1]:
-            trend = "BEARISH"
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm < 0] = 0
 
-        # =====================================================
-        # MARKET STRUCTURE
-        # =====================================================
+        tr_smooth = tr.rolling(14).mean()
 
-        recent_highs = highs[-15:]
-        recent_lows = lows[-15:]
+        plus_di = 100 * (
+            plus_dm.rolling(14).mean() / tr_smooth
+        )
 
-        resistance = max(recent_highs)
-        support = min(recent_lows)
+        minus_di = 100 * (
+            minus_dm.rolling(14).mean() / tr_smooth
+        )
 
-        volatility = resistance - support
+        dx = (
+            abs(plus_di - minus_di)
+            / (plus_di + minus_di)
+        ) * 100
 
-        structure = "RANGING"
+        adx = dx.rolling(14).mean()
 
-        if current_price > resistance - (volatility * 0.1):
-            structure = "BREAKOUT_UP"
+        latest_adx = float(adx.iloc[-1])
 
-        elif current_price < support + (volatility * 0.1):
-            structure = "BREAKOUT_DOWN"
+        if np.isnan(latest_adx):
+            latest_adx = 20
 
-        # =====================================================
-        # LIQUIDITY SWEEP
-        # =====================================================
+        # ====================== SMC / PRICE ACTION ======================
+        # Recent structure
+        recent_high = htf_highs.max()
+        recent_low = htf_lows.min()
+        volatility = recent_high - recent_low
 
+        # Liquidity Sweeps
         liquidity_sweep = "NONE"
-
-        last_high = highs[-1]
-        last_low = lows[-1]
-
-        if (
-            last_high > resistance
-            and current_price < resistance
-        ):
-
+        if highs.iloc[-1] > recent_high and closes.iloc[-1] < recent_high - (volatility * 0.05):
             liquidity_sweep = "SWEEP_HIGH"
-
-        elif (
-            last_low < support
-            and current_price > support
-        ):
-
+        elif lows.iloc[-1] < recent_low and closes.iloc[-1] > recent_low + (volatility * 0.05):
             liquidity_sweep = "SWEEP_LOW"
 
-        # =====================================================
-        # MOMENTUM
-        # =====================================================
+        # Fair Value Gap (simple 3-candle imbalance)
+        fvg = "NONE"
 
-        bullish_count = 0
-        bearish_count = 0
+        if len(df) >= 3:
 
-        recent_closes = closes[-10:]
+           # Bullish FVG
+           if lows.iloc[-1] > highs.iloc[-3]:
+               fvg = "BULLISH"
 
-        for i in range(1, len(recent_closes)):
+           # Bearish FVG
+           elif highs.iloc[-1] < lows.iloc[-3]:
+               fvg = "BEARISH"
 
-            if recent_closes[i] > recent_closes[i - 1]:
-                bullish_count += 1
+        # Break of Structure (BOS)
+        bos = "NONE"
+        if closes.iloc[-1] > htf_highs[:-1].max():
+            bos = "BULLISH_BOS"
+        elif closes.iloc[-1] < htf_lows[:-1].min():
+            bos = "BEARISH_BOS"
 
-            elif recent_closes[i] < recent_closes[i - 1]:
-                bearish_count += 1
+        # Strong candle
+        body = abs(closes.iloc[-1] - opens.iloc[-1])
+        is_strong_candle = body > 0.5 * latest_atr
 
-        # =====================================================
-        # CANDLE STRENGTH
-        # =====================================================
+        # ====================== HIGHER TIMEFRAME BIAS ======================
+        htf_bias = "BULLISH" if htf_closes.iloc[-1] > ema200.iloc[-len_htf:].mean() else "BEARISH"
 
-        last_open = opens[-1]
-        last_close = closes[-1]
+        # ====================== CONFLUENCE SCORING (Permissive) ======================
+        score = 40  # Base score - allows more signals
+        reasons = []
 
-        candle_body = abs(last_close - last_open)
+        # Trend Alignment (Heavy weight)
+        if ema21.iloc[-1] > ema50.iloc[-1] and closes.iloc[-1] > ema200.iloc[-1] and htf_bias == "BULLISH":
+            score += 30
+            reasons.append("Strong bullish alignment (Multi-TF)")
+        elif ema21.iloc[-1] < ema50.iloc[-1] and closes.iloc[-1] < ema200.iloc[-1] and htf_bias == "BEARISH":
+            score += 30
+            reasons.append("Strong bearish alignment (Multi-TF)")
 
-        entry_quality = "WEAK"
+        # Momentum
+        if macd_hist.iloc[-1] > 0 and macd_hist.iloc[-2] < macd_hist.iloc[-1]:
+            score += 18
+            reasons.append("MACD bullish crossover")
+        elif macd_hist.iloc[-1] < 0 and macd_hist.iloc[-2] > macd_hist.iloc[-1]:
+            score += 18
+            reasons.append("MACD bearish crossover")
 
-        if candle_body > 0.5:
-            entry_quality = "STRONG"
+        # RSI + Divergence (light)
+        if (htf_bias == "BULLISH" and latest_rsi > 48) or (htf_bias == "BEARISH" and latest_rsi < 52):
+            score += 12
 
-        elif candle_body > 0.2:
-            entry_quality = "GOOD"
-
-        # =====================================================
-        # SIGNAL ENGINE
-        # =====================================================
-
-        signal = "WAIT"
-        confidence = 50
-        reason = "No setup"
-
-        # BUY CONDITIONS
-
-        if (
-
-            trend == "BULLISH"
-
-            and latest_rsi > 50
-
-            and bullish_count >= bearish_count
-
-            and structure != "BREAKOUT_DOWN"
-
-        ):
-
-            signal = "BUY"
-            confidence = 75
-            reason = "Bullish trend confirmation"
-
-        # SELL CONDITIONS
-
-        elif (
-
-            trend == "BEARISH"
-
-            and latest_rsi < 50
-
-            and bearish_count >= bullish_count
-
-            and structure != "BREAKOUT_UP"
-
-        ):
-
-            signal = "SELL"
-            confidence = 75
-            reason = "Bearish trend confirmation"
-
-        # =====================================================
-        # CONFIDENCE BOOSTS
-        # =====================================================
-
-        if volatility > 3:
-            confidence += 10
-
-        elif volatility > 1:
-            confidence += 5
-
-        if entry_quality == "STRONG":
-            confidence += 5
-
-        elif entry_quality == "GOOD":
-            confidence += 2
-
+        # SMC Elements
         if liquidity_sweep != "NONE":
-            confidence += 5
+            score += 15
+            reasons.append(f"Liquidity sweep: {liquidity_sweep}")
+        if fvg != "NONE":
+            score += 10
+            reasons.append(f"Fair Value Gap: {fvg}")
+        if bos != "NONE":
+            score += 12
+            reasons.append(f"Break of Structure: {bos}")
 
-        # RSI POWER
+        if is_strong_candle:
+            score += 8
 
-        if signal == "BUY" and latest_rsi > 65:
-            confidence += 5
+        if latest_adx > 23:
+            score += 10
+            reasons.append("Trending market")
 
-        elif signal == "SELL" and latest_rsi < 35:
-            confidence += 5
+        early_entry = False
 
-        # LIMITS
+        # Bullish continuation
+        if (
+            htf_bias == "BULLISH"
+            and closes.iloc[-1] > ema21.iloc[-1]
+            and closes.iloc[-2] < ema21.iloc[-2]
+        ):
 
-        if confidence > 95:
-            confidence = 95
+            early_entry = True
+            score += 12
+            reasons.append("Early bullish continuation")
 
-        # =====================================================
-        # SL / TP ENGINE
-        # =====================================================
+        # Bearish continuation
+        elif (
+           htf_bias == "BEARISH"
+           and closes.iloc[-1] < ema21.iloc[-1]
+           and closes.iloc[-2] > ema21.iloc[-2]
+        ):
 
+           early_entry = True
+           score += 12
+           reasons.append("Early bearish continuation")   
+
+        # ====================== SIGNAL DECISION ======================
+        signal = "WAIT"
+        confidence = min(92, int(score))
+
+        if score >= 58 and htf_bias == "BULLISH" and latest_rsi < 78:   # Lower threshold = more trades
+            signal = "BUY"
+            reasons.append("✅ Bullish SMC Setup")
+        elif score >= 58 and htf_bias == "BEARISH" and latest_rsi > 22:
+            signal = "SELL"
+            reasons.append("✅ Bearish SMC Setup")
+
+        # ====================== DYNAMIC RISK MANAGEMENT ======================
         stop_loss = None
         take_profit = None
-
-        risk_reward_ratio = 2
+        rr_ratio = 1.8
 
         if signal == "BUY":
-
-            stop_loss = support - (volatility * 0.2)
-
+            stop_loss = current_price - (latest_atr * 1.4)
             risk = current_price - stop_loss
-
-            take_profit = (
-                current_price
-                + (risk * risk_reward_ratio)
-            )
-
+            take_profit = current_price + (risk * rr_ratio)
         elif signal == "SELL":
-
-            stop_loss = resistance + (volatility * 0.2)
-
+            stop_loss = current_price + (latest_atr * 1.4)
             risk = stop_loss - current_price
+            take_profit = current_price - (risk * rr_ratio)
 
-            take_profit = (
-                current_price
-                - (risk * risk_reward_ratio)
-            )
-
-        # =====================================================
-        # FINAL RESPONSE
-        # =====================================================
+        # Final flexible filter
+        if rr_ratio < 1.6 and signal != "WAIT":
+            confidence = max(55, confidence - 10)  # Still allow but note risk
 
         return {
-
             "signal": signal,
-
-            "trend": trend,
-
+            "trend": htf_bias,
             "confidence": confidence,
-
-            "reason": reason,
-
-            "entry_quality": entry_quality,
-
-            "structure": structure,
-
-            "liquidity_sweep": liquidity_sweep,
-
+            "reason": " | ".join(reasons[:4]),
+            "current_price": round(current_price, 4 if current_price < 10 else 2),
             "rsi": round(latest_rsi, 2),
-
-            "current_price": round(current_price, 2),
-
-            "support": round(support, 2),
-
-            "resistance": round(resistance, 2),
-
-            "volatility": round(volatility, 2),
-
-            "stop_loss":
-                round(stop_loss, 2)
-                if stop_loss else None,
-
-            "take_profit":
-                round(take_profit, 2)
-                if take_profit else None,
-
-            "risk_reward_ratio":
-                risk_reward_ratio,
-
-            "bullish_candles":
-                bullish_count,
-
-            "bearish_candles":
-                bearish_count
+            "adx": round(latest_adx, 2),
+            "atr": round(latest_atr, 5),
+            "stop_loss": round(stop_loss, 4 if stop_loss and stop_loss < 10 else 2) if stop_loss else None,
+            "take_profit": round(take_profit, 4 if take_profit and take_profit < 10 else 2) if take_profit else None,
+            "rr_ratio": round(rr_ratio, 2),
+            "liquidity_sweep": liquidity_sweep,
+            "fvg": fvg,
+            "bos": bos,
+            "structure": "TRENDING" if latest_adx > 22 else "RANGING",
         }
