@@ -64,7 +64,7 @@ def verify_license(
 
     now = datetime.now(timezone.utc)
 
-    if license.expires_at < now:
+    if license.expires_at and license.expires_at < now:
 
         raise HTTPException(
             status_code=403,
