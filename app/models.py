@@ -250,6 +250,16 @@ class ClientMT5Account(Base):
 
     verification_error = Column(String, nullable=True)
 
+    failed_login_attempts = Column(
+        Integer,
+        default=0
+    )
+
+    last_login_error = Column(
+        String,
+        nullable=True
+    )
+
     is_verified = Column(Boolean, default=False)
     is_active = Column(Boolean, default=True)
 
@@ -381,6 +391,63 @@ class AISignal(Base):
     confidence = Column(Float, default=0)
 
     is_executed = Column(Boolean, default=False)
+
+    status = Column(
+        String,
+        default="NEW"
+    )
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )
+
+
+class AITradeExecution(Base):
+
+    __tablename__ = "ai_trade_executions"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    signal_id = Column(
+        Integer,
+        ForeignKey("ai_signals.id"),
+        nullable=False
+    )
+
+    license_id = Column(
+        Integer,
+        ForeignKey("licenses.id"),
+        nullable=False
+    )
+
+    mt5_login = Column(String, nullable=False)
+
+    status = Column(
+        String,
+        default="PENDING"
+    )
+    # PENDING / SUCCESS / FAILED
+
+    error_message = Column(
+        Text,
+        nullable=True
+    )
+
+    mt5_ticket = Column(
+        String,
+        nullable=True
+    )
+
+    retry_count = Column(
+        Integer,
+        default=0
+    )
+
+    executed_at = Column(
+        DateTime(timezone=True),
+        nullable=True
+    )
 
     created_at = Column(
         DateTime(timezone=True),
