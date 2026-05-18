@@ -617,7 +617,7 @@ def worker_update_mt5_status(payload: dict, db: Session = Depends(get_db)):
     return {"success": True}
 
 
-@router.get("/ai/mt5-status")
+@router.get("/api/client/ai/mt5-status")
 def get_mt5_status(
     license_key: str
 ):
@@ -626,26 +626,11 @@ def get_mt5_status(
 
     try:
 
-        license_row = (
-            db.query(License)
-            .filter(
-                License.license_key
-                == license_key
-            )
-            .first()
-        )
-
-        if not license_row:
-
-            return {
-                "connected": False
-            }
-
         account = (
             db.query(ClientMT5Account)
             .filter(
-                ClientMT5Account.license_id
-                == license_row.id
+                ClientMT5Account.license_key
+                == license_key
             )
             .first()
         )
@@ -658,13 +643,19 @@ def get_mt5_status(
 
         return {
 
-            "connected": account.is_verified,
+            "connected": True,
 
-            "account_name":
-                account.account_name,
+            "login":
+                account.mt_login,
 
-            "broker_name":
+            "broker":
                 account.broker_name,
+
+            "server":
+                account.mt_server,
+
+            "name":
+                account.account_name,
 
             "balance":
                 account.balance,
@@ -673,13 +664,10 @@ def get_mt5_status(
                 account.equity,
 
             "verified":
-                account.is_verified,
+                account.verified,
 
-            "mt_login":
-                account.mt_login,
-
-            "mt_server":
-                account.mt_server
+            "last_verified":
+                account.last_verified_at
         }
 
     finally:
