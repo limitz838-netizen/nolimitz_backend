@@ -7,7 +7,6 @@ from app.models import (
     ClientMT5Account,
     License,
     LiveTrade,
-    AITradeHistory
 )
 
 router = APIRouter(
