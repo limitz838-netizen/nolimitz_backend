@@ -7,7 +7,6 @@ from app.models import (
     ClientMT5Account,
     License,
     LiveTrade,
-    AITradeHistory,
 )
 
 router = APIRouter(
@@ -434,63 +433,6 @@ def get_live_trades(
                 "status": trade.status,
 
                 "mt5_ticket": trade.mt5_ticket,
-
-                "created_at": trade.created_at
-            })
-
-        return results
-
-    finally:
-
-        db.close()
-
-
-# =========================================================
-# TRADE HISTORY
-# =========================================================
-
-@router.get("/ai/trade-history")
-def get_trade_history(
-    license_key: str = ""
-):
-
-    db = SessionLocal()
-
-    try:
-
-        trades = (
-            db.query(AITradeHistory)
-            .order_by(
-                AITradeHistory.id.desc()
-            )
-            .all()
-        )
-
-        results = []
-
-        for trade in trades:
-
-            results.append({
-
-                "id": trade.id,
-
-                "symbol": trade.symbol,
-
-                "signal": trade.signal,
-
-                "trend": trade.trend,
-
-                "entry_price": trade.entry_price,
-
-                "stop_loss": trade.stop_loss,
-
-                "take_profit": trade.take_profit,
-
-                "profit": trade.profit,
-
-                "result": trade.result,
-
-                "confidence": trade.confidence,
 
                 "created_at": trade.created_at
             })
