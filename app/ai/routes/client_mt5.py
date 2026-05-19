@@ -7,7 +7,8 @@ from app.models import (
     ClientMT5Account,
     License,
     LiveTrade,
-    AISymbol
+    AISymbol,
+    ClientSymbolSetting
 )
 
 from app.models import AISymbol
@@ -328,6 +329,35 @@ def save_ai_settings(
 
     account.max_open_trades = data.get("max_open_trades", 3)
 
+
+    # ============================================
+    # SAVE ENABLED SYMBOLS
+    # ============================================
+
+    selected_symbols = data.get("symbols", [])
+
+    print("SAVING SYMBOLS:", selected_symbols)
+
+    # REMOVE OLD SETTINGS
+    db.query(ClientSymbolSetting).filter(
+        ClientSymbolSetting.license_id == license_row.id
+    ).delete()
+
+    # ADD NEW SETTINGS
+    for sym in selected_symbols:
+
+        db.add(
+            ClientSymbolSetting(
+                license_id=license_row.id,
+                symbol_name=sym,
+                enabled=True,
+                trade_direction="both",
+                lot_size=data.get("lot_size", 0.01),
+                trades_per_signal=data.get("trades_per_signal", 1),
+                max_open_trades=data.get("max_open_trades", 3)
+            )
+        )
+
     db.commit()
 
     return {
@@ -374,19 +404,37 @@ def get_ai_settings(
             "success": False
         }
 
+    symbol_settings = (
+        db.query(ClientSymbolSetting)
+        .filter(
+            ClientSymbolSetting.license_id == license_row.id
+        )
+        .all()
+    )
+
+    symbols = []
+
+    for s in symbol_settings:
+        symbols.append(s.symbol_name)
+
+    first_symbol = symbol_settings[0] if symbol_settings else None
+
     return {
 
         "success": True,
 
         "lot_size":
-            account.lot_size,
+            first_symbol.lot_size if first_symbol else 0.01,
 
         "trades_per_signal":
-            account.trades_per_signal,
+            first_symbol.trades_per_signal if first_symbol else 1,
 
         "max_open_trades":
-            account.max_open_trades
+            first_symbol.max_open_trades if first_symbol else 3,
+
+        "symbols": symbols
     }
+
 
 # =========================================================
 # LIVE TRADES
