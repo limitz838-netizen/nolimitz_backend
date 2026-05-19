@@ -346,10 +346,25 @@ def save_ai_settings(
     # ADD NEW SETTINGS
     for sym in selected_symbols:
 
+        # HANDLE OBJECTS FROM FRONTEND
+        if isinstance(sym, dict):
+
+            symbol_name = sym.get("symbol")
+            enabled = sym.get("enabled", False)
+
+        else:
+
+            symbol_name = sym
+            enabled = True
+
+        # SKIP DISABLED SYMBOLS
+        if not enabled:
+            continue
+
         db.add(
             ClientSymbolSetting(
                 license_id=license_row.id,
-                symbol_name=sym,
+                symbol_name=symbol_name,
                 enabled=True,
                 trade_direction="both",
                 lot_size=data.get("lot_size", 0.01),
@@ -599,10 +614,25 @@ def save_ai_symbols(
     # SAVE NEW
     for sym in symbols:
 
+        # HANDLE OBJECTS FROM FRONTEND
+        if isinstance(sym, dict):
+
+            symbol_name = sym.get("symbol")
+            enabled = sym.get("enabled", False)
+
+        else:
+
+            symbol_name = sym
+            enabled = True
+
+        # SKIP DISABLED SYMBOLS
+        if not enabled:
+            continue
+
         db.add(
             ClientSymbolSetting(
                 license_id=license_row.id,
-                symbol_name=sym,
+                symbol_name=symbol_name,
                 enabled=True,
                 trade_direction="both",
                 lot_size=data.get("lot_size", 0.01),
