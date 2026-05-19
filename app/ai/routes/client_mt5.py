@@ -566,6 +566,58 @@ def ai_symbols():
         db.close()
 
 
+@router.post("/ai/symbols")
+def save_ai_symbols(
+    data: dict,
+    db: Session = Depends(get_db)
+):
+
+    license_key = data.get("license_key")
+
+    symbols = data.get("symbols", [])
+
+    license_row = (
+        db.query(License)
+        .filter(
+            License.license_key == license_key
+        )
+        .first()
+    )
+
+    if not license_row:
+
+        return {
+            "success": False,
+            "message": "Invalid license"
+        }
+
+    # DELETE OLD
+    db.query(ClientSymbolSetting).filter(
+        ClientSymbolSetting.license_id == license_row.id
+    ).delete()
+
+    # SAVE NEW
+    for sym in symbols:
+
+        db.add(
+            ClientSymbolSetting(
+                license_id=license_row.id,
+                symbol_name=sym,
+                enabled=True,
+                trade_direction="both",
+                lot_size=data.get("lot_size", 0.01),
+                trades_per_signal=data.get("trades_per_signal", 1),
+                max_open_trades=data.get("max_open_trades", 3)
+            )
+        )
+
+    db.commit()
+
+    return {
+        "success": True,
+        "symbols": symbols
+    }
+
 # =========================================================
 # MARKET DATA
 # =========================================================
