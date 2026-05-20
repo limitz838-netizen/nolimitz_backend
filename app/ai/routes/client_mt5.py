@@ -508,9 +508,12 @@ def get_live_trades(
     try:
 
         trades = (
-            db.query(AITradeHistory)
+            db.query(LiveTrade)
+            .filter(
+                LiveTrade.status == "OPEN"
+            )
             .order_by(
-                AITradeHistory.id.desc()
+                LiveTrade.id.desc()
             )
             .all()
         )
@@ -525,7 +528,7 @@ def get_live_trades(
 
                 "symbol": trade.symbol,
 
-                "trade_type": trade.signal,
+                "trade_type": trade.trade_type,
 
                 "lot_size": trade.lot_size,
 
@@ -537,9 +540,11 @@ def get_live_trades(
 
                 "profit": trade.profit,
 
-                "status": trade.result,
+                "status": trade.status,
 
-                "created_at": trade.created_at
+                "mt5_ticket": trade.mt5_ticket,
+
+                "created_at": trade.opened_at
 
             })
 
@@ -549,6 +554,86 @@ def get_live_trades(
 
         db.close()
 
+
+@router.get("/ai/trade-history")
+def get_trade_history(
+    license_key: str = ""
+):
+
+    db = SessionLocal()
+
+    try:
+
+        trades = (
+            db.query(AITradeHistory)
+            .order_by(
+                AITradeHistory.id.desc()
+            )
+            .all()
+        )
+
+        results = []
+
+        wins = 0
+        losses = 0
+        total_profit = 0
+
+        for trade in trades:
+
+            profit = trade.profit or 0
+
+            total_profit += profit
+
+            if profit > 0:
+                wins += 1
+
+            elif profit < 0:
+                losses += 1
+
+            results.append({
+
+                "symbol": trade.symbol,
+
+                "trade_type": trade.signal,
+
+                "profit": profit,
+
+                "status": trade.result,
+
+                "created_at": trade.created_at
+
+            })
+
+        total = wins + losses
+
+        win_rate = 0
+
+        if total > 0:
+
+            win_rate = round(
+                (wins / total) * 100,
+                1
+            )
+
+        return {
+
+            "total_trades": len(trades),
+
+            "wins": wins,
+
+            "losses": losses,
+
+            "win_rate": win_rate,
+
+            "net_profit": round(total_profit, 2),
+
+            "trades": results
+
+        }
+
+    finally:
+
+        db.close()
 
 # =========================================================
 # AI STATUS
@@ -740,83 +825,3 @@ def market_data(
     finally:
 
         db.close()        
-
-
-@router.get("/ai/trade-history")
-def get_trade_history(
-    license_key: str = ""
-):
-
-    db = SessionLocal()
-
-    try:
-
-        trades = (
-            db.query(AITradeHistory)
-            .order_by(
-                AITradeHistory.id.desc()
-            )
-            .all()
-        )
-
-        results = []
-
-        wins = 0
-        losses = 0
-        total_profit = 0
-
-        for trade in trades:
-
-            profit = trade.profit or 0
-
-            total_profit += profit
-
-            if profit > 0:
-                wins += 1
-            elif profit < 0:
-                losses += 1
-
-            results.append({
-
-                "symbol": trade.symbol,
-
-                "trade_type": trade.signal,
-
-                "profit": profit,
-
-                "status": trade.result,
-
-                "created_at": trade.created_at
-
-            })
-
-        total = wins + losses
-
-        win_rate = 0
-
-        if total > 0:
-
-            win_rate = round(
-                (wins / total) * 100,
-                1
-            )
-
-        return {
-
-            "total_trades": len(trades),
-
-            "wins": wins,
-
-            "losses": losses,
-
-            "win_rate": win_rate,
-
-            "net_profit": round(total_profit, 2),
-
-            "trades": results
-
-        }
-
-    finally:
-
-        db.close()
