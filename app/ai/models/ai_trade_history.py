@@ -70,6 +70,16 @@ class AITradeHistory(Base):
         default=0
     )
 
+    lot_size = Column(
+        Float,
+        default=0.01
+    )
+
+    status = Column(
+        String,
+        default="OPEN"
+    )
+
     created_at = Column(
         DateTime,
         default=datetime.utcnow
