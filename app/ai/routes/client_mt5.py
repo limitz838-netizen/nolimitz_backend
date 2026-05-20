@@ -758,7 +758,7 @@ def get_trade_history(
         trades = (
             db.query(LiveTrade)
             .filter(
-                LiveTrade.status.in_(["OPEN", "CLOSED"])
+                LiveTrade.status == "CLOSED"
             )
             .order_by(
                 LiveTrade.id.desc()
