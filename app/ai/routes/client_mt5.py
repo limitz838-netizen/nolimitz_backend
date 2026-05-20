@@ -590,6 +590,7 @@ def get_trade_history(
         trades = (
             db.query(AITradeHistory)
             .filter(
+                AITradeHistory.trend == "AI",
                 AITradeHistory.license_id == license.id
             )
             .order_by(
