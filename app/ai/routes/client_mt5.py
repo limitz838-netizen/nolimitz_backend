@@ -789,9 +789,9 @@ def get_trade_history(
 
                 "profit": profit,
 
-                "status": trade.status,
+                "status": trade.result,
 
-                "created_at": trade.opened_at
+                "created_at": trade.created_at
 
             })
 
