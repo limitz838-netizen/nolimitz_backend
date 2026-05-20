@@ -361,17 +361,59 @@ def save_ai_settings(
         if not enabled:
             continue
 
-        db.add(
-            ClientSymbolSetting(
-                license_id=license_row.id,
-                symbol_name=symbol_name,
-                enabled=True,
-                trade_direction="both",
-                lot_size=data.get("lot_size", 0.01),
-                trades_per_signal=data.get("trades_per_signal", 1),
-                max_open_trades=data.get("max_open_trades", 3)
+        print("LOT SIZE SAVED:", data.get("lot_size"))
+        print("TRADES SAVED:", data.get("trades_per_signal"))
+        print("MAX TRADES SAVED:", data.get("max_open_trades"))
+
+        existing = (
+            db.query(ClientSymbolSetting)
+            .filter(
+                ClientSymbolSetting.license_id
+                == license_row.id,
+
+                ClientSymbolSetting.symbol_name
+                == symbol_name
             )
+            .first()
         )
+
+        if existing:
+
+            existing.enabled = True
+
+            existing.lot_size = float(
+                data.get("lot_size", 0.01)
+            )
+
+            existing.trades_per_signal = int(
+                data.get("trades_per_signal", 1)
+            )
+
+            existing.max_open_trades = int(
+                data.get("max_open_trades", 3)
+            )
+
+        else:
+
+            db.add(
+                ClientSymbolSetting(
+                    license_id=license_row.id,
+                    symbol_name=symbol_name,
+                    enabled=True,
+
+                    lot_size=float(
+                        data.get("lot_size", 0.01)
+                    ),
+
+                    trades_per_signal=int(
+                        data.get("trades_per_signal", 1)
+                    ),
+
+                    max_open_trades=int(
+                        data.get("max_open_trades", 3)
+                    ),
+                )
+            )
 
     db.commit()
 
@@ -501,7 +543,6 @@ def get_live_trades(
 
                 "mt5_ticket": trade.mt5_ticket,
 
-                "created_at": trade.created_at
             })
 
         return results
