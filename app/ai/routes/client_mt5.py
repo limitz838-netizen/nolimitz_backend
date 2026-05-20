@@ -507,10 +507,22 @@ def get_live_trades(
 
     try:
 
+        license = (
+            db.query(License)
+            .filter(
+                License.license_key == license_key
+            )
+            .first()
+        )
+
+        if not license:
+            return []
+
         trades = (
             db.query(LiveTrade)
             .filter(
-                LiveTrade.status == "OPEN"
+                LiveTrade.status == "OPEN",
+                LiveTrade.license_key == license_key
             )
             .order_by(
                 LiveTrade.id.desc()
@@ -564,8 +576,22 @@ def get_trade_history(
 
     try:
 
+        license = (
+            db.query(License)
+            .filter(
+                License.license_key == license_key
+            )
+            .first()
+        )
+
+        if not license:
+            return []
+
         trades = (
             db.query(AITradeHistory)
+            .filter(
+                AITradeHistory.license_id == license.id
+            )
             .order_by(
                 AITradeHistory.id.desc()
             )
