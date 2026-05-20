@@ -542,6 +542,8 @@ def get_live_trades(
                 "status": trade.status,
 
                 "mt5_ticket": trade.mt5_ticket,
+                
+                "created_at": trade.opened_at
 
             })
 
