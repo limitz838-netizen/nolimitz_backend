@@ -509,11 +509,8 @@ def get_live_trades(
 
         trades = (
             db.query(AITradeHistory)
-            .filter(
-                LiveTrade.status == "OPEN"
-            )
             .order_by(
-                LiveTrade.id.desc()
+                AITradeHistory.id.desc()
             )
             .all()
         )
@@ -540,11 +537,9 @@ def get_live_trades(
 
                 "profit": trade.profit,
 
-                "status": trade.status,
+                "status": trade.result,
 
-                "mt5_ticket": trade.mt5_ticket,
-
-                "created_at": trade.opened_at
+                "created_at": trade.created_at
 
             })
 
