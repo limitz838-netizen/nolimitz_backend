@@ -13,6 +13,7 @@ from app.models import (
 
 from app.models import AISymbol
 from app.ai.models.ai_market_state import AIMarketState
+from app.ai.models.ai_trade_history import AITradeHistory
 
 router = APIRouter(
     prefix="/api/client",
@@ -507,7 +508,7 @@ def get_live_trades(
     try:
 
         trades = (
-            db.query(LiveTrade)
+            db.query(AITradeHistory)
             .filter(
                 LiveTrade.status == "OPEN"
             )
@@ -527,7 +528,7 @@ def get_live_trades(
 
                 "symbol": trade.symbol,
 
-                "trade_type": trade.trade_type,
+                "trade_type": trade.signal,
 
                 "lot_size": trade.lot_size,
 
@@ -756,12 +757,9 @@ def get_trade_history(
     try:
 
         trades = (
-            db.query(LiveTrade)
-            .filter(
-                LiveTrade.status == "CLOSED"
-            )
+            db.query(AITradeHistory)
             .order_by(
-                LiveTrade.id.desc()
+                AITradeHistory.id.desc()
             )
             .all()
         )
@@ -787,7 +785,7 @@ def get_trade_history(
 
                 "symbol": trade.symbol,
 
-                "trade_type": trade.trade_type,
+                "trade_type": trade.signal,
 
                 "profit": profit,
 
