@@ -143,9 +143,21 @@ def analyze_symbol(symbol: str):
         htf_candles = fetch_candles(symbol, "H1", 300)
 
         if len(ltf_candles) < 80:
-            return {"signal": "WAIT", "confidence": 0, "reason": "Not enough data"}
+            return {
+                "signal": "WAIT",
+                "confidence": 35,
+                "trend": "NEUTRAL",
+                "reason": "Not enough data"
+            }
 
         analysis = SCANNER.analyze_market(ltf_candles, htf_candles)
+
+        if analysis.get("signal") == "WAIT":
+
+            analysis["confidence"] = max(
+                35,
+                int(analysis.get("confidence", 35))
+            )
 
         # Flexible filter
         if analysis.get("rr_ratio", 0) < MIN_RR_RATIO and analysis["signal"] != "WAIT":
@@ -155,9 +167,10 @@ def analyze_symbol(symbol: str):
             logging.info(f"Low volatility for {symbol}")
             return {
                 "signal": "WAIT",
-                "confidence": 0,
+                "confidence": 42,
+                "trend": "SIDEWAYS",
                 "reason": "Low volatility"
-            }   
+            } 
 
         return analysis
 
@@ -210,7 +223,7 @@ def save_market_state():
             if last_signal and last_signal.created_at:
 
                 signal_age = (
-                    datetime.datetime.utcnow() - last_signal.created_at
+                    datetime.utcnow() - last_signal.created_at
                 ).total_seconds()
 
                 if (
