@@ -228,6 +228,8 @@ class ClientMT5Account(Base):
     password = Column(String, nullable=False)
     server = Column(String, nullable=False)
 
+    risk_level = Column(String, default="medium")
+
     # Account info
     account_name = Column(String, nullable=True)
     broker_name = Column(String, nullable=True)
