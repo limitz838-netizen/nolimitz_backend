@@ -533,7 +533,6 @@ def ai_status(
 
 @router.get("/ai/market-data")
 def get_market_data(
-    license_key: str,
     symbol: str,
     db: Session = Depends(get_db)
 ):
@@ -554,7 +553,7 @@ def get_market_data(
     return {
         "success": True,
         "symbol": market.symbol,
-        "direction": market.direction,
+        "direction": market.trend,
         "entry_price": market.entry_price,
         "strength": market.strength,
         "updated_at": market.updated_at.isoformat() if market.updated_at else None
@@ -562,7 +561,6 @@ def get_market_data(
 
 @router.get("/ai/symbols")
 def get_ai_symbols(
-    license_key: str,
     db: Session = Depends(get_db)
 ):
     markets = db.query(AIMarketState).filter(
@@ -574,7 +572,7 @@ def get_ai_symbols(
         "symbols": [
             {
                 "symbol": m.symbol,
-                "direction": m.direction,
+                "direction": m.trend,
                 "strength": m.strength,
                 "entry_price": m.entry_price,
                 "updated_at": m.updated_at.isoformat() if m.updated_at else None
