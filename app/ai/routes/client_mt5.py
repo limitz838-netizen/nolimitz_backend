@@ -545,8 +545,12 @@ def get_market_data(
             "success": False,
             "symbol": symbol,
             "direction": "NEUTRAL",
+            "signal": "NONE",
             "entry_price": 0,
             "strength": 0,
+            "analysis": "",
+            "stop_loss": 0,
+            "take_profit": 0,
             "updated_at": None
         }
 
@@ -554,18 +558,21 @@ def get_market_data(
         "success": True,
         "symbol": market.symbol,
         "direction": market.trend,
-        "entry_price": market.entry_price,
-        "strength": market.strength,
+        "signal": market.signal,
+        "entry_price": market.entry,
+        "strength": market.confidence,
+        "analysis": market.analysis,
+        "stop_loss": market.stop_loss,
+        "take_profit": market.take_profit,
         "updated_at": market.updated_at.isoformat() if market.updated_at else None
     }
+
 
 @router.get("/ai/symbols")
 def get_ai_symbols(
     db: Session = Depends(get_db)
 ):
-    markets = db.query(AIMarketState).filter(
-        AIMarketState.active == True
-    ).all()
+    markets = db.query(AIMarketState).all()
 
     return {
         "success": True,
@@ -573,8 +580,12 @@ def get_ai_symbols(
             {
                 "symbol": m.symbol,
                 "direction": m.trend,
-                "strength": m.strength,
-                "entry_price": m.entry_price,
+                "signal": m.signal,
+                "strength": m.confidence,
+                "entry_price": m.entry,
+                "stop_loss": m.stop_loss,
+                "take_profit": m.take_profit,
+                "analysis": m.analysis,
                 "updated_at": m.updated_at.isoformat() if m.updated_at else None
             }
             for m in markets
