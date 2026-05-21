@@ -2,6 +2,22 @@ import MetaTrader5 as mt5
 import subprocess
 import time
 
+verified_servers = set()
+
+from app.config.supported_brokers import SUPPORTED_BROKERS
+
+
+def is_supported_server(server_name: str):
+
+    for broker, servers in SUPPORTED_BROKERS.items():
+
+        for server in servers:
+
+            if server.lower() == server_name.lower():
+                return True
+
+    return False
+
 
 def verify_mt5_credentials_direct(
     mt_login,
@@ -17,7 +33,12 @@ def verify_mt5_credentials_direct(
     })
 
     try:
-        mt5.shutdown()
+        if not is_supported_server(mt_server):
+
+            raise Exception(
+                f"Broker server not supported: {mt_server}"
+            )
+        
     except:
         pass
 
@@ -26,7 +47,7 @@ def verify_mt5_credentials_direct(
         subprocess.Popen([terminal_path])
 
     # GIVE TERMINAL TIME TO OPEN
-    time.sleep(8)
+    time.sleep(2)
 
     # INITIALIZE
     if terminal_path:
@@ -38,11 +59,20 @@ def verify_mt5_credentials_direct(
         raise Exception(f"MT5 initialize failed: {mt5.last_error()}")
 
     # LOGIN
+    login_start = time.time()
+
     authorized = mt5.login(
         login=int(mt_login),
         password=str(mt_password),
         server=str(mt_server),
     )
+
+    login_time = time.time() - login_start
+
+    if login_time > 15:
+        raise Exception(
+            "MT5 login timeout"
+        )
 
     print("AUTHORIZED:", authorized)
 
@@ -52,7 +82,7 @@ def verify_mt5_credentials_direct(
         raise Exception(f"MT5 login failed: {error}")
 
     # WAIT
-    time.sleep(8)
+    time.sleep(2)
 
     account_info = mt5.account_info()
 

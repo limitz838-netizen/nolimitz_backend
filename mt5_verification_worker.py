@@ -16,6 +16,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./nolimitz.db")
 WORKER_NAME = os.getenv("MT5_WORKER_NAME", "nolimitz-mt5-worker-1")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", 5))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", 5))
+MAX_JOBS_PER_MINUTE = 20
 
 # ========================= LOGGING =========================
 logging.basicConfig(
