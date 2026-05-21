@@ -1,24 +1,53 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+
 from sqlalchemy.orm import Session
 
-from app.database import get_db, SessionLocal
+from pydantic import BaseModel
+
+from typing import List
+
+from app.database import get_db
 
 from app.models import (
     ClientMT5Account,
     License,
     LiveTrade,
-    AISymbol,
-    ClientSymbolSetting
+    ClientSymbolSetting,
+    AISymbol
 )
 
-from app.models import AISymbol
-from app.ai.models.ai_market_state import AIMarketState
-from app.ai.models.ai_trade_history import AITradeHistory
+from app.ai.models.ai_trade_history import (
+    AITradeHistory
+)
 
 router = APIRouter(
     prefix="/api/client",
-    tags=["Client MT5"]
+    tags=["Client MT5 & AI"]
 )
+
+
+# =========================================================
+# MODELS
+# =========================================================
+
+class MT5AccountCreate(BaseModel):
+
+    license_key: str
+
+    login: str
+
+    password: str
+
+    server: str
+
+    risk_level: str = "medium"
+
+
+class AISettingsUpdate(BaseModel):
+
+    license_key: str
+
+    symbols: List[str] = []
 
 
 # =========================================================
@@ -27,83 +56,46 @@ router = APIRouter(
 
 @router.post("/mt5-account")
 def save_mt5_account(
-    data: dict,
+    data: MT5AccountCreate,
     db: Session = Depends(get_db)
 ):
-
-    # =========================
-    # FIND LICENSE
-    # =========================
-
-    license_key = data.get("license_key")
 
     license_row = (
         db.query(License)
         .filter(
-            License.license_key == license_key
+            License.license_key
+            == data.license_key
         )
         .first()
     )
 
     if not license_row:
 
-        return {
-            "success": False,
-            "message": "Invalid license key"
-        }
-
-    # =========================
-    # VPS VERIFICATION PENDING
-    # =========================
-
-    mt5_info = {
-
-        "broker_name": "Pending VPS Verification",
-
-        "name": f"MT5-{data['login']}",
-
-        "balance": 0,
-
-        "equity": 0
-    }
-
-    # =========================
-    # CHECK EXISTING ACCOUNT
-    # =========================
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid license key"
+        )
 
     existing = (
         db.query(ClientMT5Account)
         .filter(
-            ClientMT5Account.license_id == license_row.id
+            ClientMT5Account.license_id
+            == license_row.id
         )
         .first()
     )
 
-    # =========================
-    # UPDATE EXISTING
-    # =========================
-
     if existing:
 
-        existing.license_id = license_row.id
+        existing.login = data.login
 
-        existing.login = data["login"]
+        existing.password = data.password
 
-        existing.password = data["password"]
+        existing.server = data.server
 
-        existing.server = data["server"]
-
-        existing.broker_name = mt5_info["broker_name"]
-
-        existing.account_name = mt5_info["name"]
-
-        existing.balance = mt5_info["balance"]
-
-        existing.equity = mt5_info["equity"]
-
-        existing.is_verified = False
-
-        existing.verification_status = "PENDING"
+        existing.risk_level = (
+            data.risk_level.lower()
+        )
 
         existing.is_active = True
 
@@ -112,66 +104,25 @@ def save_mt5_account(
         db.refresh(existing)
 
         return {
-
             "success": True,
-
-            "message": "MT5 account updated",
-
-            "account": {
-
-                "id": existing.id,
-
-                "name": existing.account_name,
-
-                "broker": existing.broker_name,
-
-                "balance": existing.balance,
-
-                "equity": existing.equity,
-
-                "verified": existing.is_verified
-            }
+            "message": "MT5 updated"
         }
-
-    # =========================
-    # CREATE NEW ACCOUNT
-    # =========================
 
     new_account = ClientMT5Account(
 
         license_id=license_row.id,
 
-        login=data["login"],
+        login=data.login,
 
-        password=data["password"],
+        password=data.password,
 
-        server=data["server"],
+        server=data.server,
 
-        broker_name=mt5_info["broker_name"],
+        risk_level=data.risk_level.lower(),
 
-        account_name=mt5_info["name"],
+        is_active=True,
 
-        balance=mt5_info["balance"],
-
-        equity=mt5_info["equity"],
-
-        is_verified=False,
-
-        verification_status="PENDING",
-
-        ai_enabled=False,
-
-        ai_auto_trade=False,
-
-        max_ai_trades=1,
-
-        risk_percent=2.0,
-
-        allow_buy=True,
-
-        allow_sell=True,
-
-        is_active=True
+        ai_auto_trade=False
     )
 
     db.add(new_account)
@@ -181,25 +132,8 @@ def save_mt5_account(
     db.refresh(new_account)
 
     return {
-
         "success": True,
-
-        "message": "MT5 account connected",
-
-        "account": {
-
-            "id": new_account.id,
-
-            "name": new_account.account_name,
-
-            "broker": new_account.broker_name,
-
-            "balance": new_account.balance,
-
-            "equity": new_account.equity,
-
-            "verified": new_account.is_verified
-        }
+        "message": "MT5 connected"
     }
 
 
@@ -209,95 +143,15 @@ def save_mt5_account(
 
 @router.get("/ai/mt5-status")
 def get_mt5_status(
-    license_key: str
-):
-
-    db = SessionLocal()
-
-    try:
-
-        # =========================
-        # FIND LICENSE
-        # =========================
-
-        license_row = (
-            db.query(License)
-            .filter(
-                License.license_key == license_key
-            )
-            .first()
-        )
-
-        if not license_row:
-
-            return {
-                "connected": False
-            }
-
-        # =========================
-        # FIND MT5 ACCOUNT
-        # =========================
-
-        account = (
-            db.query(ClientMT5Account)
-            .filter(
-                ClientMT5Account.license_id == license_row.id
-            )
-            .first()
-        )
-
-        if not account:
-
-            return {
-                "connected": False
-            }
-
-        return {
-
-            "connected": True,
-
-            "login": account.login,
-
-            "broker": account.broker_name,
-
-            "server": account.server,
-
-            "name": account.account_name,
-
-            "balance": account.balance,
-
-            "equity": account.equity,
-
-            "verified": account.is_verified,
-
-            "verification_status":
-                account.verification_status,
-
-            "last_verified":
-                account.last_verified_at
-        }
-
-    finally:
-
-        db.close()
-
-
-# =========================================================
-# SAVE AI SETTINGS
-# =========================================================
-
-@router.post("/ai/settings")
-def save_ai_settings(
-    data: dict,
+    license_key: str,
     db: Session = Depends(get_db)
 ):
-
-    license_key = data.get("license_key")
 
     license_row = (
         db.query(License)
         .filter(
-            License.license_key == license_key
+            License.license_key
+            == license_key
         )
         .first()
     )
@@ -305,14 +159,14 @@ def save_ai_settings(
     if not license_row:
 
         return {
-            "success": False,
-            "message": "Invalid license"
+            "connected": False
         }
 
     account = (
         db.query(ClientMT5Account)
         .filter(
-            ClientMT5Account.license_id == license_row.id
+            ClientMT5Account.license_id
+            == license_row.id
         )
         .first()
     )
@@ -320,107 +174,83 @@ def save_ai_settings(
     if not account:
 
         return {
-            "success": False,
-            "message": "MT5 account not connected"
+            "connected": False
         }
 
-    account.lot_size = data.get("lot_size", 0.01)
+    return {
 
-    account.trades_per_signal = data.get("trades_per_signal", 1)
+        "connected": True,
 
-    account.max_open_trades = data.get("max_open_trades", 3)
+        "login": account.login,
+
+        "broker": account.broker_name,
+
+        "server": account.server,
+
+        "balance": account.balance or 0,
+
+        "equity": account.equity or 0,
+
+        "verified": account.is_verified,
+
+        "risk_level": (
+            account.risk_level
+            or "medium"
+        )
+    }
 
 
-    # ============================================
-    # SAVE ENABLED SYMBOLS
-    # ============================================
+# =========================================================
+# AI SETTINGS
+# =========================================================
 
-    selected_symbols = data.get("symbols", [])
+@router.post("/ai/settings")
+def save_ai_settings(
+    data: AISettingsUpdate,
+    db: Session = Depends(get_db)
+):
 
-    print("SAVING SYMBOLS:", selected_symbols)
+    license_row = (
+        db.query(License)
+        .filter(
+            License.license_key
+            == data.license_key
+        )
+        .first()
+    )
 
-    # REMOVE OLD SETTINGS
-    db.query(ClientSymbolSetting).filter(
-        ClientSymbolSetting.license_id == license_row.id
-    ).delete()
+    if not license_row:
 
-    # ADD NEW SETTINGS
-    for sym in selected_symbols:
-
-        # HANDLE OBJECTS FROM FRONTEND
-        if isinstance(sym, dict):
-
-            symbol_name = sym.get("symbol")
-            enabled = sym.get("enabled", False)
-
-        else:
-
-            symbol_name = sym
-            enabled = True
-
-        # SKIP DISABLED SYMBOLS
-        if not enabled:
-            continue
-
-        print("LOT SIZE SAVED:", data.get("lot_size"))
-        print("TRADES SAVED:", data.get("trades_per_signal"))
-        print("MAX TRADES SAVED:", data.get("max_open_trades"))
-
-        existing = (
-            db.query(ClientSymbolSetting)
-            .filter(
-                ClientSymbolSetting.license_id
-                == license_row.id,
-
-                ClientSymbolSetting.symbol_name
-                == symbol_name
-            )
-            .first()
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid license key"
         )
 
-        if existing:
+    db.query(ClientSymbolSetting).filter(
+        ClientSymbolSetting.license_id
+        == license_row.id
+    ).delete()
 
-            existing.enabled = True
+    for symbol in data.symbols:
 
-            existing.lot_size = float(
-                data.get("lot_size", 0.01)
-            )
+        setting = ClientSymbolSetting(
 
-            existing.trades_per_signal = int(
-                data.get("trades_per_signal", 1)
-            )
+            license_id=license_row.id,
 
-            existing.max_open_trades = int(
-                data.get("max_open_trades", 3)
-            )
+            symbol_name=symbol.upper(),
 
-        else:
+            enabled=True,
 
-            db.add(
-                ClientSymbolSetting(
-                    license_id=license_row.id,
-                    symbol_name=symbol_name,
-                    enabled=True,
+            trade_direction="both"
+        )
 
-                    lot_size=float(
-                        data.get("lot_size", 0.01)
-                    ),
-
-                    trades_per_signal=int(
-                        data.get("trades_per_signal", 1)
-                    ),
-
-                    max_open_trades=int(
-                        data.get("max_open_trades", 3)
-                    ),
-                )
-            )
+        db.add(setting)
 
     db.commit()
 
     return {
         "success": True,
-        "message": "AI settings saved"
+        "message": "Symbols updated"
     }
 
 
@@ -437,60 +267,39 @@ def get_ai_settings(
     license_row = (
         db.query(License)
         .filter(
-            License.license_key == license_key
+            License.license_key
+            == license_key
         )
         .first()
     )
 
     if not license_row:
 
-        return {
-            "success": False
-        }
-
-    account = (
-        db.query(ClientMT5Account)
-        .filter(
-            ClientMT5Account.license_id == license_row.id
+        raise HTTPException(
+            status_code=404,
+            detail="License not found"
         )
-        .first()
-    )
 
-    if not account:
-
-        return {
-            "success": False
-        }
-
-    symbol_settings = (
+    settings = (
         db.query(ClientSymbolSetting)
         .filter(
-            ClientSymbolSetting.license_id == license_row.id
+            ClientSymbolSetting.license_id
+            == license_row.id,
+
+            ClientSymbolSetting.enabled
+            == True
         )
         .all()
     )
-
-    symbols = []
-
-    for s in symbol_settings:
-        symbols.append(s.symbol_name)
-
-    first_symbol = symbol_settings[0] if symbol_settings else None
 
     return {
 
         "success": True,
 
-        "lot_size":
-            first_symbol.lot_size if first_symbol else 0.01,
-
-        "trades_per_signal":
-            first_symbol.trades_per_signal if first_symbol else 1,
-
-        "max_open_trades":
-            first_symbol.max_open_trades if first_symbol else 3,
-
-        "symbols": symbols
+        "symbols": [
+            s.symbol_name
+            for s in settings
+        ]
     }
 
 
@@ -500,243 +309,75 @@ def get_ai_settings(
 
 @router.get("/ai/live-trades")
 def get_live_trades(
-    license_key: str = ""
-):
-
-    db = SessionLocal()
-
-    try:
-
-        trades = (
-            db.query(LiveTrade)
-            .filter(
-                LiveTrade.license_key == license_key
-            )
-            .filter(
-                LiveTrade.status == "OPEN"
-            )
-            .order_by(
-                LiveTrade.id.desc()
-            )
-            .all()
-        )
-
-        results = []
-
-        for trade in trades:
-
-            results.append({
-
-                "id": trade.id,
-
-                "symbol": trade.symbol,
-
-                "trade_type": trade.trade_type,
-
-                "lot_size": trade.lot_size,
-
-                "entry_price": trade.entry_price,
-
-                "stop_loss": trade.stop_loss,
-
-                "take_profit": trade.take_profit,
-
-                "profit": trade.profit,
-
-                "status": trade.status,
-
-                "mt5_ticket": trade.mt5_ticket,
-
-                "created_at": trade.opened_at
-
-            })
-
-        return results
-
-    finally:
-
-        db.close()
-
-
-@router.get("/ai/trade-history")
-def get_trade_history(
-    license_key: str = ""
-):
-
-    db = SessionLocal()
-
-    try:
-
-        license = (
-            db.query(License)
-            .filter(
-                License.license_key == license_key
-            )
-            .first()
-        )
-
-        if not license:
-            return []
-
-        trades = (
-            db.query(AITradeHistory)
-            .filter(
-                AITradeHistory.trend == "AI",
-                AITradeHistory.license_id == license.id
-            )
-            .order_by(
-                AITradeHistory.id.desc()
-            )
-            .all()
-        )
-
-        results = []
-
-        wins = 0
-        losses = 0
-        total_profit = 0
-
-        for trade in trades:
-
-            profit = trade.profit or 0
-
-            total_profit += profit
-
-            if profit > 0:
-                wins += 1
-
-            elif profit < 0:
-                losses += 1
-
-            results.append({
-
-                "symbol": trade.symbol,
-
-                "trade_type": trade.signal,
-
-                "profit": profit,
-
-                "status": trade.result,
-
-                "created_at": trade.created_at
-
-            })
-
-        total = wins + losses
-
-        win_rate = 0
-
-        if total > 0:
-
-            win_rate = round(
-                (wins / total) * 100,
-                1
-            )
-
-        return {
-
-            "total_trades": len(trades),
-
-            "wins": wins,
-
-            "losses": losses,
-
-            "win_rate": win_rate,
-
-            "net_profit": round(total_profit, 2),
-
-            "trades": results
-
-        }
-
-    finally:
-
-        db.close()
-
-# =========================================================
-# AI STATUS
-# =========================================================
-
-@router.get("/ai/status")
-def ai_status():
-
-    db = SessionLocal()
-
-    try:
-
-        pairs = (
-            db.query(AISymbol)
-            .filter(
-                AISymbol.enabled == True
-            )
-            .count()
-        )
-
-        latest = (
-            db.query(AIMarketState)
-            .order_by(
-                AIMarketState.id.desc()
-            )
-            .first()
-        )
-
-        return {
-
-            "ai_active": True,
-
-            "pairs_tracked": pairs,
-
-            "last_scan":
-                latest.updated_at if latest else None
-        }
-
-    finally:
-
-        db.close()
-
-
-# =========================================================
-# AI SYMBOLS
-# =========================================================
-
-@router.get("/ai/symbols")
-def ai_symbols():
-
-    db = SessionLocal()
-
-    try:
-
-        symbols = db.query(AISymbol).all()
-
-        return [
-
-            {
-                "symbol": s.symbol,
-                "enabled": s.enabled
-            }
-
-            for s in symbols
-        ]
-
-    finally:
-
-        db.close()
-
-
-@router.post("/ai/symbols")
-def save_ai_symbols(
-    data: dict,
+    license_key: str,
     db: Session = Depends(get_db)
 ):
 
-    license_key = data.get("license_key")
+    trades = (
+        db.query(LiveTrade)
+        .filter(
+            LiveTrade.license_key
+            == license_key,
 
-    symbols = data.get("symbols", [])
+            LiveTrade.status
+            == "OPEN"
+        )
+        .order_by(
+            LiveTrade.id.desc()
+        )
+        .all()
+    )
+
+    results = []
+
+    for trade in trades:
+
+        results.append({
+
+            "id": trade.id,
+
+            "symbol": trade.symbol,
+
+            "trade_type": trade.trade_type,
+
+            "lot_size": trade.lot_size,
+
+            "entry_price": trade.entry_price,
+
+            "stop_loss": trade.stop_loss,
+
+            "take_profit": trade.take_profit,
+
+            "profit": round(
+                trade.profit or 0,
+                2
+            ),
+
+            "status": trade.status,
+
+            "mt5_ticket": trade.mt5_ticket,
+
+            "opened_at": trade.opened_at
+        })
+
+    return results
+
+
+# =========================================================
+# TRADE HISTORY
+# =========================================================
+
+@router.get("/ai/trade-history")
+def get_trade_history(
+    license_key: str,
+    db: Session = Depends(get_db)
+):
 
     license_row = (
         db.query(License)
         .filter(
-            License.license_key == license_key
+            License.license_key
+            == license_key
         )
         .first()
     )
@@ -744,102 +385,147 @@ def save_ai_symbols(
     if not license_row:
 
         return {
-            "success": False,
-            "message": "Invalid license"
+            "total_trades": 0,
+            "trades": []
         }
 
-    # DELETE OLD
-    db.query(ClientSymbolSetting).filter(
-        ClientSymbolSetting.license_id == license_row.id
-    ).delete()
-
-    # SAVE NEW
-    for sym in symbols:
-
-        # HANDLE OBJECTS FROM FRONTEND
-        if isinstance(sym, dict):
-
-            symbol_name = sym.get("symbol")
-            enabled = sym.get("enabled", False)
-
-        else:
-
-            symbol_name = sym
-            enabled = True
-
-        # SKIP DISABLED SYMBOLS
-        if not enabled:
-            continue
-
-        db.add(
-            ClientSymbolSetting(
-                license_id=license_row.id,
-                symbol_name=symbol_name,
-                enabled=True,
-                trade_direction="both",
-                lot_size=data.get("lot_size", 0.01),
-                trades_per_signal=data.get("trades_per_signal", 1),
-                max_open_trades=data.get("max_open_trades", 3)
-            )
+    trades = (
+        db.query(AITradeHistory)
+        .filter(
+            AITradeHistory.license_id
+            == license_row.id
         )
+        .order_by(
+            AITradeHistory.id.desc()
+        )
+        .all()
+    )
 
-    db.commit()
+    results = []
+
+    for trade in trades:
+
+        results.append({
+
+            "symbol": trade.symbol,
+
+            "trade_type": trade.signal,
+
+            "profit": round(
+                trade.profit or 0,
+                2
+            ),
+
+            "status": trade.result,
+
+            "created_at": trade.created_at,
+
+            "closed_at": trade.closed_at
+        })
 
     return {
-        "success": True,
-        "symbols": symbols
+
+        "total_trades": len(results),
+
+        "trades": results
     }
 
+
 # =========================================================
-# MARKET DATA
+# SIGNALS PRO
 # =========================================================
 
-@router.get("/ai/market-data")
-def market_data(
-    symbol: str = "XAUUSD"
+@router.get("/ai/signals-pro")
+def get_signals_pro(
+    license_key: str,
+    db: Session = Depends(get_db)
 ):
 
-    db = SessionLocal()
+    license_row = (
+        db.query(License)
+        .filter(
+            License.license_key
+            == license_key
+        )
+        .first()
+    )
 
-    try:
+    if not license_row:
 
-        state = (
-            db.query(AIMarketState)
-            .filter(
-                AIMarketState.symbol == symbol
-            )
-            .first()
+        raise HTTPException(
+            status_code=404,
+            detail="License not found"
         )
 
-        if not state:
+    trades = (
+        db.query(AITradeHistory)
+        .filter(
+            AITradeHistory.license_id
+            == license_row.id
+        )
+        .all()
+    )
 
-            return {
-                "success": False
-            }
+    total_trades = len(trades)
 
-        return {
+    wins = sum(
+        1 for t in trades
+        if (t.profit or 0) > 0
+    )
 
-            "success": True,
+    losses = sum(
+        1 for t in trades
+        if (t.profit or 0) < 0
+    )
 
-            "symbol": state.symbol,
+    net_profit = round(
+        sum(t.profit or 0 for t in trades),
+        2
+    )
 
-            "signal": state.signal,
+    win_rate = 0
 
-            "trend": state.trend,
+    if total_trades > 0:
 
-            "confidence": state.confidence,
+        win_rate = round(
+            (wins / total_trades) * 100,
+            1
+        )
 
-            "entry": state.entry,
+    return {
 
-            "stop_loss": state.stop_loss,
+        "total_trades": total_trades,
 
-            "take_profit": state.take_profit,
+        "wins": wins,
 
-            "analysis": state.analysis,
+        "losses": losses,
 
-            "updated_at": state.updated_at
-        }
+        "win_rate": win_rate,
 
-    finally:
+        "net_profit": net_profit
+    }
 
-        db.close()        
+
+# =========================================================
+# AI STATUS
+# =========================================================
+
+@router.get("/ai/status")
+def ai_status(
+    db: Session = Depends(get_db)
+):
+
+    pairs = (
+        db.query(AISymbol)
+        .filter(
+            AISymbol.enabled == True
+        )
+        .count()
+    )
+
+    return {
+
+        "ai_active": True,
+
+        "pairs_tracked": pairs
+    }
