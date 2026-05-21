@@ -19,6 +19,7 @@ from app.models import (
 from app.ai.models.ai_trade_history import (
     AITradeHistory
 )
+from app.ai.models.ai_market_state import AIMarketState
 
 router = APIRouter(
     prefix="/api/client",
@@ -528,4 +529,56 @@ def ai_status(
         "ai_active": True,
 
         "pairs_tracked": pairs
+    }
+
+@router.get("/ai/market-data")
+def get_market_data(
+    license_key: str,
+    symbol: str,
+    db: Session = Depends(get_db)
+):
+    market = db.query(AIMarketState).filter(
+        AIMarketState.symbol == symbol.upper()
+    ).first()
+
+    if not market:
+        return {
+            "success": False,
+            "symbol": symbol,
+            "direction": "NEUTRAL",
+            "entry_price": 0,
+            "strength": 0,
+            "updated_at": None
+        }
+
+    return {
+        "success": True,
+        "symbol": market.symbol,
+        "direction": market.direction,
+        "entry_price": market.entry_price,
+        "strength": market.strength,
+        "updated_at": market.updated_at.isoformat() if market.updated_at else None
+    }
+
+@router.get("/ai/symbols")
+def get_ai_symbols(
+    license_key: str,
+    db: Session = Depends(get_db)
+):
+    markets = db.query(AIMarketState).filter(
+        AIMarketState.active == True
+    ).all()
+
+    return {
+        "success": True,
+        "symbols": [
+            {
+                "symbol": m.symbol,
+                "direction": m.direction,
+                "strength": m.strength,
+                "entry_price": m.entry_price,
+                "updated_at": m.updated_at.isoformat() if m.updated_at else None
+            }
+            for m in markets
+        ]
     }
