@@ -691,8 +691,9 @@ def save_ai_symbols(
 
         setting = ClientSymbolSetting(
             license_id=license_row.id,
-            symbol=symbol,
-            enabled=True
+            symbol_name=symbol.upper(),
+            enabled=True,
+            trade_direction="both"
         )
 
         db.add(setting)
