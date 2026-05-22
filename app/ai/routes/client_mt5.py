@@ -20,6 +20,7 @@ from app.ai.models.ai_trade_history import (
     AITradeHistory
 )
 from app.ai.models.ai_market_state import AIMarketState
+from app.config.brokers import BROKERS
 
 router = APIRouter(
     prefix="/api/client",
@@ -50,6 +51,14 @@ class AISettingsUpdate(BaseModel):
 
     symbols: List[str] = []
 
+
+@router.get("/ai/brokers")
+def get_brokers():
+
+    return {
+        "success": True,
+        "brokers": BROKERS
+    }
 
 # =========================================================
 # SAVE MT5 ACCOUNT
@@ -94,9 +103,21 @@ def save_mt5_account(
 
         existing.server = data.server
 
-        existing.risk_level = (
+        allowed_risks = [
+            "low",
+            "medium",
+            "aggressive"
+        ]
+
+        risk_level = (
             data.risk_level.lower()
         )
+
+        if risk_level not in allowed_risks:
+
+            risk_level = "medium"
+
+        existing.risk_level = risk_level
 
         existing.is_active = True
 
@@ -119,7 +140,7 @@ def save_mt5_account(
 
         server=data.server,
 
-        risk_level=data.risk_level.lower(),
+        risk_level=risk_level,
 
         is_active=True,
 
@@ -231,6 +252,13 @@ def save_ai_settings(
         ClientSymbolSetting.license_id
         == license_row.id
     ).delete()
+
+    if len(data.symbols) > 20:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Too many symbols"
+        )
 
     for symbol in data.symbols:
 
@@ -358,7 +386,11 @@ def get_live_trades(
 
             "mt5_ticket": trade.mt5_ticket,
 
-            "opened_at": trade.opened_at
+            "opened_at": (
+                trade.opened_at.isoformat()
+                if trade.opened_at
+                else None
+            )
         })
 
     return results
@@ -419,9 +451,17 @@ def get_trade_history(
 
             "status": trade.result,
 
-            "created_at": trade.created_at,
+            "created_at": (
+                trade.created_at.isoformat()
+                if trade.created_at
+                else None
+            ),
 
-            "closed_at": trade.closed_at
+            "closed_at": (
+                trade.closed_at.isoformat()
+                if trade.closed_at
+                else None
+            )
         })
 
     return {
@@ -536,9 +576,16 @@ def get_market_data(
     symbol: str,
     db: Session = Depends(get_db)
 ):
-    market = db.query(AIMarketState).filter(
-        AIMarketState.symbol == symbol.upper()
-    ).first()
+    market = (
+        db.query(AIMarketState)
+        .filter(
+            AIMarketState.symbol == symbol.upper()
+        )
+        .order_by(
+            AIMarketState.updated_at.desc()
+        )
+        .first()
+    )
 
     if not market:
         return {
@@ -572,7 +619,11 @@ def get_market_data(
 def get_ai_symbols(
     db: Session = Depends(get_db)
 ):
-    markets = db.query(AIMarketState).all()
+    markets = (
+        db.query(AIMarketState)
+        .limit(50)
+        .all()
+    )
 
     return {
         "success": True,
