@@ -242,6 +242,8 @@ while True:
 
                 info = mt5.account_info()
 
+                logger.info(f"RAW ACCOUNT INFO: {info}")
+
                 if not info:
 
                     logger.warning(
@@ -263,35 +265,40 @@ while True:
 
                 account.verification_status = "VERIFIED"
 
-                account.account_name = info.name
+                account.account_name = str(info.name)
 
-                account.broker_name = info.company
+                account.broker_name = str(info.company)
 
-                account.balance = float(
-                    info.balance
-                )
+                account.balance = float(info.balance)
 
-                account.equity = float(
-                    info.equity
-                )
+                account.equity = float(info.equity)
 
-                account.last_verified_at = (
-                    datetime.utcnow()
-                )
+                account.server = str(account.server)
+
+                account.last_verified_at = datetime.utcnow()
 
                 db.commit()
 
+                db.refresh(account)
+
                 logger.info(
-                    f"✅ VERIFIED "
-                    f"{account.login}"
+                    f"✅ VERIFIED {account.login}"
                 )
 
                 logger.info(
-                    f"NAME: {info.name}"
+                    f"NAME: {account.account_name}"
                 )
 
                 logger.info(
-                    f"BROKER: {info.company}"
+                    f"BROKER: {account.broker_name}"
+                )
+
+                logger.info(
+                    f"BALANCE: {account.balance}"
+                )
+
+                logger.info(
+                    f"EQUITY: {account.equity}"
                 )
 
             except Exception as account_error:
