@@ -207,19 +207,27 @@ def get_mt5_status(
 
         "login": account.login,
 
+        "account_name": account.account_name,
+
         "broker": account.broker_name,
 
         "server": account.server,
 
-        "balance": account.balance or 0,
+        "balance": float(account.balance or 0),
 
-        "equity": account.equity or 0,
+        "equity": float(account.equity or 0),
 
         "verified": account.is_verified,
 
+        "last_verified_at": (
+            account.last_verified_at.isoformat()
+            if account.last_verified_at
+            else None
+        ),
+
         "risk_level": (
             account.risk_level
-            or "medium"
+           or "medium"
         )
     }
 
