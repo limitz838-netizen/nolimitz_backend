@@ -52,6 +52,11 @@ class AISettingsUpdate(BaseModel):
     symbols: List[str] = []
 
 
+class SaveSymbolsRequest(BaseModel):
+    license_key: str
+    symbols: List[str]  
+
+
 @router.get("/ai/brokers")
 def get_brokers():
 
@@ -651,4 +656,50 @@ def get_ai_symbols(
             }
             for m in markets
         ]
+    }
+
+
+@router.post("/ai/symbols")
+def save_ai_symbols(
+    data: SaveSymbolsRequest,
+    db: Session = Depends(get_db)
+):
+
+    license_row = (
+        db.query(License)
+        .filter(
+            License.license_key
+            == data.license_key
+        )
+        .first()
+    )
+
+    if not license_row:
+        raise HTTPException(
+            status_code=404,
+            detail="License not found"
+        )
+
+    # DELETE OLD SYMBOLS
+    db.query(ClientSymbolSetting).filter(
+        ClientSymbolSetting.license_id
+        == license_row.id
+    ).delete()
+
+    # SAVE NEW SYMBOLS
+    for symbol in data.symbols:
+
+        setting = ClientSymbolSetting(
+            license_id=license_row.id,
+            symbol=symbol,
+            enabled=True
+        )
+
+        db.add(setting)
+
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "Symbols saved successfully"
     }
