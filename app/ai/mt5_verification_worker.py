@@ -26,7 +26,7 @@ TERMINAL_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 
 MAX_VERIFY_PER_LOOP = 5
 
-VERIFY_LOOP_DELAY = 10
+VERIFY_LOOP_DELAY = 5
 
 LOGIN_CACHE_SECONDS = 30
 
@@ -147,7 +147,7 @@ while True:
         accounts = (
             db.query(ClientMT5Account)
             .filter(
-                ClientMT5Account.is_verified == False
+                ClientMT5Account.is_active == True
             )
             .limit(MAX_VERIFY_PER_LOOP)
             .all()
