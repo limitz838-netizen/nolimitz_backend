@@ -129,6 +129,8 @@ def save_mt5_account(
             "success": True,
             "message": "MT5 updated"
         }
+    
+    risk_level = getattr(data, "risk_level", "medium")
 
     new_account = ClientMT5Account(
 
