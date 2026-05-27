@@ -61,8 +61,12 @@ class SaveSymbolsRequest(BaseModel):
 def get_brokers():
 
     return {
+
         "success": True,
-        "brokers": BROKERS
+
+        "brokers": BROKERS,
+
+        "custom_server_allowed": True
     }
 
 # =========================================================

@@ -34,35 +34,6 @@ LAST_LOGIN_TIMES = {}
 
 LAST_MT5_REFRESH = time.time()
 
-# =========================================================
-# ALLOWED BROKERS
-# =========================================================
-
-ALLOWED_SERVERS = [
-
-    # EXNESS
-    "Exness-MT5Real",
-    "Exness-MT5Real2",
-    "Exness-MT5Real3",
-    "Exness-MT5Real4",
-    "Exness-MT5Real5",
-    "ExnessKE-MT5Real",
-    "ExnessKE-MT5Real2",
-    "ExnessKE-MT5Real3",
-    "ExnessKE-MT5Real21",
-
-    # DERIV
-    "Deriv-Server",
-    "Deriv-Demo",
-
-    # FBS
-    "FBS-Demo",
-    "FBS-Real",
-
-    # IC MARKETS
-    "ICMarketsSC-MT5",
-    "ICMarketsSC-Demo",
-]
 
 # =========================================================
 # INITIALIZE MT5
@@ -169,51 +140,25 @@ while True:
                     f"VERIFYING {account.login}"
                 )
 
-                # =========================================================
-                # BROKER VALIDATION
-                # =========================================================
-
-                if account.server not in ALLOWED_SERVERS:
-
-                    logger.warning(
-                        f"Blocked broker server "
-                        f"{account.server}"
-                    )
-
-                    account.verification_status = "BLOCKED"
-
-                    db.commit()
-
-                    continue
+                
 
                 # =========================================================
-                # LOGIN CACHE
+                # SAFE LOGIN
                 # =========================================================
 
-                current_time = time.time()
-
-                last_login = LAST_LOGIN_TIMES.get(
-                    account.login,
-                    0
+                authorized = mt5.login(
+                    login=int(account.login),
+                    password=account.password,
+                    server=account.server
                 )
 
-                if current_time - last_login > LOGIN_CACHE_SECONDS:
+                time.sleep(1)
 
-                    authorized = mt5.login(
-                        login=int(account.login),
-                        password=account.password,
-                        server=account.server
-                    )
+                if authorized:
 
-                    if authorized:
-
-                        LAST_LOGIN_TIMES[
-                            account.login
-                        ] = current_time
-
-                else:
-
-                    authorized = True
+                    LAST_LOGIN_TIMES[
+                        account.login
+                    ] = time.time()
 
                 # =========================================================
                 # LOGIN FAILED
@@ -249,6 +194,24 @@ while True:
                     logger.warning(
                         f"ACCOUNT INFO FAILED "
                         f"{account.login}"
+                    )
+
+                    account.verification_status = "FAILED"
+
+                    db.commit()
+
+                    continue
+
+                # =========================================================
+                # VERIFY CORRECT ACCOUNT
+                # =========================================================
+
+                if str(info.login) != str(account.login):
+
+                    logger.error(
+                        f"ACCOUNT MISMATCH | "
+                        f"expected={account.login} "
+                        f"got={info.login}"
                     )
 
                     account.verification_status = "FAILED"
