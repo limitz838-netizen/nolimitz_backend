@@ -28,7 +28,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
-import MetaTrader5 as mt5
 
 from app.database import SessionLocal, get_db
 from app.models import (
