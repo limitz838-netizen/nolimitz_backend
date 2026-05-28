@@ -14,7 +14,7 @@ from app.mt5_service import verify_mt5_credentials_direct
 # ========================= CONFIG =========================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./nolimitz.db")
 WORKER_NAME = os.getenv("MT5_WORKER_NAME", "nolimitz-mt5-worker-1")
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", 5))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", 2))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", 5))
 
 # ========================= LOGGING =========================
@@ -72,7 +72,7 @@ def process_one_job() -> bool:
         heartbeat_worker(db, worker)
 
         # Reset dead workers
-        stuck_worker_time = utc_now() - timedelta(minutes=5)
+        stuck_worker_time = utc_now() - timedelta(minutes=2)
 
         db.query(MT5Worker).filter(
             MT5Worker.is_busy == True,
@@ -85,7 +85,7 @@ def process_one_job() -> bool:
         db.commit()
 
         # Reset stuck processing jobs
-        stuck_time = utc_now() - timedelta(minutes=10)
+        stuck_time = utc_now() - timedelta(minutes=3)
 
         db.query(MT5VerificationJob).filter(
             MT5VerificationJob.status == "processing",
@@ -117,6 +117,12 @@ def process_one_job() -> bool:
 
         if not job:
             return False
+        
+        logger.info(
+
+            f"🔍 VERIFY REQUEST "
+            f"Job={job.id}"
+        )
 
         # Skip if newer job exists for same license
         newer_job = db.query(MT5VerificationJob).filter(
@@ -213,6 +219,15 @@ def process_one_job() -> bool:
             time.sleep(1) 
 
         finally:
+            try:
+
+                import MetaTrader5 as mt5
+
+                mt5.shutdown()
+
+            except Exception:
+
+                pass
             heartbeat_worker(db, worker, error_text)
             db.commit()
 
