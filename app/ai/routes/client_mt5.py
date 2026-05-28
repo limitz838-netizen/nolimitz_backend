@@ -1,35 +1,39 @@
 """
 ================================================================================
-  CLIENT MT5 + AI API ENDPOINTS
+  CLIENT MT5 + AI API ENDPOINTS  (RENDER / LINUX — NO MetaTrader5)
 ================================================================================
+  IMPORTANT: This file runs on Render (Linux). It must NEVER import or use
+  the MetaTrader5 package — that package is Windows-only and crashes Render
+  on deploy. ALL MT5 work (login, balance, verification) is done by the
+  Windows-side client_mt5_verification_worker.py. The database is the message
+  bus between them.
 
-  FLOW (matches Lovable frontend's polling expectation):
-    1. POST /api/client/mt5-account
-         - Saves credentials immediately
+  CONNECT FLOW:
+    1. POST /mt5-account
+         - Saves credentials to DB
          - Sets verification_status = "VERIFYING"
-         - Spawns a background thread to verify
-         - Returns within ~50ms (no hanging)
-    2. Frontend polls GET /api/client/ai/mt5-status every 3 seconds
-    3. Background thread completes verification (~1-5 seconds typically):
-         - Success: sets verification_status = "VERIFIED" + saves balance etc
-         - Failure: sets verification_status = "FAILED" + saves error_reason
-    4. Frontend sees verified=true on next poll → shows balance, broker, name
-    5. If after 20s polling still VERIFYING → frontend shows timeout error
+         - Returns immediately (~50ms). Does NOT touch MT5.
+    2. Windows worker (fast loop) sees the VERIFYING row within ~1-2s,
+       logs in, captures balance/name/broker, writes VERIFIED + details,
+       and auto-enables ai_auto_trade.
+    3. Frontend polls GET /ai/mt5-status every 3s → sees VERIFIED + details.
+       Feels instant (details appear in ~3-5 seconds).
+
+  REFRESH FLOW:
+    - POST /ai/refresh-balance just flags the account (status → REFRESH)
+      so the worker re-reads balance on its next loop. Frontend polls status.
 ================================================================================
 """
 
-import threading
-import time
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
-
-from app.database import SessionLocal, get_db
+from app.database import get_db
 from app.models import (
     ClientMT5Account, License, LiveTrade,
     ClientSymbolSetting, AISymbol,
@@ -37,197 +41,10 @@ from app.models import (
 from app.ai.models.ai_trade_history import AITradeHistory
 from app.ai.models.ai_market_state import AIMarketState
 
-# Broker suggestions are optional — never let a broken import block the module
-try:
-    from app.config.brokers import BROKERS
-except Exception:
-    BROKERS = []
-
 
 logger = logging.getLogger("client_mt5")
 
 router = APIRouter(prefix="/api/client", tags=["Client MT5 & AI"])
-
-
-# ============================================================================
-# MT5 TERMINAL LOCK + VERIFICATION QUEUE
-# ----------------------------------------------------------------------------
-# Single MT5 terminal serves all users. _MT5_LOCK serializes terminal access
-# across the API (this file) and the periodic verification worker.
-#
-# When a user submits credentials, we spawn a worker thread that acquires the
-# lock, performs the verification, and writes the result to the database.
-# ============================================================================
-_MT5_LOCK = threading.Lock()
-_MT5_LOCK_TIMEOUT = 12  # seconds — enough for retry if broker is slow
-
-# Track which logins are currently being verified (to dedupe rapid resubmits)
-_verifying_now: set = set()
-_verifying_lock = threading.Lock()
-
-
-def _do_verification(login: str, password: str, server: str) -> dict:
-    """
-    Connect to MT5, log in, capture account info. Pure function — no DB writes.
-    Returns dict with ok / reason / account fields.
-    """
-    out = {"ok": False, "reason": ""}
-
-    # =========================================================
-    # HARD RESET MT5 SESSION
-    # =========================================================
-
-    try:
-
-        mt5.shutdown()
-
-        time.sleep(1)
-
-    except Exception:
-
-        pass
-
-    if not mt5.initialize():
-
-        out["reason"] = (
-
-            f"mt5_reinitialize_failed_"
-            f"{mt5.last_error()}"
-
-        )
-
-        return out
-
-    if not _MT5_LOCK.acquire(timeout=_MT5_LOCK_TIMEOUT):
-        out["reason"] = "mt5_terminal_busy"
-        return out
-    try:
-        # Ensure terminal alive
-        if not mt5.terminal_info():
-            mt5.shutdown()
-            time.sleep(0.5)
-            if not mt5.initialize():
-                out["reason"] = f"mt5_init_failed_{mt5.last_error()}"
-                return out
-
-        try:
-            login_int = int(login)
-        except (ValueError, TypeError):
-            out["reason"] = "invalid_login_not_numeric"
-            return out
-
-        if not mt5.login(login_int, password=password, server=server):
-            err = mt5.last_error()
-            err_code = err[0] if isinstance(err, tuple) and len(err) > 0 else 0
-            # Map common MT5 error codes to friendly messages
-            err_msg = "mt5_login_failed"
-            if err_code in (-6, 10004):
-                err_msg = "invalid_credentials"
-            elif err_code in (-2, -3):
-                err_msg = "server_unreachable"
-            elif err_code == -8:
-                err_msg = "account_disabled"
-            out["reason"] = f"{err_msg}_{err}"
-            return out
-
-        time.sleep(0.5)
-        info = mt5.account_info()
-        if not info:
-            out["reason"] = "account_info_unavailable"
-            return out
-
-        if str(info.login) != str(login):
-            out["reason"] = f"account_mismatch_{login}_vs_{info.login}"
-            return out
-
-        out["ok"] = True
-        out["account_name"] = str(info.name or "")
-        out["broker_name"]  = str(info.company or "")
-        out["balance"]      = float(info.balance or 0)
-        out["equity"]       = float(info.equity or 0)
-        out["currency"]     = str(info.currency or "USD")
-        out["leverage"]     = int(info.leverage or 0)
-        return out
-    except Exception as e:
-        out["reason"] = f"exception_{type(e).__name__}_{str(e)[:80]}"
-        return out
-    finally:
-
-        try:
-
-            mt5.shutdown()
-
-        except Exception:
-
-            pass
-
-        try:
-            _MT5_LOCK.release()
-        except RuntimeError:
-            pass
-
-
-def _verify_async(account_id: int, login: str, password: str, server: str) -> None:
-    """
-    Worker thread: verifies one account against MT5 and updates DB.
-    Runs after the POST endpoint returns to the user.
-    """
-    key = login
-    with _verifying_lock:
-        if key in _verifying_now:
-            logger.info("Skip duplicate verify for %s (already in progress)", login)
-            return
-        _verifying_now.add(key)
-
-    try:
-        logger.info("🔍 Async verify start: %s", login)
-        result = _do_verification(login, password, server)
-
-        db = SessionLocal()
-        try:
-            account = db.query(ClientMT5Account).filter(
-                ClientMT5Account.id == account_id
-            ).first()
-            if not account:
-                logger.warning("Account row %d disappeared mid-verify", account_id)
-                return
-
-            if result["ok"]:
-                account.is_verified         = True
-                account.verification_status = "VERIFIED"
-                account.account_name        = result["account_name"]
-                account.broker_name         = result["broker_name"]
-                account.balance             = result["balance"]
-                account.equity              = result["equity"]
-                account.last_verified_at    = datetime.now(timezone.utc)
-                # CLEANUP #1: auto-enable AI trading the moment the account
-                # verifies. User connects → account verifies → AI trades.
-                # No separate "Start AI" tap required.
-                account.ai_auto_trade       = True
-                db.commit()
-                logger.info(
-                    "✅ ASYNC VERIFY %s | %s | %s | bal=$%.2f | AI auto-enabled",
-                    login, result["account_name"], result["broker_name"],
-                    result["balance"],
-                )
-            else:
-                account.is_verified         = False
-                account.verification_status = "FAILED"
-                account.last_verified_at    = datetime.now(timezone.utc)
-                if hasattr(account, "verification_error"):
-                    account.verification_error = result["reason"][:200]
-                db.commit()
-                logger.warning("❌ ASYNC VERIFY FAILED %s | %s", login, result["reason"])
-        except Exception as e:
-            logger.error("DB write failed for %s: %s", login, e)
-            try: db.rollback()
-            except Exception: pass
-        finally:
-            try: db.close()
-            except Exception: pass
-    finally:
-        with _verifying_lock:
-            _verifying_now.discard(key)
 
 
 # ============================================================================
@@ -260,6 +77,7 @@ class MT5AccountCreate(BaseModel):
 class AISettingsUpdate(BaseModel):
     license_key: str
     symbols: List[str] = []
+    risk_level: Optional[str] = None   # optional — if sent, also update mode
 
 
 class SaveSymbolsRequest(BaseModel):
@@ -267,33 +85,27 @@ class SaveSymbolsRequest(BaseModel):
     symbols: List[str]
 
 
+class RiskLevelUpdate(BaseModel):
+    license_key: str
+    risk_level: str
+
+
 # ============================================================================
-# BROKERS LIST
-# ----------------------------------------------------------------------------
-# CLEANUP #2: NO broker restrictions. The list is SUGGESTIONS ONLY — users can
-# type any server name. The save endpoint never validates server against this
-# list. If the BROKERS import is empty/broken, we still return a working
-# response so the frontend never blocks the user.
+# BROKER LIST — no restrictions, any server allowed. Suggestions come from
+# the frontend; backend never enforces a broker list.
 # ============================================================================
 @router.get("/ai/brokers")
 def get_brokers():
-    try:
-        suggestions = BROKERS if isinstance(BROKERS, (list, dict)) else []
-    except Exception:
-        suggestions = []
     return {
         "success": True,
-        "brokers": suggestions,           # suggestions only — not enforced
-        "custom_server_allowed": True,    # any server name accepted
+        "brokers": [],                  # no backend-enforced list
+        "custom_server_allowed": True,  # any server name accepted
         "restrictions": False,
     }
 
 
 # ============================================================================
-# SAVE MT5 ACCOUNT
-# ----------------------------------------------------------------------------
-# Returns IMMEDIATELY with status=VERIFYING. Background thread does the work.
-# Frontend polls /ai/mt5-status every 3s to detect completion.
+# SAVE MT5 ACCOUNT — saves creds, sets VERIFYING. Worker does the rest.
 # ============================================================================
 @router.post("/mt5-account")
 def save_mt5_account(data: MT5AccountCreate, db: Session = Depends(get_db)):
@@ -332,15 +144,6 @@ def save_mt5_account(data: MT5AccountCreate, db: Session = Depends(get_db)):
         db.add(account)
     db.commit()
     db.refresh(account)
-
-    # Kick off async verification — returns immediately
-    thread = threading.Thread(
-        target=_verify_async,
-        args=(account.id, data.login, data.password, data.server),
-        daemon=True,
-        name=f"verify-{data.login}",
-    )
-    thread.start()
 
     logger.info("📥 Queued verification: login=%s server=%s", data.login, data.server)
 
@@ -400,17 +203,8 @@ def get_mt5_status(license_key: str, db: Session = Depends(get_db)):
 
 
 # ============================================================================
-# CLEANUP #4: RISK LEVEL UPDATE
-# ----------------------------------------------------------------------------
-# Lets the user change risk mode (normal/medium/aggressive) WITHOUT re-entering
-# MT5 credentials. The old flow only saved risk_level inside /mt5-account, so
-# changing it in the dashboard alone never persisted.
+# RISK LEVEL UPDATE — change mode without re-entering MT5 creds
 # ============================================================================
-class RiskLevelUpdate(BaseModel):
-    license_key: str
-    risk_level: str
-
-
 @router.post("/ai/risk-level")
 def update_risk_level(data: RiskLevelUpdate, db: Session = Depends(get_db)):
     license_row = db.query(License).filter(
@@ -438,15 +232,8 @@ def update_risk_level(data: RiskLevelUpdate, db: Session = Depends(get_db)):
 
 
 # ============================================================================
-# CLEANUP #3: LIVE BALANCE REFRESH
-# ----------------------------------------------------------------------------
-# The stale-balance problem: balance was only captured at verify time. This
-# endpoint does a FRESH MT5 read on demand (serialized by the terminal lock)
-# so the dashboard can show the real, current balance/equity. Frontend can
-# call this on dashboard open or via a manual "refresh balance" action.
-#
-# NOTE: don't call this every poll for 100+ users — it hits the MT5 terminal.
-# Use it on dashboard load and on user-initiated refresh only.
+# REFRESH BALANCE — flags account so the Windows worker re-reads balance.
+# (No MT5 here — just sets status so the worker refreshes on its next loop.)
 # ============================================================================
 @router.post("/ai/refresh-balance")
 def refresh_balance(license_key: str, db: Session = Depends(get_db)):
@@ -470,32 +257,17 @@ def refresh_balance(license_key: str, db: Session = Depends(get_db)):
             "equity":  float(account.equity or 0),
         }
 
-    # Fresh read from MT5
-    result = _do_verification(account.login, account.password, account.server)
-    if result["ok"]:
-        account.balance          = result["balance"]
-        account.equity           = result["equity"]
-        account.account_name     = result["account_name"]
-        account.broker_name      = result["broker_name"]
-        account.last_verified_at = datetime.now(timezone.utc)
-        db.commit()
-        return {
-            "success":      True,
-            "balance":      result["balance"],
-            "equity":       result["equity"],
-            "account_name": result["account_name"],
-            "broker":       result["broker_name"],
-            "currency":     result["currency"],
-            "updated_at":   account.last_verified_at.isoformat(),
-        }
-    else:
-        # Return last-known values if the live read fails
-        return {
-            "success": False,
-            "message": result["reason"],
-            "balance": float(account.balance or 0),
-            "equity":  float(account.equity or 0),
-        }
+    # Flag for worker to re-read on next loop. Worker picks REFRESH up fast.
+    account.verification_status = "REFRESH"
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "Balance refresh queued",
+        "balance": float(account.balance or 0),   # last-known, until worker updates
+        "equity":  float(account.equity or 0),
+        "status":  "REFRESH",
+    }
 
 
 # ============================================================================
@@ -503,11 +275,6 @@ def refresh_balance(license_key: str, db: Session = Depends(get_db)):
 # ============================================================================
 @router.post("/ai/settings")
 def save_ai_settings(data: AISettingsUpdate, db: Session = Depends(get_db)):
-    """
-    UPSERT user's enabled symbols. Symbols removed from the list are disabled
-    (not deleted) so per-symbol lot_size / max_open_trades / trade_direction
-    customizations come back if the symbol is re-added later.
-    """
     license_row = db.query(License).filter(
         License.license_key == data.license_key
     ).first()
@@ -538,8 +305,24 @@ def save_ai_settings(data: AISettingsUpdate, db: Session = Depends(get_db)):
                 enabled         = True,
                 trade_direction = "both",
             ))
+
+    # FIX 1: if risk_level was sent, save it on the MT5 account too, so the
+    # user can change mode from the AI settings screen and it persists.
+    saved_risk = None
+    if data.risk_level:
+        account = db.query(ClientMT5Account).filter(
+            ClientMT5Account.license_id == license_row.id
+        ).first()
+        if account:
+            saved_risk = normalize_risk_level(data.risk_level)
+            account.risk_level = saved_risk
+
     db.commit()
-    return {"success": True, "message": "Symbols updated"}
+    return {
+        "success": True,
+        "message": "Symbols updated",
+        "risk_level": saved_risk,
+    }
 
 
 @router.get("/ai/settings")
@@ -555,8 +338,15 @@ def get_ai_settings(license_key: str, db: Session = Depends(get_db)):
         ClientSymbolSetting.enabled == True,
     ).all()
 
+    # Include the saved risk mode so the frontend can restore it after refresh
+    account = db.query(ClientMT5Account).filter(
+        ClientMT5Account.license_id == license_row.id
+    ).first()
+    risk_level = (account.risk_level if account and account.risk_level else "medium")
+
     return {
         "success": True,
+        "risk_level": risk_level,
         "symbols": [
             {
                 "symbol":          s.symbol_name,
@@ -624,25 +414,14 @@ def get_ai_symbols(db: Session = Depends(get_db)):
 
 
 # ============================================================================
-# LIVE TRADES / HISTORY / STATS / MARKET DATA
+# LIVE TRADES — with auto-cleanup of stale OPEN rows
 # ============================================================================
-# ============================================================================
-# LIVE TRADES / HISTORY / STATS / MARKET DATA
-# ============================================================================
-
-# CLEANUP #5: any LiveTrade still marked OPEN after this many hours is almost
-# certainly a ghost (closed on MT5 but the worker never reconciled it, e.g.
-# closed manually, or from a previous worker version). A real scalp never
-# stays open this long. We auto-mark these CLOSED so they stop cluttering the
-# dashboard. Tune via env if needed.
 import os as _os
 STALE_OPEN_TRADE_HOURS = int(_os.environ.get("STALE_OPEN_TRADE_HOURS", "24"))
 
 
 @router.get("/ai/live-trades")
 def get_live_trades(license_key: str, db: Session = Depends(get_db)):
-    from datetime import timedelta
-
     now_utc = datetime.now(timezone.utc)
     cutoff  = now_utc - timedelta(hours=STALE_OPEN_TRADE_HOURS)
 
@@ -655,12 +434,9 @@ def get_live_trades(license_key: str, db: Session = Depends(get_db)):
     stale_count = 0
     for t in open_trades:
         opened = t.opened_at
-        # Normalize naive datetimes to UTC for comparison
         if opened is not None and opened.tzinfo is None:
             opened = opened.replace(tzinfo=timezone.utc)
-
         if opened is not None and opened < cutoff:
-            # Ghost trade — auto-close it in the DB so it stops showing
             t.status = "CLOSED"
             if hasattr(t, "closed_at") and not t.closed_at:
                 t.closed_at = now_utc
@@ -694,6 +470,9 @@ def get_live_trades(license_key: str, db: Session = Depends(get_db)):
     ]
 
 
+# ============================================================================
+# TRADE HISTORY — only CLOSED trades with real outcomes
+# ============================================================================
 @router.get("/ai/trade-history")
 def get_trade_history(license_key: str, db: Session = Depends(get_db)):
     license_row = db.query(License).filter(
@@ -702,8 +481,6 @@ def get_trade_history(license_key: str, db: Session = Depends(get_db)):
     if not license_row:
         return {"total_trades": 0, "trades": []}
 
-    # Only show CLOSED trades — open/pending rows have no meaningful outcome.
-    # This prevents the "all OPEN +0.00" noise seen in older data.
     trades = db.query(AITradeHistory).filter(
         AITradeHistory.license_id == license_row.id,
         AITradeHistory.status == "CLOSED",
@@ -716,8 +493,8 @@ def get_trade_history(license_key: str, db: Session = Depends(get_db)):
                 "symbol":     t.symbol,
                 "trade_type": t.signal,
                 "profit":     round(float(t.profit or 0), 2),
-                "result":     t.result,          # WIN / LOSS / BREAKEVEN
-                "status":     t.result,          # frontend shows this as the badge
+                "result":     t.result,
+                "status":     t.result,
                 "lot_size":   float(t.lot_size or 0),
                 "created_at": t.created_at.isoformat() if t.created_at else None,
                 "closed_at":  t.closed_at.isoformat() if t.closed_at else None,
@@ -727,6 +504,9 @@ def get_trade_history(license_key: str, db: Session = Depends(get_db)):
     }
 
 
+# ============================================================================
+# SIGNALS PRO — stats only from CLOSED trades, profit as source of truth
+# ============================================================================
 @router.get("/ai/signals-pro")
 def get_signals_pro(license_key: str, db: Session = Depends(get_db)):
     license_row = db.query(License).filter(
@@ -735,24 +515,17 @@ def get_signals_pro(license_key: str, db: Session = Depends(get_db)):
     if not license_row:
         raise HTTPException(status_code=404, detail="License not found")
 
-    # Only CLOSED trades count toward stats. Open/pending rows (profit 0,
-    # no result) are excluded so we never show contradictory numbers like
-    # "60% win rate but 0/0 wins/losses".
     trades = db.query(AITradeHistory).filter(
         AITradeHistory.license_id == license_row.id,
         AITradeHistory.status == "CLOSED",
     ).all()
 
     total = len(trades)
-
-    # Classify by ACTUAL profit (single source of truth) rather than mixing
-    # a "result" string field with a separate profit test.
     wins   = sum(1 for t in trades if float(t.profit or 0) > 0)
     losses = sum(1 for t in trades if float(t.profit or 0) < 0)
     breakeven = total - wins - losses
     net = round(sum(float(t.profit or 0) for t in trades), 2)
 
-    # Win rate = wins / decisive trades (exclude breakevens from the ratio)
     decisive = wins + losses
     win_rate = round((wins / decisive * 100), 1) if decisive > 0 else 0.0
 
@@ -766,6 +539,9 @@ def get_signals_pro(license_key: str, db: Session = Depends(get_db)):
     }
 
 
+# ============================================================================
+# AI STATUS / MARKET DATA
+# ============================================================================
 @router.get("/ai/status")
 def ai_status(db: Session = Depends(get_db)):
     pairs = db.query(AISymbol).filter(AISymbol.enabled == True).count()

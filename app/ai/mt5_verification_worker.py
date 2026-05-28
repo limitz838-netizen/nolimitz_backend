@@ -40,13 +40,9 @@ from sqlalchemy.orm import Session
 from app.database import SessionLocal
 from app.models import ClientMT5Account
 
-# Share the same MT5_LOCK as the API endpoint (single terminal serializer).
-# If imported from a different process, this becomes its own lock — which is
-# fine since the API and worker would each have their own terminal then.
-try:
-    from app.routes.client_mt5 import _MT5_LOCK as MT5_LOCK
-except Exception:
-    MT5_LOCK = threading.Lock()
+# The Windows worker is the ONLY thing that touches MT5, so it owns its own
+# terminal lock. The Render API no longer imports MetaTrader5 at all.
+MT5_LOCK = threading.Lock()
 
 
 # ==============================================================================
@@ -70,12 +66,15 @@ TERMINAL_PATH = os.environ.get(
 
 # How often to refresh a VERIFIED account's balance/equity
 REFRESH_INTERVAL_SEC      = int(os.environ.get("VERIFY_REFRESH_SEC",   "300"))   # 5 min
-# Loop cadence
-LOOP_DELAY                = int(os.environ.get("VERIFY_LOOP_DELAY",    "5"))
+# Fast loop cadence — checks for NEW connections (VERIFYING/REFRESH) often so
+# users see their account details within ~1-2 seconds of tapping Connect.
+LOOP_DELAY                = int(os.environ.get("VERIFY_LOOP_DELAY",    "2"))
 # How many accounts to process per loop
 MAX_ACCOUNTS_PER_LOOP     = int(os.environ.get("VERIFY_BATCH_SIZE",   "20"))
 # Periodic MT5 refresh (full restart of terminal)
 MT5_RESTART_INTERVAL_SEC  = int(os.environ.get("MT5_RESTART_INTERVAL", "3600"))  # 1 hr
+# Login timeout (ms) — bounds every connect attempt so a bad broker can't hang
+LOGIN_TIMEOUT_MS          = int(os.environ.get("MT5_LOGIN_TIMEOUT_MS", "15000"))  # 15s
 
 # Failure backoff schedule (seconds since last attempt before next retry)
 FAILURE_BACKOFF = [60, 120, 300, 900, 1800, 3600]
@@ -138,6 +137,58 @@ def should_skip_due_to_backoff(account_login: str) -> bool:
 
 
 # ==============================================================================
+# ROBUST CONNECT
+# ==============================================================================
+def _robust_connect(login_int: int, password: str, server: str,
+                   attempts: int = 2) -> bool:
+    """
+    Try to connect to a user's account using multiple strategies so the
+    terminal doesn't hang ("stack") when a broker server needs resolving.
+
+    Strategy A — initialize(login=, password=, server=): passing creds to
+      initialize gives the terminal the best chance to resolve the broker's
+      server automatically (better than login() on its own).
+    Strategy B — login(login, password, server) on the running terminal.
+
+    Both strategies use a bounded timeout (LOGIN_TIMEOUT_MS) so a bad broker
+    can never hang the worker. Each strategy is retried up to `attempts` times
+    with a short pause, because server resolution can succeed on a second try.
+
+    Returns True if connected (verified by account_info matching login).
+    """
+    for attempt in range(1, attempts + 1):
+        # Strategy A: initialize with credentials (bounded timeout)
+        try:
+            ok = mt5.initialize(
+                path=TERMINAL_PATH,
+                login=login_int,
+                password=password,
+                server=server,
+                timeout=LOGIN_TIMEOUT_MS,   # ms — never hangs forever
+            )
+            if ok:
+                info = mt5.account_info()
+                if info and str(info.login) == str(login_int):
+                    return True
+        except Exception as e:
+            logger.debug("init-with-creds attempt %d failed: %s", attempt, e)
+
+        # Strategy B: plain login on the running terminal (bounded timeout)
+        try:
+            if mt5.login(login_int, password=password, server=server,
+                        timeout=LOGIN_TIMEOUT_MS):
+                info = mt5.account_info()
+                if info and str(info.login) == str(login_int):
+                    return True
+        except Exception as e:
+            logger.debug("login attempt %d failed: %s", attempt, e)
+
+        time.sleep(1.0)  # brief pause before next attempt
+
+    return False
+
+
+# ==============================================================================
 # CORE VERIFICATION
 # ==============================================================================
 def verify_one_account(account: ClientMT5Account, db: Session) -> bool:
@@ -162,12 +213,31 @@ def verify_one_account(account: ClientMT5Account, db: Session) -> bool:
         return False
 
     try:
-        if not mt5.login(login_int, password=account.password, server=account.server):
+        # ── Robust connect: try several strategies so we don't "stack" ────────
+        # Strategy A: initialize() WITH credentials — best server resolution.
+        #             Passing login/server to initialize lets the terminal
+        #             resolve the broker server more reliably than login() alone.
+        # Strategy B: plain login() on the already-running terminal.
+        # Each strategy is retried briefly because server resolution can need
+        # a moment on the first attempt.
+        connected = _robust_connect(login_int, account.password, account.server)
+
+        if not connected:
             err = mt5.last_error()
-            logger.warning("Login failed %s: %s", login_str, err)
+            logger.warning("Login failed %s on %s: %s", login_str, account.server, err)
             _failure_count[login_str] += 1
-            # Don't mark as FAILED forever — keep PENDING for retry
-            account.verification_status = "PENDING"
+            # Distinguish "broker not known to terminal" from "wrong password".
+            # Error -2/-3 == server unreachable/unknown → broker not added.
+            err_code = err[0] if isinstance(err, tuple) and err else 0
+            if err_code in (-2, -3):
+                account.verification_status = "FAILED"
+                if hasattr(account, "verification_error"):
+                    account.verification_error = (
+                        f"broker_server_not_supported:{account.server}"
+                    )
+            else:
+                # Keep PENDING for retry (could be transient / wrong creds)
+                account.verification_status = "PENDING"
             account.is_verified = False
             db.commit()
             return False
@@ -191,19 +261,30 @@ def verify_one_account(account: ClientMT5Account, db: Session) -> bool:
             return False
 
         # Success — capture details
+        was_first_verify = not account.is_verified
         account.is_verified         = True
         account.verification_status = "VERIFIED"
+        account.is_active           = True
         account.account_name        = str(info.name or "")
         account.broker_name         = str(info.company or "")
         account.balance             = float(info.balance or 0)
         account.equity              = float(info.equity or 0)
         account.last_verified_at    = datetime.now(timezone.utc)
+        # FIX 1: clear any stale verification error from a previous failure,
+        # otherwise an old error message could linger forever after a fix.
+        if hasattr(account, "verification_error"):
+            account.verification_error = None
+        # Auto-enable AI trading on first successful verify — user connects,
+        # account verifies, AI starts trading. No separate "Start AI" needed.
+        if was_first_verify:
+            account.ai_auto_trade = True
         db.commit()
         _failure_count[login_str] = 0
         logger.info(
-            "✅ %s | %s | %s | bal=$%.2f eq=$%.2f",
+            "✅ %s | %s | %s | bal=$%.2f eq=$%.2f%s",
             login_str, account.account_name, account.broker_name,
             account.balance, account.equity,
+            " | AI auto-enabled" if was_first_verify else "",
         )
         return True
     except Exception as e:
@@ -223,28 +304,41 @@ def verify_one_account(account: ClientMT5Account, db: Session) -> bool:
 def get_accounts_to_process(db: Session) -> List[ClientMT5Account]:
     """
     Build the list of accounts that need attention this cycle.
-    Priority:
-      1. PENDING accounts past their backoff
-      2. VERIFIED accounts whose last_verified_at is older than REFRESH_INTERVAL_SEC
+    Priority order:
+      1. NEW user actions — VERIFYING / REFRESH (no backoff, always immediate)
+      2. PENDING / FAILED retries (respecting backoff)
+      3. VERIFIED accounts whose last_verified_at is stale (periodic refresh)
     """
     now_utc = datetime.now(timezone.utc)
     refresh_cutoff = now_utc - timedelta(seconds=REFRESH_INTERVAL_SEC)
 
-    # PENDING accounts (or never-verified) get tried first
+    # 1. HIGHEST PRIORITY — brand-new connect / refresh requests from users.
+    #    These are processed every fast loop with NO backoff so the user sees
+    #    their account details within ~1-2 seconds.
+    fresh_requests = db.query(ClientMT5Account).filter(
+        ClientMT5Account.is_active == True,
+        or_(
+            ClientMT5Account.verification_status == "VERIFYING",
+            ClientMT5Account.verification_status == "REFRESH",
+        ),
+    ).limit(MAX_ACCOUNTS_PER_LOOP).all()
+
+    # 2. Retry PENDING / FAILED / never-verified (with backoff)
     pending = db.query(ClientMT5Account).filter(
         or_(
             ClientMT5Account.verification_status == "PENDING",
             ClientMT5Account.verification_status == "FAILED",
             ClientMT5Account.verification_status.is_(None),
-            ClientMT5Account.is_verified == False,
         ),
+        ClientMT5Account.is_verified == False,
         ClientMT5Account.is_active == True,
     ).limit(MAX_ACCOUNTS_PER_LOOP).all()
 
-    # VERIFIED but stale
+    # 3. VERIFIED but stale → periodic balance refresh
     stale = db.query(ClientMT5Account).filter(
         ClientMT5Account.is_verified == True,
         ClientMT5Account.is_active == True,
+        ClientMT5Account.verification_status == "VERIFIED",
         or_(
             ClientMT5Account.last_verified_at.is_(None),
             ClientMT5Account.last_verified_at < refresh_cutoff,
@@ -253,11 +347,19 @@ def get_accounts_to_process(db: Session) -> List[ClientMT5Account]:
 
     seen_logins = set()
     queue: List[ClientMT5Account] = []
+
+    # Fresh requests first — never skipped by backoff
+    for acc in fresh_requests:
+        if acc.login in seen_logins:
+            continue
+        seen_logins.add(acc.login)
+        queue.append(acc)
+
+    # Then pending/stale, respecting backoff
     for acc in pending + stale:
         if acc.login in seen_logins:
             continue
         seen_logins.add(acc.login)
-        # Apply backoff to pending failures
         if should_skip_due_to_backoff(str(acc.login)):
             continue
         queue.append(acc)
