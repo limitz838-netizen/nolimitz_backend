@@ -573,3 +573,106 @@ def get_market_data(symbol: str, db: Session = Depends(get_db)):
         "take_profit": float(market.take_profit or 0) if market.take_profit else None,
         "updated_at":  market.updated_at.isoformat() if market.updated_at else None,
     }
+
+
+# ============================================================================
+# DIAGNOSE — temporary endpoint to figure out why live-trades is empty
+# ----------------------------------------------------------------------------
+# Open in browser:
+#   https://nolimitz-backend-yfne.onrender.com/api/client/diagnose-live-trades
+#       ?license_key=NL-U42YHV54J5
+#
+# It returns a JSON report explaining exactly what the DB contains, so we
+# can pinpoint why /live-trades returns []. REMOVE THIS ENDPOINT after the
+# investigation — it doesn't require auth and exposes internal state.
+# ============================================================================
+@router.get("/diagnose-live-trades")
+def diagnose_live_trades(license_key: str, db: Session = Depends(get_db)):
+    report = {"license_key_input": license_key}
+
+    # 1) Does the license exist?
+    lic = db.query(License).filter(License.license_key == license_key).first()
+    report["license_found"] = bool(lic)
+    if not lic:
+        report["hint"] = "License key not found at all. Check spelling."
+        return report
+    report["license_id"] = lic.id
+    report["license_key_in_db"] = lic.license_key
+
+    # 2) MT5 account info
+    acct = db.query(ClientMT5Account).filter(
+        ClientMT5Account.license_id == lic.id
+    ).first()
+    if acct:
+        report["mt5_account"] = {
+            "login":        acct.login,
+            "verified":     bool(acct.is_verified),
+            "status":       acct.verification_status,
+            "ai_auto_trade": bool(acct.ai_auto_trade),
+            "risk_level":   acct.risk_level,
+            "balance":      float(acct.balance or 0),
+        }
+    else:
+        report["mt5_account"] = None
+
+    # 3) Count LiveTrade rows by status FOR THIS license_key (exact match)
+    from sqlalchemy import func
+    by_status = (
+        db.query(LiveTrade.status, func.count(LiveTrade.id))
+        .filter(LiveTrade.license_key == license_key)
+        .group_by(LiveTrade.status)
+        .all()
+    )
+    report["live_trades_by_status_for_license_key"] = {s: n for s, n in by_status}
+
+    # 4) Same count but search by mt5_login (catches mismatch case)
+    if acct:
+        by_login = (
+            db.query(LiveTrade.status, func.count(LiveTrade.id))
+            .filter(LiveTrade.mt5_login == str(acct.login))
+            .group_by(LiveTrade.status)
+            .all()
+        )
+        report["live_trades_by_status_for_mt5_login"] = {s: n for s, n in by_login}
+
+    # 5) Recent rows (last 6 hours) regardless of license — see what worker writes
+    six_hours_ago = datetime.now(timezone.utc) - timedelta(hours=6)
+    recent = db.query(LiveTrade).filter(
+        LiveTrade.opened_at > six_hours_ago
+    ).order_by(LiveTrade.id.desc()).limit(15).all()
+    report["recent_live_trades_any_license"] = [
+        {
+            "id":          t.id,
+            "license_key": t.license_key,
+            "mt5_login":   t.mt5_login,
+            "symbol":      t.symbol,
+            "status":      t.status,
+            "ticket":      t.mt5_ticket,
+            "lot":         float(t.lot_size or 0),
+            "opened_at":   t.opened_at.isoformat() if t.opened_at else None,
+        }
+        for t in recent
+    ]
+
+    # 6) The actual filter used by GET /live-trades, replayed
+    open_for_key = db.query(LiveTrade).filter(
+        LiveTrade.license_key == license_key,
+        LiveTrade.status == "OPEN",
+    ).all()
+    report["matches_live_trades_endpoint_filter"] = len(open_for_key)
+
+    # 7) Verdict — narrow the cause
+    n_by_key   = sum(report["live_trades_by_status_for_license_key"].values())
+    n_by_login = sum(
+        report.get("live_trades_by_status_for_mt5_login", {}).values()
+    )
+    if n_by_key == 0 and n_by_login == 0:
+        report["verdict"] = "NO_ROWS_AT_ALL — the worker never wrote LiveTrade rows. Check the worker is running and writing to the same DB."
+    elif n_by_key == 0 and n_by_login > 0:
+        report["verdict"] = "LICENSE_KEY_MISMATCH — rows exist under mt5_login but with a different/null license_key. Worker writes broken license_key."
+    elif report["live_trades_by_status_for_license_key"].get("OPEN", 0) == 0:
+        report["verdict"] = "ALL_CLOSED — rows exist but none are OPEN. Either auto-cleanup ran, or worker closed them in DB."
+    else:
+        report["verdict"] = "OK — rows exist and should be returned. If endpoint still gives [], cache or wrong frontend URL."
+
+    return report
