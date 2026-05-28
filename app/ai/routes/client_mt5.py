@@ -676,3 +676,59 @@ def diagnose_live_trades(license_key: str, db: Session = Depends(get_db)):
         report["verdict"] = "OK — rows exist and should be returned. If endpoint still gives [], cache or wrong frontend URL."
 
     return report
+
+
+# ============================================================================
+# BACKFILL — one-shot migration to fix orphaned AITradeHistory rows
+# ----------------------------------------------------------------------------
+# Old worker wrote AITradeHistory with license_id=NULL because it tried to
+# read signal.license_id (which doesn't exist). Worker is now fixed, but the
+# existing orphaned rows are invisible to /trade-history and /signals-pro.
+#
+# This endpoint joins AITradeHistory → ClientMT5Account (via mt5_login) →
+# License and backfills the license_id. Idempotent — safe to call multiple
+# times. REMOVE AFTER RUNNING.
+#
+# Open in browser:
+#   https://nolimitz-backend-yfne.onrender.com/api/client/backfill-history
+# ============================================================================
+@router.get("/backfill-history")
+def backfill_history(db: Session = Depends(get_db)):
+    # Build map: mt5_login → license_id, from ClientMT5Account
+    accounts = db.query(ClientMT5Account).filter(
+        ClientMT5Account.license_id.isnot(None)
+    ).all()
+    login_to_license = {str(a.login): a.license_id for a in accounts if a.login}
+
+    if not login_to_license:
+        return {"success": False, "reason": "no_accounts_found", "fixed": 0}
+
+    # Find all orphaned AITradeHistory rows
+    orphans = db.query(AITradeHistory).filter(
+        AITradeHistory.license_id.is_(None),
+        AITradeHistory.mt5_login.isnot(None),
+    ).all()
+
+    fixed = 0
+    no_match = 0
+    for row in orphans:
+        lic_id = login_to_license.get(str(row.mt5_login))
+        if lic_id:
+            row.license_id = lic_id
+            fixed += 1
+        else:
+            no_match += 1
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        return {"success": False, "reason": f"commit_failed_{e}", "fixed": 0}
+
+    return {
+        "success":           True,
+        "orphans_found":     len(orphans),
+        "fixed":             fixed,
+        "no_matching_login": no_match,
+        "accounts_mapped":   len(login_to_license),
+    }
