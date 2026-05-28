@@ -94,7 +94,7 @@ class RiskLevelUpdate(BaseModel):
 # BROKER LIST — no restrictions, any server allowed. Suggestions come from
 # the frontend; backend never enforces a broker list.
 # ============================================================================
-@router.get("/ai/brokers")
+@router.get("/brokers")
 def get_brokers():
     return {
         "success": True,
@@ -163,7 +163,7 @@ def save_mt5_account(data: MT5AccountCreate, db: Session = Depends(get_db)):
 # ============================================================================
 # MT5 STATUS — frontend polls this every 3s
 # ============================================================================
-@router.get("/ai/mt5-status")
+@router.get("/mt5-status")
 def get_mt5_status(license_key: str, db: Session = Depends(get_db)):
     license_row = db.query(License).filter(
         License.license_key == license_key
@@ -205,7 +205,7 @@ def get_mt5_status(license_key: str, db: Session = Depends(get_db)):
 # ============================================================================
 # RISK LEVEL UPDATE — change mode without re-entering MT5 creds
 # ============================================================================
-@router.post("/ai/risk-level")
+@router.post("/risk-level")
 def update_risk_level(data: RiskLevelUpdate, db: Session = Depends(get_db)):
     license_row = db.query(License).filter(
         License.license_key == data.license_key
@@ -235,7 +235,7 @@ def update_risk_level(data: RiskLevelUpdate, db: Session = Depends(get_db)):
 # REFRESH BALANCE — flags account so the Windows worker re-reads balance.
 # (No MT5 here — just sets status so the worker refreshes on its next loop.)
 # ============================================================================
-@router.post("/ai/refresh-balance")
+@router.post("/refresh-balance")
 def refresh_balance(license_key: str, db: Session = Depends(get_db)):
     license_row = db.query(License).filter(
         License.license_key == license_key
@@ -273,7 +273,7 @@ def refresh_balance(license_key: str, db: Session = Depends(get_db)):
 # ============================================================================
 # AI SETTINGS — preserves per-symbol customizations
 # ============================================================================
-@router.post("/ai/settings")
+@router.post("/settings")
 def save_ai_settings(data: AISettingsUpdate, db: Session = Depends(get_db)):
     license_row = db.query(License).filter(
         License.license_key == data.license_key
@@ -325,7 +325,7 @@ def save_ai_settings(data: AISettingsUpdate, db: Session = Depends(get_db)):
     }
 
 
-@router.get("/ai/settings")
+@router.get("/settings")
 def get_ai_settings(license_key: str, db: Session = Depends(get_db)):
     license_row = db.query(License).filter(
         License.license_key == license_key
@@ -362,7 +362,7 @@ def get_ai_settings(license_key: str, db: Session = Depends(get_db)):
 # ============================================================================
 # SYMBOLS (same upsert pattern)
 # ============================================================================
-@router.post("/ai/symbols")
+@router.post("/symbols")
 def save_ai_symbols(data: SaveSymbolsRequest, db: Session = Depends(get_db)):
     license_row = db.query(License).filter(
         License.license_key == data.license_key
@@ -391,7 +391,7 @@ def save_ai_symbols(data: SaveSymbolsRequest, db: Session = Depends(get_db)):
     return {"success": True, "message": "Symbols saved (settings preserved)"}
 
 
-@router.get("/ai/symbols")
+@router.get("/symbols")
 def get_ai_symbols(db: Session = Depends(get_db)):
     markets = db.query(AIMarketState).limit(50).all()
     return {
@@ -420,7 +420,7 @@ import os as _os
 STALE_OPEN_TRADE_HOURS = int(_os.environ.get("STALE_OPEN_TRADE_HOURS", "24"))
 
 
-@router.get("/ai/live-trades")
+@router.get("/live-trades")
 def get_live_trades(license_key: str, db: Session = Depends(get_db)):
     now_utc = datetime.now(timezone.utc)
     cutoff  = now_utc - timedelta(hours=STALE_OPEN_TRADE_HOURS)
@@ -473,7 +473,7 @@ def get_live_trades(license_key: str, db: Session = Depends(get_db)):
 # ============================================================================
 # TRADE HISTORY — only CLOSED trades with real outcomes
 # ============================================================================
-@router.get("/ai/trade-history")
+@router.get("/closed-trades")
 def get_trade_history(license_key: str, db: Session = Depends(get_db)):
     license_row = db.query(License).filter(
         License.license_key == license_key
@@ -507,7 +507,7 @@ def get_trade_history(license_key: str, db: Session = Depends(get_db)):
 # ============================================================================
 # SIGNALS PRO — stats only from CLOSED trades, profit as source of truth
 # ============================================================================
-@router.get("/ai/signals-pro")
+@router.get("/signals-pro")
 def get_signals_pro(license_key: str, db: Session = Depends(get_db)):
     license_row = db.query(License).filter(
         License.license_key == license_key
@@ -542,13 +542,13 @@ def get_signals_pro(license_key: str, db: Session = Depends(get_db)):
 # ============================================================================
 # AI STATUS / MARKET DATA
 # ============================================================================
-@router.get("/ai/status")
+@router.get("/status")
 def ai_status(db: Session = Depends(get_db)):
     pairs = db.query(AISymbol).filter(AISymbol.enabled == True).count()
     return {"ai_active": True, "pairs_tracked": pairs}
 
 
-@router.get("/ai/market-data")
+@router.get("/market-data")
 def get_market_data(symbol: str, db: Session = Depends(get_db)):
     market = db.query(AIMarketState).filter(
         AIMarketState.symbol == symbol.upper()
