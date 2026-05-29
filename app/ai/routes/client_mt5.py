@@ -568,6 +568,12 @@ def get_trade_history(license_key: str, db: Session = Depends(get_db)):
     if not license_row:
         return {"total_trades": 0, "trades": []}
 
+    # Show ALL AI-executed closed trades for this license. The data is kept
+    # clean by (a) the corrected write_trade_outcome (close-deals-only +
+    # sanity cap) so values match MT5, and (b) the /reset-history endpoint
+    # the operator calls at launch to clear any legacy/buggy rows. We do NOT
+    # filter by last_verified_at — that timestamp moves on every reconnect
+    # and would make a user's history vanish after reconnecting.
     trades = db.query(AITradeHistory).filter(
         AITradeHistory.license_id == license_row.id,
         AITradeHistory.status == "CLOSED",
@@ -592,7 +598,7 @@ def get_trade_history(license_key: str, db: Session = Depends(get_db)):
 
 
 # ============================================================================
-# SIGNALS PRO — stats only from CLOSED trades, profit as source of truth
+# SIGNALS PRO — stats from all AI-executed trades for this license
 # ============================================================================
 @router.get("/signals-pro")
 def get_signals_pro(license_key: str, db: Session = Depends(get_db)):
@@ -602,6 +608,7 @@ def get_signals_pro(license_key: str, db: Session = Depends(get_db)):
     if not license_row:
         raise HTTPException(status_code=404, detail="License not found")
 
+    # Same scope as /closed-trades — all CLOSED AI trades for this license.
     trades = db.query(AITradeHistory).filter(
         AITradeHistory.license_id == license_row.id,
         AITradeHistory.status == "CLOSED",
@@ -629,6 +636,37 @@ def get_signals_pro(license_key: str, db: Session = Depends(get_db)):
 # ============================================================================
 # AI STATUS / MARKET DATA
 # ============================================================================
+@router.post("/reset-history")
+def reset_trade_history(license_key: str, db: Session = Depends(get_db)):
+    """
+    PRODUCTION CLEAN SLATE.
+
+    Deletes ALL AITradeHistory rows for this license. Use this once at
+    launch (or whenever you want a fresh start) to clear out trades recorded
+    by older, buggy worker versions whose profit values don't match MT5.
+
+    After this, only NEW trades the execution worker records — using the
+    corrected close-deal-only + sanity-capped profit logic — will appear in
+    Trade History and Signals Pro, so the numbers match MT5.
+    """
+    license_row = db.query(License).filter(
+        License.license_key == license_key
+    ).first()
+    if not license_row:
+        raise HTTPException(status_code=404, detail="License not found")
+
+    deleted = db.query(AITradeHistory).filter(
+        AITradeHistory.license_id == license_row.id
+    ).delete(synchronize_session=False)
+    db.commit()
+
+    return {
+        "success": True,
+        "deleted": int(deleted or 0),
+        "message": "Trade history cleared. Only new AI trades will show from now on.",
+    }
+
+
 @router.get("/status")
 def ai_status(db: Session = Depends(get_db)):
     pairs = db.query(AISymbol).filter(AISymbol.enabled == True).count()

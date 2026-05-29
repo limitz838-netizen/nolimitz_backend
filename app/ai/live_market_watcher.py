@@ -75,6 +75,12 @@ class Config:
     HTF_CANDLES     = int(os.environ.get("HTF_CANDLES", "150"))
     MIN_CANDLES_REQUIRED = int(os.environ.get("MIN_CANDLES_REQUIRED", "40"))
 
+    # News pause: DISABLED by default. The execution worker's brain now
+    # checks ATR volatility and momentum before every entry, so it already
+    # refuses to trade into news-driven chaos. The old fixed-schedule pause
+    # blocked ~3 hours/day even with no real news. Set NEWS_PAUSE_ENABLED=1
+    # to turn it back on if you ever want the hard time-based block.
+    NEWS_PAUSE_ENABLED = os.environ.get("NEWS_PAUSE_ENABLED", "0") == "1"
     NEWS_PAUSE_MINS = int(os.environ.get("NEWS_PAUSE_MINS", "15"))
     HIGH_IMPACT_NEWS = [
         (8,30),(9,0),(13,30),(14,0),(15,0),(15,30),(16,0),(19,0),(20,0),(21,30),
@@ -193,6 +199,11 @@ def get_session() -> Tuple[str, float]:
 
 
 def is_high_impact_news() -> bool:
+    # Disabled by default — the execution worker's brain handles volatility
+    # filtering (ATR sanity + momentum) on a per-trade basis, which is far
+    # more accurate than a fixed daily schedule.
+    if not cfg.NEWS_PAUSE_ENABLED:
+        return False
     now = datetime.now(timezone.utc)
     for h, m in cfg.HIGH_IMPACT_NEWS:
         news_dt = datetime(now.year, now.month, now.day, h, m, tzinfo=timezone.utc)
