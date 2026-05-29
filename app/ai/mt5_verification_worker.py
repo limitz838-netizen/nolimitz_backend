@@ -264,7 +264,6 @@ def verify_one_account(account: ClientMT5Account, db: Session) -> bool:
         was_first_verify = not account.is_verified
         account.is_verified         = True
         account.verification_status = "VERIFIED"
-        account.is_active           = True
         account.account_name        = str(info.name or "")
         account.broker_name         = str(info.company or "")
         account.balance             = float(info.balance or 0)

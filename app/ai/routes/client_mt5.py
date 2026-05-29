@@ -232,6 +232,93 @@ def update_risk_level(data: RiskLevelUpdate, db: Session = Depends(get_db)):
 
 
 # ============================================================================
+# START / STOP AI — toggle auto-trading on the user's account
+# ----------------------------------------------------------------------------
+# Stop AI sets ai_auto_trade=False so the execution worker stops opening NEW
+# trades for this user. Existing open positions continue being managed (BE
+# lock, partials, trailing) until they close naturally — same way a pro
+# trader would close out positions cleanly. Use /stop-ai-now if a user wants
+# everything force-closed (not implemented here — needs MT5 access).
+# ============================================================================
+class AIToggle(BaseModel):
+    license_key: str
+
+
+@router.post("/start-ai")
+def start_ai(data: AIToggle, db: Session = Depends(get_db)):
+    license_row = db.query(License).filter(
+        License.license_key == data.license_key
+    ).first()
+    if not license_row:
+        raise HTTPException(status_code=400, detail="Invalid license key")
+
+    account = db.query(ClientMT5Account).filter(
+        ClientMT5Account.license_id == license_row.id
+    ).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="No MT5 account connected")
+    if not account.is_verified:
+        raise HTTPException(status_code=400, detail="MT5 account not verified")
+
+    account.ai_auto_trade = True
+    db.commit()
+    logger.info("▶️ AI STARTED: login=%s", account.login)
+    return {
+        "success": True,
+        "ai_auto_trade": True,
+        "message": "AI auto-trading started",
+    }
+
+
+@router.post("/stop-ai")
+def stop_ai(data: AIToggle, db: Session = Depends(get_db)):
+    license_row = db.query(License).filter(
+        License.license_key == data.license_key
+    ).first()
+    if not license_row:
+        raise HTTPException(status_code=400, detail="Invalid license key")
+
+    account = db.query(ClientMT5Account).filter(
+        ClientMT5Account.license_id == license_row.id
+    ).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="No MT5 account connected")
+
+    account.ai_auto_trade = False
+    db.commit()
+    logger.info("⏹️ AI STOPPED: login=%s (open positions will continue being managed until they close)",
+               account.login)
+    return {
+        "success": True,
+        "ai_auto_trade": False,
+        "message": "AI stopped. No new trades will open. Existing positions continue being managed until close.",
+    }
+
+
+@router.get("/ai-state")
+def get_ai_state(license_key: str, db: Session = Depends(get_db)):
+    """Quick check whether AI is currently running for this user."""
+    license_row = db.query(License).filter(
+        License.license_key == license_key
+    ).first()
+    if not license_row:
+        return {"ai_auto_trade": False, "connected": False}
+
+    account = db.query(ClientMT5Account).filter(
+        ClientMT5Account.license_id == license_row.id
+    ).first()
+    if not account:
+        return {"ai_auto_trade": False, "connected": False}
+
+    return {
+        "connected":     True,
+        "ai_auto_trade": bool(account.ai_auto_trade),
+        "verified":      bool(account.is_verified),
+        "status":        account.verification_status or "PENDING",
+    }
+
+
+# ============================================================================
 # REFRESH BALANCE — flags account so the Windows worker re-reads balance.
 # (No MT5 here — just sets status so the worker refreshes on its next loop.)
 # ============================================================================
@@ -572,163 +659,4 @@ def get_market_data(symbol: str, db: Session = Depends(get_db)):
         "stop_loss":   float(market.stop_loss or 0) if market.stop_loss else None,
         "take_profit": float(market.take_profit or 0) if market.take_profit else None,
         "updated_at":  market.updated_at.isoformat() if market.updated_at else None,
-    }
-
-
-# ============================================================================
-# DIAGNOSE — temporary endpoint to figure out why live-trades is empty
-# ----------------------------------------------------------------------------
-# Open in browser:
-#   https://nolimitz-backend-yfne.onrender.com/api/client/diagnose-live-trades
-#       ?license_key=NL-U42YHV54J5
-#
-# It returns a JSON report explaining exactly what the DB contains, so we
-# can pinpoint why /live-trades returns []. REMOVE THIS ENDPOINT after the
-# investigation — it doesn't require auth and exposes internal state.
-# ============================================================================
-@router.get("/diagnose-live-trades")
-def diagnose_live_trades(license_key: str, db: Session = Depends(get_db)):
-    report = {"license_key_input": license_key}
-
-    # 1) Does the license exist?
-    lic = db.query(License).filter(License.license_key == license_key).first()
-    report["license_found"] = bool(lic)
-    if not lic:
-        report["hint"] = "License key not found at all. Check spelling."
-        return report
-    report["license_id"] = lic.id
-    report["license_key_in_db"] = lic.license_key
-
-    # 2) MT5 account info
-    acct = db.query(ClientMT5Account).filter(
-        ClientMT5Account.license_id == lic.id
-    ).first()
-    if acct:
-        report["mt5_account"] = {
-            "login":        acct.login,
-            "verified":     bool(acct.is_verified),
-            "status":       acct.verification_status,
-            "ai_auto_trade": bool(acct.ai_auto_trade),
-            "risk_level":   acct.risk_level,
-            "balance":      float(acct.balance or 0),
-        }
-    else:
-        report["mt5_account"] = None
-
-    # 3) Count LiveTrade rows by status FOR THIS license_key (exact match)
-    from sqlalchemy import func
-    by_status = (
-        db.query(LiveTrade.status, func.count(LiveTrade.id))
-        .filter(LiveTrade.license_key == license_key)
-        .group_by(LiveTrade.status)
-        .all()
-    )
-    report["live_trades_by_status_for_license_key"] = {s: n for s, n in by_status}
-
-    # 4) Same count but search by mt5_login (catches mismatch case)
-    if acct:
-        by_login = (
-            db.query(LiveTrade.status, func.count(LiveTrade.id))
-            .filter(LiveTrade.mt5_login == str(acct.login))
-            .group_by(LiveTrade.status)
-            .all()
-        )
-        report["live_trades_by_status_for_mt5_login"] = {s: n for s, n in by_login}
-
-    # 5) Recent rows (last 6 hours) regardless of license — see what worker writes
-    six_hours_ago = datetime.now(timezone.utc) - timedelta(hours=6)
-    recent = db.query(LiveTrade).filter(
-        LiveTrade.opened_at > six_hours_ago
-    ).order_by(LiveTrade.id.desc()).limit(15).all()
-    report["recent_live_trades_any_license"] = [
-        {
-            "id":          t.id,
-            "license_key": t.license_key,
-            "mt5_login":   t.mt5_login,
-            "symbol":      t.symbol,
-            "status":      t.status,
-            "ticket":      t.mt5_ticket,
-            "lot":         float(t.lot_size or 0),
-            "opened_at":   t.opened_at.isoformat() if t.opened_at else None,
-        }
-        for t in recent
-    ]
-
-    # 6) The actual filter used by GET /live-trades, replayed
-    open_for_key = db.query(LiveTrade).filter(
-        LiveTrade.license_key == license_key,
-        LiveTrade.status == "OPEN",
-    ).all()
-    report["matches_live_trades_endpoint_filter"] = len(open_for_key)
-
-    # 7) Verdict — narrow the cause
-    n_by_key   = sum(report["live_trades_by_status_for_license_key"].values())
-    n_by_login = sum(
-        report.get("live_trades_by_status_for_mt5_login", {}).values()
-    )
-    if n_by_key == 0 and n_by_login == 0:
-        report["verdict"] = "NO_ROWS_AT_ALL — the worker never wrote LiveTrade rows. Check the worker is running and writing to the same DB."
-    elif n_by_key == 0 and n_by_login > 0:
-        report["verdict"] = "LICENSE_KEY_MISMATCH — rows exist under mt5_login but with a different/null license_key. Worker writes broken license_key."
-    elif report["live_trades_by_status_for_license_key"].get("OPEN", 0) == 0:
-        report["verdict"] = "ALL_CLOSED — rows exist but none are OPEN. Either auto-cleanup ran, or worker closed them in DB."
-    else:
-        report["verdict"] = "OK — rows exist and should be returned. If endpoint still gives [], cache or wrong frontend URL."
-
-    return report
-
-
-# ============================================================================
-# BACKFILL — one-shot migration to fix orphaned AITradeHistory rows
-# ----------------------------------------------------------------------------
-# Old worker wrote AITradeHistory with license_id=NULL because it tried to
-# read signal.license_id (which doesn't exist). Worker is now fixed, but the
-# existing orphaned rows are invisible to /trade-history and /signals-pro.
-#
-# This endpoint joins AITradeHistory → ClientMT5Account (via mt5_login) →
-# License and backfills the license_id. Idempotent — safe to call multiple
-# times. REMOVE AFTER RUNNING.
-#
-# Open in browser:
-#   https://nolimitz-backend-yfne.onrender.com/api/client/backfill-history
-# ============================================================================
-@router.get("/backfill-history")
-def backfill_history(db: Session = Depends(get_db)):
-    # Build map: mt5_login → license_id, from ClientMT5Account
-    accounts = db.query(ClientMT5Account).filter(
-        ClientMT5Account.license_id.isnot(None)
-    ).all()
-    login_to_license = {str(a.login): a.license_id for a in accounts if a.login}
-
-    if not login_to_license:
-        return {"success": False, "reason": "no_accounts_found", "fixed": 0}
-
-    # Find all orphaned AITradeHistory rows
-    orphans = db.query(AITradeHistory).filter(
-        AITradeHistory.license_id.is_(None),
-        AITradeHistory.mt5_login.isnot(None),
-    ).all()
-
-    fixed = 0
-    no_match = 0
-    for row in orphans:
-        lic_id = login_to_license.get(str(row.mt5_login))
-        if lic_id:
-            row.license_id = lic_id
-            fixed += 1
-        else:
-            no_match += 1
-
-    try:
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        return {"success": False, "reason": f"commit_failed_{e}", "fixed": 0}
-
-    return {
-        "success":           True,
-        "orphans_found":     len(orphans),
-        "fixed":             fixed,
-        "no_matching_login": no_match,
-        "accounts_mapped":   len(login_to_license),
     }
