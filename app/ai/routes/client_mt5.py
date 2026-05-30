@@ -29,7 +29,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
@@ -676,21 +676,70 @@ def get_signals_pro(license_key: str, db: Session = Depends(get_db)):
 # ============================================================================
 # AI STATUS / MARKET DATA
 # ============================================================================
-@router.post("/reset-history")
-def reset_trade_history(license_key: str, db: Session = Depends(get_db)):
+@router.get("/history-debug")
+def history_debug(license_key: str, db: Session = Depends(get_db)):
     """
-    PRODUCTION CLEAN SLATE.
-
-    Deletes ALL AITradeHistory rows for this license. Use this once at
-    launch (or whenever you want a fresh start) to clear out trades recorded
-    by older, buggy worker versions whose profit values don't match MT5.
-
-    After this, only NEW trades the execution worker records — using the
-    corrected close-deal-only + sanity-capped profit logic — will appear in
-    Trade History and Signals Pro, so the numbers match MT5.
+    Diagnostic: shows exactly what is stored for this license so you can
+    confirm whether old/garbage rows still exist and whether they're scoped
+    to the right license_id. Safe, read-only.
     """
     license_row = db.query(License).filter(
         License.license_key == license_key
+    ).first()
+    if not license_row:
+        return {"found": False, "reason": "license_not_found", "license_key": license_key}
+
+    rows = db.query(AITradeHistory).filter(
+        AITradeHistory.license_id == license_row.id
+    ).order_by(AITradeHistory.id.desc()).limit(20).all()
+
+    total = db.query(AITradeHistory).filter(
+        AITradeHistory.license_id == license_row.id
+    ).count()
+    # Also count any orphan rows (no license_id) that could leak via bad joins
+    orphans = db.query(AITradeHistory).filter(
+        AITradeHistory.license_id.is_(None)
+    ).count()
+
+    return {
+        "found": True,
+        "license_id": license_row.id,
+        "total_rows_for_this_license": total,
+        "orphan_rows_null_license": orphans,
+        "sample_recent": [
+            {
+                "id": t.id, "symbol": t.symbol, "signal": t.signal,
+                "profit": float(t.profit or 0), "result": t.result,
+                "status": t.status,
+                "closed_at": t.closed_at.isoformat() if t.closed_at else None,
+            }
+            for t in rows
+        ],
+    }
+
+
+@router.post("/reset-history")
+def reset_trade_history(license_key: str = None, body: dict = Body(default=None),
+                        db: Session = Depends(get_db)):
+    """
+    PRODUCTION CLEAN SLATE.
+
+    Deletes ALL AITradeHistory rows for this license. Accepts the license key
+    either as a query param (?license_key=...) OR in the JSON body
+    ({"license_key": "..."}) so it works no matter how the client sends it.
+
+    Use this once at launch (or whenever you want a fresh start) to clear out
+    trades recorded by older, buggy worker versions whose profit values don't
+    match MT5. After this, only NEW trades the execution worker records — using
+    the corrected close-deal-only + sanity-capped profit logic — will appear,
+    so Trade History and Signals Pro match MT5.
+    """
+    key = license_key or (body or {}).get("license_key")
+    if not key:
+        raise HTTPException(status_code=422, detail="license_key required (query or body)")
+
+    license_row = db.query(License).filter(
+        License.license_key == key
     ).first()
     if not license_row:
         raise HTTPException(status_code=404, detail="License not found")
