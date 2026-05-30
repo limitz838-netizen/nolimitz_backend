@@ -91,6 +91,49 @@ class RiskLevelUpdate(BaseModel):
 
 
 # ============================================================================
+# DISPLAY-ONLY MODE TABLES
+# These MIRROR the execution worker's MODE_LOTS / RISK_MODE so the dashboard
+# can show the EFFECTIVE lot size and trade count the worker will actually
+# use for each symbol under the selected mode. The worker remains the source
+# of truth for execution; these are only for display. Keep them in sync with
+# execution_worker.py cfg.MODE_LOTS / RISK_MODE.
+# ============================================================================
+_DISPLAY_MODE_LOTS = {
+    "normal":     {"GOLD": 0.01, "BTC": 0.10, "ETH": 0.10, "INDEX": 0.05,
+                   "OIL": 0.05, "FOREX": 0.05, "JPY": 0.05, "OTHER": 0.02},
+    "medium":     {"GOLD": 0.02, "BTC": 0.20, "ETH": 0.20, "INDEX": 0.10,
+                   "OIL": 0.10, "FOREX": 0.10, "JPY": 0.10, "OTHER": 0.05},
+    "aggressive": {"GOLD": 0.05, "BTC": 0.50, "ETH": 0.50, "INDEX": 0.25,
+                   "OIL": 0.25, "FOREX": 0.20, "JPY": 0.20, "OTHER": 0.10},
+}
+_DISPLAY_MODE_MAX_TRADES = {"normal": 2, "medium": 3, "aggressive": 4}
+
+
+def _display_classify(symbol: str) -> str:
+    s = (symbol or "").upper()
+    if "XAU" in s or "GOLD" in s:           return "GOLD"
+    if "BTC" in s:                          return "BTC"
+    if "ETH" in s:                          return "ETH"
+    if "OIL" in s or "WTI" in s or "USOIL" in s: return "OIL"
+    if any(x in s for x in ("US30", "NAS", "SPX", "GER", "UK100", "JP225")): return "INDEX"
+    if "JPY" in s:                          return "JPY"
+    if len(s) == 6 and s.isalpha():         return "FOREX"
+    return "OTHER"
+
+
+def _effective_lot_and_trades(symbol: str, risk_level: str):
+    """Return (lot_size, max_open_trades) the worker will actually use for
+    this symbol under the given mode — matching the worker's mode_first logic."""
+    mode = (risk_level or "medium").lower()
+    if mode not in _DISPLAY_MODE_LOTS:
+        mode = "medium"
+    cls = _display_classify(symbol)
+    lot = _DISPLAY_MODE_LOTS[mode].get(cls, _DISPLAY_MODE_LOTS[mode]["OTHER"])
+    trades = _DISPLAY_MODE_MAX_TRADES.get(mode, 3)
+    return lot, trades
+
+
+# ============================================================================
 # BROKER LIST — no restrictions, any server allowed. Suggestions come from
 # the frontend; backend never enforces a broker list.
 # ============================================================================
@@ -431,18 +474,25 @@ def get_ai_settings(license_key: str, db: Session = Depends(get_db)):
     ).first()
     risk_level = (account.risk_level if account and account.risk_level else "medium")
 
+    # Return the EFFECTIVE lot_size / max_open_trades the worker will actually
+    # use for each symbol under the current mode — NOT the raw stored defaults
+    # (which are 0.01 / 1 from the frontend and get overridden by mode_first
+    # in the worker). This makes the dashboard show the truth: e.g. medium BTC
+    # = 0.20 lot / 3 trades, medium XAU = 0.02 lot / 3 trades.
+    out_symbols = []
+    for s in settings:
+        eff_lot, eff_trades = _effective_lot_and_trades(s.symbol_name, risk_level)
+        out_symbols.append({
+            "symbol":          s.symbol_name,
+            "lot_size":        eff_lot,
+            "max_open_trades": eff_trades,
+            "trade_direction": s.trade_direction or "both",
+        })
+
     return {
         "success": True,
         "risk_level": risk_level,
-        "symbols": [
-            {
-                "symbol":          s.symbol_name,
-                "lot_size":        float(s.lot_size) if s.lot_size else None,
-                "max_open_trades": int(s.max_open_trades) if s.max_open_trades else None,
-                "trade_direction": s.trade_direction or "both",
-            }
-            for s in settings
-        ],
+        "symbols": out_symbols,
     }
 
 
