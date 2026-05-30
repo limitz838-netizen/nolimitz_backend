@@ -531,42 +531,15 @@ def save_ai_symbols(data: SaveSymbolsRequest, db: Session = Depends(get_db)):
 @router.get("/symbols")
 def get_ai_symbols(license_key: str = None, db: Session = Depends(get_db)):
     """
-    Two modes:
-      • With license_key → returns the USER'S configured symbols
-        (ClientSymbolSetting), so the settings panel shows exactly what
-        they enabled. This is what the execution worker actually reads.
-      • Without license_key → returns the scannable market catalog
-        (AIMarketState), used by the public Scanner to know which pairs
-        to display.
-    """
-    if license_key:
-        license_row = db.query(License).filter(
-            License.license_key == license_key
-        ).first()
-        if not license_row:
-            return {"success": True, "symbols": []}
-        rows = db.query(ClientSymbolSetting).filter(
-            ClientSymbolSetting.license_id == license_row.id
-        ).all()
-        # Always expose the priority pairs the engine is tuned for, even if
-        # the user hasn't added them yet, so the UI can offer them to enable.
-        configured = {r.symbol_name.upper(): r for r in rows}
-        offer = ["XAUUSD", "BTCUSD", "EURUSD", "GBPUSD", "USDJPY", "ETHUSD"]
-        out = []
-        seen = set()
-        for r in rows:
-            out.append({
-                "symbol":    r.symbol_name.upper(),
-                "enabled":   bool(r.enabled),
-                "direction": (r.trade_direction or "both").upper(),
-            })
-            seen.add(r.symbol_name.upper())
-        for sym in offer:
-            if sym not in seen:
-                out.append({"symbol": sym, "enabled": False, "direction": "BOTH"})
-        return {"success": True, "symbols": out}
+    SCANNER FEED — always returns the full scanned market catalog
+    (AIMarketState) so the scanner shows ALL symbols the watcher is tracking,
+    for everyone, with or without a license key.
 
-    # No license → scannable market catalog for the public scanner
+    NOTE: license_key is accepted for backwards-compatibility but intentionally
+    IGNORED here — the scanner is a free, show-everything feed. The settings
+    panel gets the user's OWN enabled symbols from GET /settings, not from this
+    endpoint, so this endpoint never needs to be license-scoped.
+    """
     markets = db.query(AIMarketState).limit(50).all()
     return {
         "success": True,
@@ -812,6 +785,119 @@ def ai_status(db: Session = Depends(get_db)):
     return {"ai_active": True, "pairs_tracked": pairs}
 
 
+# ============================================================================
+# SYMBOL CATALOG — categorized universe for the scanner / symbol picker.
+# The frontend groups symbols by category and flags "recommended" ones.
+# A symbol only produces live scanner cards + signals once it is enabled in
+# the AISymbol table (which the watcher scans). The "live" flag below tells
+# the UI which catalog entries are currently being scanned, so it can show
+# the rest as "available — ask admin to enable" without breaking.
+# ============================================================================
+_SYMBOL_CATALOG = {
+    "metals": {
+        "label": "Metals",
+        "symbols": [
+            {"symbol": "XAUUSD", "name": "Gold",        "recommended": True},
+            {"symbol": "XAGUSD", "name": "Silver",      "recommended": False},
+            {"symbol": "XPTUSD", "name": "Platinum",    "recommended": False},
+        ],
+    },
+    "crypto": {
+        "label": "Crypto",
+        "symbols": [
+            {"symbol": "BTCUSD", "name": "Bitcoin",     "recommended": True},
+            {"symbol": "ETHUSD", "name": "Ethereum",    "recommended": False},
+            {"symbol": "XRPUSD", "name": "Ripple",      "recommended": False},
+            {"symbol": "SOLUSD", "name": "Solana",      "recommended": False},
+            {"symbol": "LTCUSD", "name": "Litecoin",    "recommended": False},
+        ],
+    },
+    "forex": {
+        "label": "Forex",
+        "symbols": [
+            {"symbol": "EURUSD", "name": "Euro / USD",       "recommended": True},
+            {"symbol": "GBPUSD", "name": "Pound / USD",      "recommended": False},
+            {"symbol": "USDJPY", "name": "USD / Yen",        "recommended": False},
+            {"symbol": "AUDUSD", "name": "Aussie / USD",     "recommended": False},
+            {"symbol": "USDCAD", "name": "USD / Loonie",     "recommended": False},
+            {"symbol": "USDCHF", "name": "USD / Franc",      "recommended": False},
+            {"symbol": "NZDUSD", "name": "Kiwi / USD",       "recommended": False},
+            {"symbol": "EURJPY", "name": "Euro / Yen",       "recommended": False},
+            {"symbol": "GBPJPY", "name": "Pound / Yen",      "recommended": False},
+        ],
+    },
+    "indices": {
+        "label": "Indices",
+        "symbols": [
+            {"symbol": "US30",   "name": "Dow Jones",   "recommended": False},
+            {"symbol": "NAS100", "name": "Nasdaq 100",  "recommended": False},
+            {"symbol": "SPX500", "name": "S&P 500",     "recommended": False},
+            {"symbol": "GER40",  "name": "DAX 40",      "recommended": False},
+        ],
+    },
+    "synthetic": {
+        "label": "Synthetic",
+        "symbols": [
+            {"symbol": "V75",  "name": "Volatility 75 Index",  "recommended": False},
+            {"symbol": "V100", "name": "Volatility 100 Index", "recommended": False},
+            {"symbol": "BOOM1000", "name": "Boom 1000",        "recommended": False},
+            {"symbol": "CRASH1000", "name": "Crash 1000",      "recommended": False},
+        ],
+    },
+}
+
+
+@router.get("/symbol-catalog")
+def symbol_catalog(license_key: str = None, db: Session = Depends(get_db)):
+    """
+    Categorized symbol universe for the scanner / picker.
+
+    Returns categories (Metals, Crypto, Forex, Indices, Synthetic), each with
+    its symbols, a display name, a `recommended` flag (Gold + Bitcoin + EURUSD),
+    a `live` flag (currently scanned by the watcher), and — when a license_key
+    is supplied — an `enabled` flag showing which symbols this user has turned
+    on for trading.
+    """
+    # Which symbols the watcher is actively scanning right now
+    live_syms = {
+        r.symbol.upper()
+        for r in db.query(AISymbol).filter(AISymbol.enabled == True).all()
+    }
+
+    # Which symbols THIS user has enabled for trading
+    user_enabled = set()
+    if license_key:
+        lic = db.query(License).filter(License.license_key == license_key).first()
+        if lic:
+            user_enabled = {
+                s.symbol_name.upper()
+                for s in db.query(ClientSymbolSetting).filter(
+                    ClientSymbolSetting.license_id == lic.id,
+                    ClientSymbolSetting.enabled == True,
+                ).all()
+            }
+
+    categories = []
+    for key, cat in _SYMBOL_CATALOG.items():
+        syms = []
+        for s in cat["symbols"]:
+            up = s["symbol"].upper()
+            syms.append({
+                "symbol":      s["symbol"],
+                "name":        s["name"],
+                "recommended": s["recommended"],
+                "live":        up in live_syms,
+                "enabled":     up in user_enabled,
+            })
+        categories.append({
+            "key":     key,
+            "label":   cat["label"],
+            "symbols": syms,
+        })
+
+    return {"success": True, "categories": categories}
+
+
 @router.get("/market-data")
 def get_market_data(symbol: str, db: Session = Depends(get_db)):
     market = db.query(AIMarketState).filter(
@@ -836,4 +922,69 @@ def get_market_data(symbol: str, db: Session = Depends(get_db)):
         "stop_loss":   float(market.stop_loss or 0) if market.stop_loss else None,
         "take_profit": float(market.take_profit or 0) if market.take_profit else None,
         "updated_at":  market.updated_at.isoformat() if market.updated_at else None,
+    }
+
+
+# ============================================================================
+# FREE SCANNER — public, no license required.
+# Returns every currently-scanned symbol's latest signal in ONE call, grouped
+# by category, so free (non-paying) users can browse all live signals without
+# connecting MT5 or owning a license. Trading still requires a license, but
+# VIEWING signals is free. This is the upsell surface: show the signals, then
+# prompt "connect MT5 to auto-trade these".
+# ============================================================================
+def _catalog_lookup():
+    """symbol(upper) → (category_label, display_name, recommended)"""
+    out = {}
+    for key, cat in _SYMBOL_CATALOG.items():
+        for s in cat["symbols"]:
+            out[s["symbol"].upper()] = (cat["label"], s["name"], s["recommended"])
+    return out
+
+
+@router.get("/scanner")
+def free_scanner(db: Session = Depends(get_db)):
+    """
+    Public scanner feed — no license_key needed. Lists the latest signal for
+    every symbol the watcher is currently scanning, grouped by category.
+    """
+    lookup = _catalog_lookup()
+
+    # All symbols the watcher is actively scanning
+    live_syms = [
+        r.symbol for r in db.query(AISymbol).filter(AISymbol.enabled == True).all()
+    ]
+
+    cards = []
+    for sym in live_syms:
+        up = sym.upper()
+        market = db.query(AIMarketState).filter(
+            AIMarketState.symbol == up
+        ).order_by(AIMarketState.updated_at.desc()).first()
+        if not market:
+            continue
+        label, name, recommended = lookup.get(up, ("Other", up, False))
+        cards.append({
+            "symbol":      market.symbol,
+            "name":        name,
+            "category":    label,
+            "recommended": recommended,
+            "direction":   market.trend,
+            "signal":      market.signal,
+            "entry_price": float(market.entry or 0),
+            "strength":    int(market.confidence or 0),
+            "analysis":    market.analysis,
+            "stop_loss":   float(market.stop_loss or 0) if market.stop_loss else None,
+            "take_profit": float(market.take_profit or 0) if market.take_profit else None,
+            "updated_at":  market.updated_at.isoformat() if market.updated_at else None,
+        })
+
+    # Sort: recommended first, then by confidence desc
+    cards.sort(key=lambda c: (not c["recommended"], -c["strength"]))
+
+    return {
+        "success": True,
+        "count": len(cards),
+        "free": True,
+        "signals": cards,
     }
