@@ -479,7 +479,44 @@ def save_ai_symbols(data: SaveSymbolsRequest, db: Session = Depends(get_db)):
 
 
 @router.get("/symbols")
-def get_ai_symbols(db: Session = Depends(get_db)):
+def get_ai_symbols(license_key: str = None, db: Session = Depends(get_db)):
+    """
+    Two modes:
+      • With license_key → returns the USER'S configured symbols
+        (ClientSymbolSetting), so the settings panel shows exactly what
+        they enabled. This is what the execution worker actually reads.
+      • Without license_key → returns the scannable market catalog
+        (AIMarketState), used by the public Scanner to know which pairs
+        to display.
+    """
+    if license_key:
+        license_row = db.query(License).filter(
+            License.license_key == license_key
+        ).first()
+        if not license_row:
+            return {"success": True, "symbols": []}
+        rows = db.query(ClientSymbolSetting).filter(
+            ClientSymbolSetting.license_id == license_row.id
+        ).all()
+        # Always expose the priority pairs the engine is tuned for, even if
+        # the user hasn't added them yet, so the UI can offer them to enable.
+        configured = {r.symbol_name.upper(): r for r in rows}
+        offer = ["XAUUSD", "BTCUSD", "EURUSD", "GBPUSD", "USDJPY", "ETHUSD"]
+        out = []
+        seen = set()
+        for r in rows:
+            out.append({
+                "symbol":    r.symbol_name.upper(),
+                "enabled":   bool(r.enabled),
+                "direction": (r.trade_direction or "both").upper(),
+            })
+            seen.add(r.symbol_name.upper())
+        for sym in offer:
+            if sym not in seen:
+                out.append({"symbol": sym, "enabled": False, "direction": "BOTH"})
+        return {"success": True, "symbols": out}
+
+    # No license → scannable market catalog for the public scanner
     markets = db.query(AIMarketState).limit(50).all()
     return {
         "success": True,
@@ -583,14 +620,17 @@ def get_trade_history(license_key: str, db: Session = Depends(get_db)):
         "total_trades": len(trades),
         "trades": [
             {
-                "symbol":     t.symbol,
-                "trade_type": t.signal,
-                "profit":     round(float(t.profit or 0), 2),
-                "result":     t.result,
-                "status":     t.result,
-                "lot_size":   float(t.lot_size or 0),
-                "created_at": t.created_at.isoformat() if t.created_at else None,
-                "closed_at":  t.closed_at.isoformat() if t.closed_at else None,
+                "symbol":      t.symbol,
+                "trade_type":  t.signal,
+                "profit":      round(float(t.profit or 0), 2),
+                "result":      t.result,
+                "status":      t.result,
+                "lot_size":    float(t.lot_size or 0),
+                "entry_price": float(t.entry_price) if t.entry_price else None,
+                "close_price": None,  # not stored; MT5 settles the exit
+                "confidence":  int(t.confidence) if getattr(t, "confidence", None) else None,
+                "created_at":  t.created_at.isoformat() if t.created_at else None,
+                "closed_at":   t.closed_at.isoformat() if t.closed_at else None,
             }
             for t in trades
         ],
