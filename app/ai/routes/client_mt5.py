@@ -28,9 +28,11 @@
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
+import os
 
-from fastapi import APIRouter, Depends, HTTPException, Body
+from fastapi import APIRouter, Depends, HTTPException, Body, Header
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from pydantic import BaseModel
 
 from app.database import get_db
@@ -45,6 +47,26 @@ from app.ai.models.ai_market_state import AIMarketState
 logger = logging.getLogger("client_mt5")
 
 router = APIRouter(prefix="/api/client", tags=["Client MT5 & AI"])
+
+# Admin router — destructive cleanup operations, guarded by a shared token.
+admin_router = APIRouter(prefix="/api/admin", tags=["Admin"])
+
+# Set NOLIMITZ_ADMIN_TOKEN in your environment (Render dashboard → Environment).
+# If unset, admin endpoints are DISABLED (return 503) so they can't be abused
+# with a blank token.
+_ADMIN_TOKEN = os.environ.get("NOLIMITZ_ADMIN_TOKEN", "")
+
+
+def require_admin(x_admin_token: str = Header(default="")):
+    """Guard for destructive admin endpoints. Requires the X-Admin-Token header
+    to match NOLIMITZ_ADMIN_TOKEN. Disabled entirely if the env var is unset."""
+    if not _ADMIN_TOKEN:
+        raise HTTPException(status_code=503,
+                            detail="Admin API disabled (NOLIMITZ_ADMIN_TOKEN not set)")
+    if x_admin_token != _ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid admin token")
+    return True
+
 
 
 # ============================================================================
@@ -990,3 +1012,119 @@ def free_scanner(db: Session = Depends(get_db)):
         "free": True,
         "signals": cards,
     }
+
+# ============================================================================
+# ADMIN — ACCOUNT CLEANUP
+# Destructive maintenance tools, guarded by X-Admin-Token. Use these to keep
+# the worker efficient and the DB clean.
+# ============================================================================
+@admin_router.get("/accounts-overview")
+def accounts_overview(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """
+    Snapshot of all MT5 accounts grouped by state, so you can see what would
+    be cleared before doing it. Read-only.
+    """
+    accounts = db.query(ClientMT5Account).all()
+    failed, inactive, verified, pending, dupes = [], [], [], [], []
+    by_login = {}
+    for a in accounts:
+        status = (a.verification_status or "").upper()
+        row = {
+            "id": a.id, "login": a.login, "server": a.server,
+            "status": status, "is_active": bool(a.is_active),
+            "is_verified": bool(a.is_verified),
+            "error": getattr(a, "verification_error", None),
+            "last_verified_at": a.last_verified_at.isoformat() if a.last_verified_at else None,
+        }
+        if not a.is_active:
+            inactive.append(row)
+        elif status == "FAILED":
+            failed.append(row)
+        elif a.is_verified:
+            verified.append(row)
+        else:
+            pending.append(row)
+        by_login.setdefault(str(a.login), []).append(a.id)
+
+    for login, ids in by_login.items():
+        if len(ids) > 1:
+            dupes.append({"login": login, "ids": ids})
+
+    return {
+        "total": len(accounts),
+        "counts": {
+            "failed": len(failed), "inactive": len(inactive),
+            "verified": len(verified), "pending": len(pending),
+            "duplicate_logins": len(dupes),
+        },
+        "failed": failed,
+        "inactive": inactive,
+        "duplicate_logins": dupes,
+    }
+
+
+@admin_router.post("/clear-failed-accounts")
+def clear_failed_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """
+    Deactivate every account stuck in FAILED so the worker stops processing
+    them. This is a SOFT clear: it sets is_active=False (the worker skips
+    inactive accounts) but keeps the row, so the user can resubmit and
+    reconnect later. Returns how many were cleared.
+    """
+    rows = db.query(ClientMT5Account).filter(
+        ClientMT5Account.verification_status == "FAILED",
+        ClientMT5Account.is_active == True,
+    ).all()
+    n = 0
+    for a in rows:
+        a.is_active = False
+        n += 1
+    db.commit()
+    return {"success": True, "cleared": n,
+            "message": f"Deactivated {n} failed account(s). Worker will stop processing them."}
+
+
+@admin_router.post("/delete-inactive-accounts")
+def delete_inactive_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """
+    Permanently DELETE all accounts that are is_active=False. Use after
+    clear-failed (or for abandoned accounts) to keep the DB clean. This is a
+    HARD delete — the rows are gone. Verified, active accounts are never
+    touched. Returns how many were deleted.
+    """
+    deleted = db.query(ClientMT5Account).filter(
+        ClientMT5Account.is_active == False
+    ).delete(synchronize_session=False)
+    db.commit()
+    return {"success": True, "deleted": int(deleted or 0),
+            "message": f"Deleted {int(deleted or 0)} inactive account(s)."}
+
+
+@admin_router.post("/dedupe-accounts")
+def dedupe_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """
+    Remove duplicate account rows that share the same login, keeping only the
+    most-recently-verified one per login. Prevents the worker from double-
+    trading the same MT5 account.
+    """
+    accounts = db.query(ClientMT5Account).all()
+    by_login = {}
+    for a in accounts:
+        by_login.setdefault(str(a.login), []).append(a)
+
+    removed = 0
+    for login, rows in by_login.items():
+        if len(rows) <= 1:
+            continue
+        # Keep the most-recently-verified (then highest id) row
+        rows.sort(key=lambda r: (
+            r.last_verified_at or __import__("datetime").datetime.min.replace(
+                tzinfo=__import__("datetime").timezone.utc),
+            r.id,
+        ), reverse=True)
+        for extra in rows[1:]:
+            db.delete(extra)
+            removed += 1
+    db.commit()
+    return {"success": True, "removed": removed,
+            "message": f"Removed {removed} duplicate account row(s)."}

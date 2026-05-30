@@ -139,6 +139,39 @@ def should_skip_due_to_backoff(account_login: str) -> bool:
 # ==============================================================================
 # ROBUST CONNECT
 # ==============================================================================
+def _ipc_is_dead() -> bool:
+    """True if the last MT5 error is the -10004 'No IPC connection' pipe loss."""
+    try:
+        err = mt5.last_error()
+        return isinstance(err, tuple) and err and err[0] == -10004
+    except Exception:
+        return False
+
+
+def _rebuild_terminal() -> bool:
+    """
+    Fully tear down and restart the MT5 terminal connection. Needed when the
+    IPC pipe dies (-10004), which happens when rapidly switching between
+    different brokers/servers on a single terminal. A plain login() retry on a
+    dead pipe can NEVER succeed — the pipe itself must be rebuilt first.
+    """
+    try:
+        mt5.shutdown()
+    except Exception:
+        pass
+    time.sleep(1.5)
+    try:
+        ok = mt5.initialize(path=TERMINAL_PATH, timeout=LOGIN_TIMEOUT_MS)
+        if ok:
+            logger.info("🔄 Rebuilt MT5 terminal after IPC loss")
+        else:
+            logger.warning("⚠️ Terminal rebuild failed: %s", mt5.last_error())
+        return ok
+    except Exception as e:
+        logger.warning("⚠️ Terminal rebuild exception: %s", e)
+        return False
+
+
 def _robust_connect(login_int: int, password: str, server: str,
                    attempts: int = 2) -> bool:
     """
@@ -150,9 +183,13 @@ def _robust_connect(login_int: int, password: str, server: str,
       server automatically (better than login() on its own).
     Strategy B — login(login, password, server) on the running terminal.
 
+    If the IPC pipe dies (-10004 No IPC connection — common when switching
+    between different brokers on one terminal), the terminal is fully rebuilt
+    (shutdown + initialize) before retrying, because login() on a dead pipe
+    can never succeed.
+
     Both strategies use a bounded timeout (LOGIN_TIMEOUT_MS) so a bad broker
-    can never hang the worker. Each strategy is retried up to `attempts` times
-    with a short pause, because server resolution can succeed on a second try.
+    can never hang the worker.
 
     Returns True if connected (verified by account_info matching login).
     """
@@ -173,6 +210,10 @@ def _robust_connect(login_int: int, password: str, server: str,
         except Exception as e:
             logger.debug("init-with-creds attempt %d failed: %s", attempt, e)
 
+        # If the IPC pipe is dead, rebuild the terminal before trying login()
+        if _ipc_is_dead():
+            _rebuild_terminal()
+
         # Strategy B: plain login on the running terminal (bounded timeout)
         try:
             if mt5.login(login_int, password=password, server=server,
@@ -182,6 +223,10 @@ def _robust_connect(login_int: int, password: str, server: str,
                     return True
         except Exception as e:
             logger.debug("login attempt %d failed: %s", attempt, e)
+
+        # IPC died during login too → rebuild before the next attempt loop
+        if _ipc_is_dead():
+            _rebuild_terminal()
 
         time.sleep(1.0)  # brief pause before next attempt
 
@@ -354,11 +399,15 @@ def get_accounts_to_process(db: Session) -> List[ClientMT5Account]:
         ),
     ).limit(MAX_ACCOUNTS_PER_LOOP).all()
 
-    # 2. Retry PENDING / FAILED / never-verified (with backoff)
+    # 2. Retry PENDING / never-verified (with backoff).
+    #    FAILED is intentionally EXCLUDED — a FAILED account has a known cause
+    #    (wrong password / bad server) and should NOT be retried automatically
+    #    every cycle (that wastes worker time logging into dead credentials).
+    #    It becomes eligible again only when the user RESUBMITS, which sets the
+    #    status back to VERIFYING (handled as a fresh request above).
     pending = db.query(ClientMT5Account).filter(
         or_(
             ClientMT5Account.verification_status == "PENDING",
-            ClientMT5Account.verification_status == "FAILED",
             ClientMT5Account.verification_status.is_(None),
         ),
         ClientMT5Account.is_verified == False,
