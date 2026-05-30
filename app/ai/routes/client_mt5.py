@@ -172,6 +172,8 @@ def save_mt5_account(data: MT5AccountCreate, db: Session = Depends(get_db)):
         account.is_active  = True
         account.is_verified         = False
         account.verification_status = "VERIFYING"
+        if hasattr(account, "verification_error"):
+            account.verification_error = None  # clear stale error on resubmit
     else:
         account = ClientMT5Account(
             license_id          = license_row.id,

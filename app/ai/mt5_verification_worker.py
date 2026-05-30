@@ -226,18 +226,50 @@ def verify_one_account(account: ClientMT5Account, db: Session) -> bool:
             err = mt5.last_error()
             logger.warning("Login failed %s on %s: %s", login_str, account.server, err)
             _failure_count[login_str] += 1
-            # Distinguish "broker not known to terminal" from "wrong password".
-            # Error -2/-3 == server unreachable/unknown → broker not added.
+            fails = _failure_count[login_str]
             err_code = err[0] if isinstance(err, tuple) and err else 0
+            err_text = (err[1] if isinstance(err, tuple) and len(err) > 1 else "") or ""
+
+            def _set_err(msg):
+                if hasattr(account, "verification_error"):
+                    account.verification_error = msg
+
+            # -2 / -3 == broker server not known to the terminal (bad server name)
             if err_code in (-2, -3):
                 account.verification_status = "FAILED"
-                if hasattr(account, "verification_error"):
-                    account.verification_error = (
-                        f"broker_server_not_supported:{account.server}"
-                    )
-            else:
-                # Keep PENDING for retry (could be transient / wrong creds)
-                account.verification_status = "PENDING"
+                _set_err(f"Server \"{account.server}\" not found. "
+                         f"Check the exact server name in your MT5 app "
+                         f"(it must match exactly, e.g. 'FBS-Demo').")
+                account.is_verified = False
+                db.commit()
+                return False
+
+            # "Invalid account" / authorization failures → wrong login or password.
+            # MT5 commonly returns code 134/10004/10015 or text mentioning auth.
+            low = err_text.lower()
+            looks_like_auth = (
+                err_code in (134, 10004, 10015)
+                or "invalid account" in low
+                or "authoriz" in low
+                or "password" in low
+                or "login" in low
+            )
+            # After 3 failed attempts with an auth-looking error, stop the silent
+            # retry loop and tell the user exactly what to fix. Transient network
+            # errors keep retrying (PENDING) up to the threshold.
+            if looks_like_auth and fails >= 3:
+                account.verification_status = "FAILED"
+                _set_err("Login or password incorrect. Re-enter your MT5 "
+                         "login number and the INVESTOR or MASTER password "
+                         "exactly as shown in your MT5 app.")
+                account.is_verified = False
+                db.commit()
+                return False
+
+            # Otherwise keep PENDING for retry (transient / still settling)
+            account.verification_status = "PENDING"
+            if hasattr(account, "verification_error"):
+                account.verification_error = None  # clear; not a hard failure yet
             account.is_verified = False
             db.commit()
             return False
@@ -347,11 +379,18 @@ def get_accounts_to_process(db: Session) -> List[ClientMT5Account]:
     seen_logins = set()
     queue: List[ClientMT5Account] = []
 
-    # Fresh requests first — never skipped by backoff
+    # Fresh requests first — never skipped by backoff.
+    # CRITICAL: a VERIFYING/REFRESH row means the user JUST submitted (often
+    # after fixing wrong details). Reset this login's failure/backoff counters
+    # so the corrected credentials are tried IMMEDIATELY with a clean slate,
+    # instead of being blocked for up to an hour by the old backoff schedule.
     for acc in fresh_requests:
         if acc.login in seen_logins:
             continue
         seen_logins.add(acc.login)
+        login_str = str(acc.login)
+        _failure_count[login_str] = 0
+        _last_attempt[login_str] = 0.0
         queue.append(acc)
 
     # Then pending/stale, respecting backoff
