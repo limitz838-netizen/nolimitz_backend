@@ -674,7 +674,7 @@ def get_trade_history(license_key: str, db: Session = Depends(get_db)):
                 "status":      t.result,
                 "lot_size":    float(t.lot_size or 0),
                 "entry_price": float(t.entry_price) if t.entry_price else None,
-                "close_price": None,  # not stored; MT5 settles the exit
+                "close_price": float(t.close_price) if getattr(t, "close_price", None) else None,
                 "confidence":  int(t.confidence) if getattr(t, "confidence", None) else None,
                 "created_at":  t.created_at.isoformat() if t.created_at else None,
                 "closed_at":   t.closed_at.isoformat() if t.closed_at else None,
