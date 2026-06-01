@@ -144,7 +144,7 @@ _DISPLAY_MODE_LOTS = {
     "aggressive": {"GOLD": 0.05, "BTC": 0.50, "ETH": 0.50, "INDEX": 0.25,
                    "OIL": 0.25, "FOREX": 0.20, "JPY": 0.20, "OTHER": 0.10},
 }
-_DISPLAY_MODE_MAX_TRADES = {"normal": 2, "medium": 3, "aggressive": 4}
+_DISPLAY_MODE_MAX_TRADES = {"normal": 1, "medium": 3, "aggressive": 5}
 
 
 def _display_classify(symbol: str) -> str:
@@ -547,6 +547,7 @@ def get_ai_settings(license_key: str, db: Session = Depends(get_db)):
     # (exactly as they typed it) and 1 trade per symbol (the safe operational
     # limit). If a symbol has no lot set yet, fall back to the mode lot so the
     # field isn't blank, but the user's typed value always wins.
+    mode_trades = _DISPLAY_MODE_MAX_TRADES.get((risk_level or "medium").lower(), 3)
     out_symbols = []
     for s in settings:
         try:
@@ -560,7 +561,7 @@ def get_ai_settings(license_key: str, db: Session = Depends(get_db)):
         out_symbols.append({
             "symbol":          s.symbol_name,
             "lot_size":        eff_lot,
-            "max_open_trades": 1,
+            "max_open_trades": mode_trades,
             "trade_direction": s.trade_direction or "both",
         })
 
