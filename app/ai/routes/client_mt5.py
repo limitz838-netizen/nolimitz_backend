@@ -48,6 +48,12 @@ logger = logging.getLogger("client_mt5")
 
 router = APIRouter(prefix="/api/client", tags=["Client MT5 & AI"])
 
+# A scanner card is "stale" if the watcher hasn't refreshed it within this
+# many seconds. The watcher updates every ~20s, so 180s (3 min) means several
+# missed cycles → the watcher stopped updating that symbol and the signal no
+# longer reflects the live market. Stale cards are flagged + sorted to bottom.
+STALE_SECONDS = int(os.environ.get("SCANNER_STALE_SECONDS", "180"))
+
 # Admin router — destructive cleanup operations, guarded by a shared token.
 admin_router = APIRouter(prefix="/api/admin", tags=["Admin"])
 
@@ -96,9 +102,19 @@ class MT5AccountCreate(BaseModel):
     risk_level: str = "medium"
 
 
+class SymbolConfig(BaseModel):
+    symbol: str
+    lot_size: Optional[float] = None
+    trade_direction: Optional[str] = "both"
+
+
 class AISettingsUpdate(BaseModel):
     license_key: str
     symbols: List[str] = []
+    # NEW: optional per-symbol config so the user can set the lot for each pair
+    # (e.g. XAUUSD 0.02, BTCUSD 0.20). If provided, lot_size is stored and the
+    # worker trades exactly that. Backward compatible: plain `symbols` still works.
+    symbol_configs: Optional[List[SymbolConfig]] = None
     risk_level: Optional[str] = None   # optional — if sent, also update mode
 
 
@@ -435,7 +451,8 @@ def save_ai_settings(data: AISettingsUpdate, db: Session = Depends(get_db)):
     if not license_row:
         raise HTTPException(status_code=400, detail="Invalid license key")
 
-    if len(data.symbols) > 50:
+    _count = len(data.symbol_configs) if data.symbol_configs else len(data.symbols)
+    if _count > 50:
         raise HTTPException(status_code=400, detail="Too many symbols (max 50)")
 
     existing = {
@@ -443,7 +460,30 @@ def save_ai_settings(data: AISettingsUpdate, db: Session = Depends(get_db)):
             ClientSymbolSetting.license_id == license_row.id
         ).all()
     }
-    new_set = {s.upper() for s in data.symbols}
+    # Build the per-symbol lot/direction map from symbol_configs if the
+    # frontend sent it. Falls back to the plain symbols list otherwise.
+    lot_map = {}
+    dir_map = {}
+    if data.symbol_configs:
+        for cfg_item in data.symbol_configs:
+            su = cfg_item.symbol.upper()
+            if cfg_item.lot_size is not None:
+                try:
+                    lv = float(cfg_item.lot_size)
+                    if 0 < lv <= 100:          # basic sanity bound
+                        lot_map[su] = lv
+                except (ValueError, TypeError):
+                    pass
+            if cfg_item.trade_direction:
+                d = cfg_item.trade_direction.lower().strip()
+                if d in ("buy", "sell", "both"):
+                    dir_map[su] = d
+
+    # The set of symbols to enable: configs take precedence, else plain list.
+    if data.symbol_configs:
+        new_set = {c.symbol.upper() for c in data.symbol_configs}
+    else:
+        new_set = {s.upper() for s in data.symbols}
 
     for sym_name, row in existing.items():
         if sym_name not in new_set:
@@ -452,12 +492,17 @@ def save_ai_settings(data: AISettingsUpdate, db: Session = Depends(get_db)):
     for sym in new_set:
         if sym in existing:
             existing[sym].enabled = True
+            if sym in lot_map:
+                existing[sym].lot_size = lot_map[sym]
+            if sym in dir_map:
+                existing[sym].trade_direction = dir_map[sym]
         else:
             db.add(ClientSymbolSetting(
                 license_id      = license_row.id,
                 symbol_name     = sym,
                 enabled         = True,
-                trade_direction = "both",
+                lot_size        = lot_map.get(sym),
+                trade_direction = dir_map.get(sym, "both"),
             ))
 
     # FIX 1: if risk_level was sent, save it on the MT5 account too, so the
@@ -498,18 +543,24 @@ def get_ai_settings(license_key: str, db: Session = Depends(get_db)):
     ).first()
     risk_level = (account.risk_level if account and account.risk_level else "medium")
 
-    # Return the EFFECTIVE lot_size / max_open_trades the worker will actually
-    # use for each symbol under the current mode — NOT the raw stored defaults
-    # (which are 0.01 / 1 from the frontend and get overridden by mode_first
-    # in the worker). This makes the dashboard show the truth: e.g. medium BTC
-    # = 0.20 lot / 3 trades, medium XAU = 0.02 lot / 3 trades.
+    # Return what the worker will ACTUALLY use: the user's own per-symbol lot
+    # (exactly as they typed it) and 1 trade per symbol (the safe operational
+    # limit). If a symbol has no lot set yet, fall back to the mode lot so the
+    # field isn't blank, but the user's typed value always wins.
     out_symbols = []
     for s in settings:
-        eff_lot, eff_trades = _effective_lot_and_trades(s.symbol_name, risk_level)
+        try:
+            user_lot = float(s.lot_size) if s.lot_size else 0
+        except (ValueError, TypeError):
+            user_lot = 0
+        if user_lot and user_lot > 0:
+            eff_lot = user_lot
+        else:
+            eff_lot, _ = _effective_lot_and_trades(s.symbol_name, risk_level)
         out_symbols.append({
             "symbol":          s.symbol_name,
             "lot_size":        eff_lot,
-            "max_open_trades": eff_trades,
+            "max_open_trades": 1,
             "trade_direction": s.trade_direction or "both",
         })
 
@@ -988,6 +1039,20 @@ def free_scanner(db: Session = Depends(get_db)):
         if not market:
             continue
         label, name, recommended = lookup.get(up, ("Other", up, False))
+        # ── Staleness guard ──────────────────────────────────────────────
+        # The watcher updates each symbol every ~20s. If a card's state is
+        # older than STALE_SECONDS, the watcher has stopped updating it
+        # (crash / lost MT5 / not running) and the signal no longer reflects
+        # the market. Flag it so the UI can grey it out instead of showing a
+        # frozen direction (e.g. a 3-hour-old SELL while price is rising).
+        age_seconds = None
+        is_stale = False
+        if market.updated_at:
+            updated = market.updated_at
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            age_seconds = int((datetime.now(timezone.utc) - updated).total_seconds())
+            is_stale = age_seconds > STALE_SECONDS
         cards.append({
             "symbol":      market.symbol,
             "name":        name,
@@ -1001,10 +1066,13 @@ def free_scanner(db: Session = Depends(get_db)):
             "stop_loss":   float(market.stop_loss or 0) if market.stop_loss else None,
             "take_profit": float(market.take_profit or 0) if market.take_profit else None,
             "updated_at":  market.updated_at.isoformat() if market.updated_at else None,
+            "age_seconds": age_seconds,
+            "stale":       is_stale,
         })
 
-    # Sort: recommended first, then by confidence desc
-    cards.sort(key=lambda c: (not c["recommended"], -c["strength"]))
+    # Sort: fresh before stale, then recommended first, then confidence desc.
+    # A frozen 3-hour-old card should never sit at the top as if actionable.
+    cards.sort(key=lambda c: (c["stale"], not c["recommended"], -c["strength"]))
 
     return {
         "success": True,
