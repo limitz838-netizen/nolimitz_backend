@@ -924,15 +924,21 @@ _SYMBOL_CATALOG = {
 
 
 @router.get("/symbol-catalog")
-def symbol_catalog(license_key: str = None, db: Session = Depends(get_db)):
+def symbol_catalog(license_key: str = None, live_only: bool = True,
+                   db: Session = Depends(get_db)):
     """
     Categorized symbol universe for the scanner / picker.
 
     Returns categories (Metals, Crypto, Forex, Indices, Synthetic), each with
-    its symbols, a display name, a `recommended` flag (Gold + Bitcoin + EURUSD),
-    a `live` flag (currently scanned by the watcher), and — when a license_key
-    is supplied — an `enabled` flag showing which symbols this user has turned
-    on for trading.
+    its symbols, a display name, a `recommended` flag, a `live` flag (currently
+    scanned by the watcher), and — when a license_key is supplied — an
+    `enabled` flag showing which symbols this user has turned on for trading.
+
+    live_only (default True): only return symbols the watcher is actually
+    scanning. This keeps the settings screen honest — a user can only pick
+    pairs the AI truly trades, so there are no dead choices that look
+    selectable but never produce a signal. Pass live_only=false to see the
+    full catalog (e.g. for an admin/preview view).
     """
     # Which symbols the watcher is actively scanning right now
     live_syms = {
@@ -958,18 +964,25 @@ def symbol_catalog(license_key: str = None, db: Session = Depends(get_db)):
         syms = []
         for s in cat["symbols"]:
             up = s["symbol"].upper()
+            is_live = up in live_syms
+            # In live_only mode, skip symbols the watcher isn't scanning so the
+            # picker only shows tradeable pairs.
+            if live_only and not is_live:
+                continue
             syms.append({
                 "symbol":      s["symbol"],
                 "name":        s["name"],
                 "recommended": s["recommended"],
-                "live":        up in live_syms,
+                "live":        is_live,
                 "enabled":     up in user_enabled,
             })
-        categories.append({
-            "key":     key,
-            "label":   cat["label"],
-            "symbols": syms,
-        })
+        # Don't return an empty category (e.g. Synthetic with nothing live)
+        if syms:
+            categories.append({
+                "key":     key,
+                "label":   cat["label"],
+                "symbols": syms,
+            })
 
     return {"success": True, "categories": categories}
 
