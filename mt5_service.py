@@ -4,7 +4,7 @@ import time
 
 verified_servers = set()
 
-from app.config.supported_brokers import SUPPORTED_BROKERS
+from app.config.brokers import SUPPORTED_BROKERS
 
 
 def is_supported_server(server_name: str):
