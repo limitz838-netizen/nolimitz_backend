@@ -569,6 +569,14 @@ def get_ai_settings(license_key: str, db: Session = Depends(get_db)):
         "success": True,
         "risk_level": risk_level,
         "symbols": out_symbols,
+        # Frontend (saveAiSettingsV2 / getAiSettings) reads symbol_configs[].lot_size
+        # to pre-fill the per-symbol lot inputs. Return it in that exact shape so
+        # a user's saved lots show up when they reopen the settings screen.
+        "symbol_configs": [
+            {"symbol": s["symbol"], "lot_size": s["lot_size"],
+             "trade_direction": s["trade_direction"]}
+            for s in out_symbols
+        ],
     }
 
 
@@ -924,6 +932,7 @@ _SYMBOL_CATALOG = {
 
 
 @router.get("/symbol-catalog")
+@router.get("/symbols-catalog")   # alias — frontend calls the plural form
 def symbol_catalog(license_key: str = None, live_only: bool = True,
                    db: Session = Depends(get_db)):
     """
