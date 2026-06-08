@@ -9,19 +9,37 @@
   the /api/client/mt5-account POST endpoint. This worker is the periodic
   refresher for already-saved accounts.
 
+  ── WHAT CHANGED (smooth-operation rewrite) ──────────────────────────────────
+  The old worker could stall the whole queue when a user entered wrong details:
+  it re-initialized the terminal per account (heavy / destabilizing), retried a
+  wrong password 3× before failing, and rebuilt the terminal on any hiccup.
+
+  This version:
+    • Logs in with mt5.login() on a terminal initialized ONCE at startup
+      (light; doesn't destabilize the terminal when cycling many accounts).
+    • Bounds every attempt with a short hard timeout (MT5_LOGIN_TIMEOUT_MS).
+    • FAILS FAST on clearly-wrong details (bad server / bad login / bad
+      password) on the FIRST attempt, and FAILED accounts are skipped by the
+      queue builder — so one bad account can never interrupt the others.
+    • Treats only ambiguous errors (timeout / dropped connection / IPC loss)
+      as transient: retried with backoff up to a cap, then failed — so a GOOD
+      account is never permanently killed by a momentary network blip.
+    • Rebuilds the terminal only on a real IPC pipe death, once, then continues.
+    • Honours a per-loop time budget so the loop always stays responsive to
+      fresh VERIFYING/REFRESH requests.
+
+  NOTE: full isolation from the execution worker (so a verifier hiccup can
+  never touch the trading terminal) comes from running the two workers on
+  SEPARATE MT5 installs — that's the next task.
+
   Loop:
-    1. Pull accounts grouped by priority:
-         a. PENDING accounts (recent connect, retry needed)
-         b. VERIFIED accounts with stale data (>5 min since last refresh)
-    2. For each account: log in, fetch info, update DB
-    3. Sleep
-    4. Repeat
+    1. Pull accounts grouped by priority (fresh requests → pending → stale).
+    2. For each account: log in, fetch info, update DB. Skip cleanly on bad
+       details.
+    3. Sleep. Repeat.
 
-  Exponential backoff for failed accounts: 1min, 2min, 5min, 15min, 30min, 1hr.
+  Exponential backoff for transient failures: 1min, 2min, 5min, 15min, 30min, 1hr.
   Verified accounts: refresh every 5 min.
-
-  Shared MT5_LOCK serializes terminal access across this worker AND the
-  client_mt5.py API endpoint (same process, same lock).
 ================================================================================
 """
 
@@ -31,7 +49,7 @@ import logging
 import threading
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import MetaTrader5 as mt5
 from sqlalchemy import or_
@@ -74,7 +92,17 @@ MAX_ACCOUNTS_PER_LOOP     = int(os.environ.get("VERIFY_BATCH_SIZE",   "20"))
 # Periodic MT5 refresh (full restart of terminal)
 MT5_RESTART_INTERVAL_SEC  = int(os.environ.get("MT5_RESTART_INTERVAL", "3600"))  # 1 hr
 # Login timeout (ms) — bounds every connect attempt so a bad broker can't hang
-LOGIN_TIMEOUT_MS          = int(os.environ.get("MT5_LOGIN_TIMEOUT_MS", "15000"))  # 15s
+# the worker. Kept short on purpose: a single slow/wrong server costs at most
+# this long, once, before the account is skipped.
+LOGIN_TIMEOUT_MS          = int(os.environ.get("MT5_LOGIN_TIMEOUT_MS", "8000"))   # 8s
+# How many TRANSIENT (non-deterministic) failures before we give up on an
+# account and mark it FAILED. Protects a GOOD account from being permanently
+# failed by a momentary network blip, while still bounding pointless churn.
+MAX_TRANSIENT_RETRIES     = int(os.environ.get("VERIFY_MAX_TRANSIENT_RETRIES", "4"))
+# Per-loop wall-clock budget. If processing the queue takes longer than this,
+# defer the rest to the next loop so fresh VERIFYING/REFRESH requests from
+# users stay responsive instead of waiting behind a pile of slow accounts.
+LOOP_TIME_BUDGET_SEC      = int(os.environ.get("VERIFY_LOOP_BUDGET_SEC", "45"))
 
 # Failure backoff schedule (seconds since last attempt before next retry)
 FAILURE_BACKOFF = [60, 120, 300, 900, 1800, 3600]
@@ -86,10 +114,28 @@ _last_mt5_restart: float = time.time()
 
 
 # ==============================================================================
+# DB HELPER
+# ==============================================================================
+def _safe_commit(db: Session) -> bool:
+    """Commit, swallowing/rolling-back on error so one bad write never crashes
+    the loop."""
+    try:
+        db.commit()
+        return True
+    except Exception as e:
+        logger.error("DB commit failed: %s", e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
+
+
+# ==============================================================================
 # MT5 LIFECYCLE
 # ==============================================================================
 def init_mt5() -> bool:
-    if not mt5.initialize(path=TERMINAL_PATH):
+    if not mt5.initialize(path=TERMINAL_PATH, timeout=LOGIN_TIMEOUT_MS):
         logger.critical("MT5 INIT FAILED: %s", mt5.last_error())
         return False
     logger.info("✅ MT5 verifier connected")
@@ -104,7 +150,7 @@ def restart_mt5_if_needed() -> None:
         with MT5_LOCK:
             mt5.shutdown()
             time.sleep(2)
-            mt5.initialize(path=TERMINAL_PATH)
+            mt5.initialize(path=TERMINAL_PATH, timeout=LOGIN_TIMEOUT_MS)
         _last_mt5_restart = time.time()
 
 
@@ -115,7 +161,7 @@ def ensure_mt5_alive() -> bool:
         with MT5_LOCK:
             mt5.shutdown()
             time.sleep(2)
-            return mt5.initialize(path=TERMINAL_PATH)
+            return mt5.initialize(path=TERMINAL_PATH, timeout=LOGIN_TIMEOUT_MS)
     return True
 
 
@@ -137,7 +183,7 @@ def should_skip_due_to_backoff(account_login: str) -> bool:
 
 
 # ==============================================================================
-# ROBUST CONNECT
+# TERMINAL HEALTH (IPC)
 # ==============================================================================
 def _ipc_is_dead() -> bool:
     """True if the last MT5 error is the -10004 'No IPC connection' pipe loss."""
@@ -151,9 +197,9 @@ def _ipc_is_dead() -> bool:
 def _rebuild_terminal() -> bool:
     """
     Fully tear down and restart the MT5 terminal connection. Needed when the
-    IPC pipe dies (-10004), which happens when rapidly switching between
-    different brokers/servers on a single terminal. A plain login() retry on a
-    dead pipe can NEVER succeed — the pipe itself must be rebuilt first.
+    IPC pipe dies (-10004), which can happen when rapidly switching between
+    different brokers/servers. A plain login() retry on a dead pipe can NEVER
+    succeed — the pipe itself must be rebuilt first.
     """
     try:
         mt5.shutdown()
@@ -172,65 +218,131 @@ def _rebuild_terminal() -> bool:
         return False
 
 
-def _robust_connect(login_int: int, password: str, server: str,
-                   attempts: int = 2) -> bool:
+# ==============================================================================
+# FAILURE CLASSIFICATION
+# ==============================================================================
+def _classify_login_failure(err) -> str:
     """
-    Try to connect to a user's account using multiple strategies so the
-    terminal doesn't hang ("stack") when a broker server needs resolving.
+    Map an mt5.last_error() tuple to one of:
+      'bad_auth'   — wrong login number or password (deterministic → skip now)
+      'bad_server' — server name unknown to the terminal (deterministic → skip)
+      'transient'  — timeout / dropped connection / broker outage (retry-able)
 
-    Strategy A — initialize(login=, password=, server=): passing creds to
-      initialize gives the terminal the best chance to resolve the broker's
-      server automatically (better than login() on its own).
-    Strategy B — login(login, password, server) on the running terminal.
-
-    If the IPC pipe dies (-10004 No IPC connection — common when switching
-    between different brokers on one terminal), the terminal is fully rebuilt
-    (shutdown + initialize) before retrying, because login() on a dead pipe
-    can never succeed.
-
-    Both strategies use a bounded timeout (LOGIN_TIMEOUT_MS) so a bad broker
-    can never hang the worker.
-
-    Returns True if connected (verified by account_info matching login).
+    We are deliberately CONSERVATIVE: only clearly-deterministic errors are
+    classified as bad_auth / bad_server. Everything ambiguous falls through to
+    'transient', so a momentary blip can never permanently fail a GOOD account.
     """
-    for attempt in range(1, attempts + 1):
-        # Strategy A: initialize with credentials (bounded timeout)
-        try:
-            ok = mt5.initialize(
-                path=TERMINAL_PATH,
-                login=login_int,
-                password=password,
-                server=server,
-                timeout=LOGIN_TIMEOUT_MS,   # ms — never hangs forever
+    code = err[0] if isinstance(err, tuple) and err else 0
+    text = ((err[1] if isinstance(err, tuple) and len(err) > 1 else "") or "").lower()
+
+    # Authorization problems = wrong login or password. Retrying never helps.
+    if (code in (-6, 134, 10004, 10015)
+            or "authoriz" in text
+            or "invalid account" in text
+            or "account disabled" in text
+            or "password" in text):
+        return "bad_auth"
+
+    # Server name not known to the terminal = wrong/misspelled server.
+    if (code in (-2, -3)
+            or "not found" in text
+            or "unknown" in text
+            or "invalid server" in text
+            or "no such server" in text):
+        return "bad_server"
+
+    # Timeouts, connection drops, IPC loss, temporary broker outages, etc.
+    return "transient"
+
+
+# ==============================================================================
+# CONNECT (login-only on a terminal that's already initialized)
+# ==============================================================================
+def _connect_account(login_int: int, password: str, server: str) -> Tuple[bool, str]:
+    """
+    Switch the (already-initialized) terminal to this account via login().
+
+    login() is far lighter than re-initialize() and is much less likely to
+    destabilize the terminal when cycling through many accounts back to back.
+
+    Returns (connected, failure_kind):
+      connected=True, kind=""                 → logged in & account_info matches
+      connected=False, kind='bad_auth'        → wrong login/password (skip now)
+      connected=False, kind='bad_server'      → wrong server name (skip now)
+      connected=False, kind='transient'       → retry-able
+
+    Bounded by LOGIN_TIMEOUT_MS so a single bad/slow broker can never hang the
+    worker. On a real IPC pipe death (-10004) the terminal is rebuilt ONCE and
+    a single clean retry is attempted before giving up (transient).
+    """
+    try:
+        ok = mt5.login(login_int, password=password, server=server,
+                       timeout=LOGIN_TIMEOUT_MS)
+        if ok:
+            info = mt5.account_info()
+            if info and str(info.login) == str(login_int):
+                return True, ""
+            # Logged in but no/mismatched account info — treat as transient.
+            return False, "transient"
+
+        err = mt5.last_error()
+
+        # IPC pipe dead → rebuild the terminal once, then one clean retry.
+        if _ipc_is_dead():
+            if _rebuild_terminal():
+                if mt5.login(login_int, password=password, server=server,
+                             timeout=LOGIN_TIMEOUT_MS):
+                    info = mt5.account_info()
+                    if info and str(info.login) == str(login_int):
+                        return True, ""
+            return False, "transient"
+        
+        logger.warning(
+            "MT5 login failed | login=%s | server=%s | error=%s",
+            login_int,
+            server,
+            err
+        )
+
+        return False, _classify_login_failure(err)
+
+    except Exception as e:
+        logger.debug("connect exception for %s: %s", login_int, e)
+        return False, "transient"
+
+
+# ==============================================================================
+# TRANSIENT HANDLING
+# ==============================================================================
+def _handle_transient(account: ClientMT5Account, db: Session,
+                      login_str: str, reason: str) -> None:
+    """
+    Record a transient failure. Retries with backoff up to MAX_TRANSIENT_RETRIES,
+    then marks the account FAILED (so the queue stops retrying it) with a
+    message telling the user to check their connection / broker and resubmit.
+    """
+    _failure_count[login_str] += 1
+    fails = _failure_count[login_str]
+
+    if fails >= MAX_TRANSIENT_RETRIES:
+        account.verification_status = "FAILED"
+        account.is_verified = False
+        if hasattr(account, "verification_error"):
+            account.verification_error = (
+                "Couldn't connect after several attempts. Check your internet "
+                "and that your broker's server is online, then tap Connect to retry."
             )
-            if ok:
-                info = mt5.account_info()
-                if info and str(info.login) == str(login_int):
-                    return True
-        except Exception as e:
-            logger.debug("init-with-creds attempt %d failed: %s", attempt, e)
+        logger.warning("⛔ %s FAILED after %d transient attempt(s) (%s)",
+                       login_str, fails, reason)
+    else:
+        account.verification_status = "PENDING"
+        account.is_verified = False
+        if hasattr(account, "verification_error"):
+            account.verification_error = None  # not a hard failure yet
+        logger.info("… %s transient (%s) — retry %d/%d with backoff",
+                    login_str, reason, fails, MAX_TRANSIENT_RETRIES)
 
-        # If the IPC pipe is dead, rebuild the terminal before trying login()
-        if _ipc_is_dead():
-            _rebuild_terminal()
-
-        # Strategy B: plain login on the running terminal (bounded timeout)
-        try:
-            if mt5.login(login_int, password=password, server=server,
-                        timeout=LOGIN_TIMEOUT_MS):
-                info = mt5.account_info()
-                if info and str(info.login) == str(login_int):
-                    return True
-        except Exception as e:
-            logger.debug("login attempt %d failed: %s", attempt, e)
-
-        # IPC died during login too → rebuild before the next attempt loop
-        if _ipc_is_dead():
-            _rebuild_terminal()
-
-        time.sleep(1.0)  # brief pause before next attempt
-
-    return False
+    _safe_commit(db)
 
 
 # ==============================================================================
@@ -239,133 +351,113 @@ def _robust_connect(login_int: int, password: str, server: str,
 def verify_one_account(account: ClientMT5Account, db: Session) -> bool:
     """
     Log in, fetch info, update DB. Returns True on success.
-    Holds MT5_LOCK while operating on the terminal.
+    Holds MT5_LOCK only for the bounded login + info read.
+
+    Bad details (wrong server / login / password) are marked FAILED on the
+    FIRST attempt and then skipped by the queue builder, so they never stall
+    the rest of the queue.
     """
     login_str = str(account.login)
     _last_attempt[login_str] = time.time()
 
+    # Non-numeric login can never be valid — fail immediately, no MT5 call.
     try:
         login_int = int(account.login)
     except (ValueError, TypeError):
-        logger.warning("Invalid non-numeric login: %s", account.login)
+        logger.info("⛔ %s FAILED (login is not numeric) — skipping", login_str)
         account.verification_status = "FAILED"
         account.is_verified = False
-        db.commit()
+        if hasattr(account, "verification_error"):
+            account.verification_error = (
+                "Login must be your numeric MT5 account number "
+                "(digits only, e.g. 51234567)."
+            )
+        _safe_commit(db)
         return False
 
-    if not MT5_LOCK.acquire(timeout=10):
-        logger.warning("Couldn't acquire MT5 lock for %s", login_str)
+    # Bounded lock acquire — if the terminal is busy, just retry next loop
+    # rather than blocking. (Short timeout keeps the loop responsive.)
+    if not MT5_LOCK.acquire(timeout=5):
+        logger.warning("Couldn't acquire MT5 lock for %s — will retry next loop", login_str)
         return False
 
     try:
-        # ── Robust connect: try several strategies so we don't "stack" ────────
-        # Strategy A: initialize() WITH credentials — best server resolution.
-        #             Passing login/server to initialize lets the terminal
-        #             resolve the broker server more reliably than login() alone.
-        # Strategy B: plain login() on the already-running terminal.
-        # Each strategy is retried briefly because server resolution can need
-        # a moment on the first attempt.
-        connected = _robust_connect(login_int, account.password, account.server)
+        connected, kind = _connect_account(login_int, account.password, account.server)
 
-        if not connected:
-            err = mt5.last_error()
-            logger.warning("Login failed %s on %s: %s", login_str, account.server, err)
-            _failure_count[login_str] += 1
-            fails = _failure_count[login_str]
-            err_code = err[0] if isinstance(err, tuple) and err else 0
-            err_text = (err[1] if isinstance(err, tuple) and len(err) > 1 else "") or ""
-
-            def _set_err(msg):
-                if hasattr(account, "verification_error"):
-                    account.verification_error = msg
-
-            # -2 / -3 == broker server not known to the terminal (bad server name)
-            if err_code in (-2, -3):
-                account.verification_status = "FAILED"
-                _set_err(f"Server \"{account.server}\" not found. "
-                         f"Check the exact server name in your MT5 app "
-                         f"(it must match exactly, e.g. 'FBS-Demo').")
-                account.is_verified = False
-                db.commit()
+        # ── SUCCESS ──────────────────────────────────────────────────────────
+        if connected:
+            time.sleep(0.2)
+            info = mt5.account_info()
+            if not info or str(info.login) != login_str:
+                _handle_transient(account, db, login_str,
+                                  "account info unavailable after login")
                 return False
 
-            # "Invalid account" / authorization failures → wrong login or password.
-            # MT5 commonly returns code 134/10004/10015 or text mentioning auth.
-            low = err_text.lower()
-            looks_like_auth = (
-                err_code in (134, 10004, 10015)
-                or "invalid account" in low
-                or "authoriz" in low
-                or "password" in low
-                or "login" in low
-            )
-            # After 3 failed attempts with an auth-looking error, stop the silent
-            # retry loop and tell the user exactly what to fix. Transient network
-            # errors keep retrying (PENDING) up to the threshold.
-            if looks_like_auth and fails >= 3:
-                account.verification_status = "FAILED"
-                _set_err("Login or password incorrect. Re-enter your MT5 "
-                         "login number and the INVESTOR or MASTER password "
-                         "exactly as shown in your MT5 app.")
-                account.is_verified = False
-                db.commit()
-                return False
-
-            # Otherwise keep PENDING for retry (transient / still settling)
-            account.verification_status = "PENDING"
+            was_first_verify = not account.is_verified
+            account.is_verified         = True
+            account.verification_status = "VERIFIED"
+            account.account_name        = str(info.name or "")
+            account.broker_name         = str(info.company or "")
+            account.balance             = float(info.balance or 0)
+            account.equity              = float(info.equity or 0)
+            account.last_verified_at    = datetime.now(timezone.utc)
+            # Clear any stale error from a previous failed attempt.
             if hasattr(account, "verification_error"):
-                account.verification_error = None  # clear; not a hard failure yet
+                account.verification_error = None
+            # Auto-enable AI trading on first successful verify.
+            if was_first_verify:
+                account.ai_auto_trade = True
+            _safe_commit(db)
+            _failure_count[login_str] = 0
+            logger.info(
+                "✅ %s | %s | %s | bal=$%.2f eq=$%.2f%s",
+                login_str, account.account_name, account.broker_name,
+                account.balance, account.equity,
+                " | AI auto-enabled" if was_first_verify else "",
+            )
+            return True
+
+        # ── BAD SERVER — deterministic, skip immediately ─────────────────────
+        if kind == "bad_server":
+            account.verification_status = "FAILED"
             account.is_verified = False
-            db.commit()
+            if hasattr(account, "verification_error"):
+                account.verification_error = (
+                    f'Server "{account.server}" not found. Open your MT5 app, '
+                    f"copy the EXACT server name (it must match exactly, e.g. "
+                    f"'Exness-MT5Real8'), and re-enter it."
+                )
+            _safe_commit(db)
+            logger.info("⛔ %s FAILED (bad server '%s') — skipping until resubmit",
+                        login_str, account.server)
             return False
 
-        time.sleep(0.4)
-        info = mt5.account_info()
-        if not info:
-            logger.warning("No account info for %s", login_str)
-            _failure_count[login_str] += 1
-            account.verification_status = "PENDING"
+        # ── BAD AUTH — deterministic, skip immediately ───────────────────────
+        if kind == "bad_auth":
+            account.verification_status = "FAILED"
             account.is_verified = False
-            db.commit()
+            if hasattr(account, "verification_error"):
+                account.verification_error = (
+                    "Login or password incorrect. Re-enter your MT5 login number "
+                    "and the MASTER (or INVESTOR) password exactly as shown in "
+                    "your MT5 app."
+                )
+            _safe_commit(db)
+            logger.info("⛔ %s FAILED (bad login/password) — skipping until resubmit",
+                        login_str)
             return False
 
-        if str(info.login) != login_str:
-            logger.error("Account mismatch — expected %s got %s", login_str, info.login)
-            _failure_count[login_str] += 1
-            account.verification_status = "PENDING"
-            account.is_verified = False
-            db.commit()
-            return False
+        # ── TRANSIENT — retry with backoff, give up after the cap ────────────
+        _handle_transient(account, db, login_str, "transient connection issue")
+        return False
 
-        # Success — capture details
-        was_first_verify = not account.is_verified
-        account.is_verified         = True
-        account.verification_status = "VERIFIED"
-        account.account_name        = str(info.name or "")
-        account.broker_name         = str(info.company or "")
-        account.balance             = float(info.balance or 0)
-        account.equity              = float(info.equity or 0)
-        account.last_verified_at    = datetime.now(timezone.utc)
-        # FIX 1: clear any stale verification error from a previous failure,
-        # otherwise an old error message could linger forever after a fix.
-        if hasattr(account, "verification_error"):
-            account.verification_error = None
-        # Auto-enable AI trading on first successful verify — user connects,
-        # account verifies, AI starts trading. No separate "Start AI" needed.
-        if was_first_verify:
-            account.ai_auto_trade = True
-        db.commit()
-        _failure_count[login_str] = 0
-        logger.info(
-            "✅ %s | %s | %s | bal=$%.2f eq=$%.2f%s",
-            login_str, account.account_name, account.broker_name,
-            account.balance, account.equity,
-            " | AI auto-enabled" if was_first_verify else "",
-        )
-        return True
     except Exception as e:
         logger.error("Verify exception %s: %s", login_str, e)
         _failure_count[login_str] += 1
+        try:
+            db.rollback()
+        except Exception:
+            pass
         return False
     finally:
         try:
@@ -382,15 +474,19 @@ def get_accounts_to_process(db: Session) -> List[ClientMT5Account]:
     Build the list of accounts that need attention this cycle.
     Priority order:
       1. NEW user actions — VERIFYING / REFRESH (no backoff, always immediate)
-      2. PENDING / FAILED retries (respecting backoff)
+      2. PENDING retries (respecting backoff)
       3. VERIFIED accounts whose last_verified_at is stale (periodic refresh)
+
+    FAILED is intentionally EXCLUDED everywhere — a FAILED account has a known
+    cause (wrong password / bad server / repeated transient failure) and must
+    NOT be retried automatically (that's what stalled the queue). It becomes
+    eligible again only when the user RESUBMITS, which sets the status back to
+    VERIFYING (handled as a fresh request above).
     """
     now_utc = datetime.now(timezone.utc)
     refresh_cutoff = now_utc - timedelta(seconds=REFRESH_INTERVAL_SEC)
 
     # 1. HIGHEST PRIORITY — brand-new connect / refresh requests from users.
-    #    These are processed every fast loop with NO backoff so the user sees
-    #    their account details within ~1-2 seconds.
     fresh_requests = db.query(ClientMT5Account).filter(
         ClientMT5Account.is_active == True,
         or_(
@@ -399,12 +495,7 @@ def get_accounts_to_process(db: Session) -> List[ClientMT5Account]:
         ),
     ).limit(MAX_ACCOUNTS_PER_LOOP).all()
 
-    # 2. Retry PENDING / never-verified (with backoff).
-    #    FAILED is intentionally EXCLUDED — a FAILED account has a known cause
-    #    (wrong password / bad server) and should NOT be retried automatically
-    #    every cycle (that wastes worker time logging into dead credentials).
-    #    It becomes eligible again only when the user RESUBMITS, which sets the
-    #    status back to VERIFYING (handled as a fresh request above).
+    # 2. Retry PENDING / never-verified (with backoff). FAILED excluded.
     pending = db.query(ClientMT5Account).filter(
         or_(
             ClientMT5Account.verification_status == "PENDING",
@@ -429,10 +520,9 @@ def get_accounts_to_process(db: Session) -> List[ClientMT5Account]:
     queue: List[ClientMT5Account] = []
 
     # Fresh requests first — never skipped by backoff.
-    # CRITICAL: a VERIFYING/REFRESH row means the user JUST submitted (often
-    # after fixing wrong details). Reset this login's failure/backoff counters
-    # so the corrected credentials are tried IMMEDIATELY with a clean slate,
-    # instead of being blocked for up to an hour by the old backoff schedule.
+    # A VERIFYING/REFRESH row means the user JUST submitted (often after fixing
+    # wrong details). Reset this login's failure/backoff counters so the
+    # corrected credentials are tried IMMEDIATELY with a clean slate.
     for acc in fresh_requests:
         if acc.login in seen_logins:
             continue
@@ -476,10 +566,19 @@ def main_loop():
                 if queue:
                     logger.info("📋 Processing %d account(s)", len(queue))
                     successes = 0
+                    processed = 0
+                    loop_start = time.time()
                     for account in queue:
+                        # Per-loop time budget: defer the rest to the next loop
+                        # so fresh VERIFYING/REFRESH requests stay responsive.
+                        if time.time() - loop_start > LOOP_TIME_BUDGET_SEC:
+                            logger.info("⏳ loop budget reached — deferring %d account(s) to next loop",
+                                        len(queue) - processed)
+                            break
                         if verify_one_account(account, db):
                             successes += 1
-                    logger.info("📊 Cycle %d: %d/%d verified", cycle, successes, len(queue))
+                        processed += 1
+                    logger.info("📊 Cycle %d: %d/%d verified", cycle, successes, processed)
                 elif cycle % 20 == 0:
                     # Quiet heartbeat every ~100s when nothing to do
                     logger.info("💓 idle — no accounts due for verification")
@@ -502,6 +601,8 @@ def main_loop():
 if __name__ == "__main__":
     if not init_mt5():
         raise SystemExit(1)
-    logger.info("🚀 MT5 Verifier started | refresh=%ds | batch=%d | restart_every=%ds",
-               REFRESH_INTERVAL_SEC, MAX_ACCOUNTS_PER_LOOP, MT5_RESTART_INTERVAL_SEC)
+    logger.info("🚀 MT5 Verifier started | refresh=%ds | batch=%d | login_timeout=%dms | "
+               "max_transient=%d | loop_budget=%ds | restart_every=%ds",
+               REFRESH_INTERVAL_SEC, MAX_ACCOUNTS_PER_LOOP, LOGIN_TIMEOUT_MS,
+               MAX_TRANSIENT_RETRIES, LOOP_TIME_BUDGET_SEC, MT5_RESTART_INTERVAL_SEC)
     main_loop()
