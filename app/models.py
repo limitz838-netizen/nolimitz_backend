@@ -692,3 +692,19 @@ class AISymbol(Base):
         DateTime(timezone=True),
         server_default=func.now()
     )
+
+
+class ManualTradeRequest(Base):
+    __tablename__ = "manual_trade_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    license_id = Column(Integer, ForeignKey("licenses.id"), nullable=False, index=True)
+    mt5_login = Column(String, nullable=True)
+    symbol = Column(String, nullable=False)
+    action = Column(String, nullable=False)              # BUY | SELL
+    source = Column(String, default="chart_scan")
+    status = Column(String, default="PENDING", index=True)  # PENDING | DONE | FAILED
+    mt5_ticket = Column(String, nullable=True)
+    error = Column(String, nullable=True)
+    requested_at = Column(DateTime(timezone=True), server_default=func.now())
+    processed_at = Column(DateTime(timezone=True), nullable=True)  
