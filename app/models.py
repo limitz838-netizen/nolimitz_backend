@@ -276,6 +276,11 @@ class ClientMT5Account(Base):
 
     ai_started_at = Column(DateTime(timezone=True), nullable=True)
 
+    signal_cutoff_at = Column(
+        DateTime(timezone=True),
+        nullable=True
+    )
+
     max_ai_trades = Column(Integer, default=1)
 
     risk_percent = Column(Float, default=2.0)

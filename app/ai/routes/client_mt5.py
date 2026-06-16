@@ -210,6 +210,9 @@ def save_mt5_account(data: MT5AccountCreate, db: Session = Depends(get_db)):
         account.is_active  = True
         account.is_verified         = False
         account.verification_status = "VERIFYING"
+
+        account.signal_cutoff_at = datetime.utcnow()
+
         if hasattr(account, "verification_error"):
             account.verification_error = None  # clear stale error on resubmit
     else:
@@ -223,6 +226,7 @@ def save_mt5_account(data: MT5AccountCreate, db: Session = Depends(get_db)):
             ai_auto_trade       = False,
             is_verified         = False,
             verification_status = "VERIFYING",
+            signal_cutoff_at    = datetime.utcnow(),
         )
         db.add(account)
     db.commit()
@@ -344,8 +348,12 @@ def start_ai(data: AIToggle, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="MT5 account not verified")
 
     account.ai_auto_trade = True
+    account.signal_cutoff_at = datetime.utcnow()
+
     db.commit()
+
     logger.info("▶️ AI STARTED: login=%s", account.login)
+
     return {
         "success": True,
         "ai_auto_trade": True,
