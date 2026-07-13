@@ -400,42 +400,910 @@ def detect_rsi_divergence(closes: List[float], lookback: int = 20) -> str:
 
 
 def detect_swings(candles: List[dict], lookback: int = 5):
-    highs, lows = [], []
+    """
+    Detect swing highs and swing lows.
+
+    Returns:
+        swing_highs = [
+            {
+                "index": 54,
+                "price": 3348.20,
+                "time": ...
+            }
+        ]
+
+        swing_lows = [...]
+    """
+
+    swing_highs = []
+    swing_lows = []
+
+    if len(candles) < lookback * 2 + 1:
+        return swing_highs, swing_lows
+
     for i in range(lookback, len(candles) - lookback):
-        if all(candles[i]["high"] >= candles[i + j]["high"]
-               for j in range(-lookback, lookback + 1) if j != 0):
-            highs.append(i)
-        if all(candles[i]["low"] <= candles[i + j]["low"]
-               for j in range(-lookback, lookback + 1) if j != 0):
-            lows.append(i)
-    return highs, lows
+
+        current_high = candles[i]["high"]
+        current_low = candles[i]["low"]
+
+        is_high = True
+        is_low = True
+
+        for j in range(i - lookback, i + lookback + 1):
+
+            if j == i:
+                continue
+
+            if candles[j]["high"] >= current_high:
+                is_high = False
+
+            if candles[j]["low"] <= current_low:
+                is_low = False
+
+            if not is_high and not is_low:
+                break
+
+        if is_high:
+            swing_highs.append({
+                "index": i,
+                "price": current_high,
+                "time": candles[i]["time"]
+            })
+
+        if is_low:
+            swing_lows.append({
+                "index": i,
+                "price": current_low,
+                "time": candles[i]["time"]
+            })
+
+    return swing_highs, swing_lows
 
 
 def market_structure(candles: List[dict]) -> str:
-    if len(candles) < 30: return "RANGING"
-    sh, sl = detect_swings(candles, 3)
-    if len(sh) < 2 or len(sl) < 2: return "RANGING"
-    last_hs = [candles[i]["high"] for i in sh[-2:]]
-    last_ls = [candles[i]["low"]  for i in sl[-2:]]
-    hh = last_hs[-1] > last_hs[-2]
-    hl = last_ls[-1] > last_ls[-2]
-    lh = last_hs[-1] < last_hs[-2]
-    ll = last_ls[-1] < last_ls[-2]
-    if hh and hl: return "BULLISH"
-    if lh and ll: return "BEARISH"
+    """
+    Determine market structure using swing highs/lows.
+
+    Returns:
+        BULLISH
+        BEARISH
+        RANGING
+    """
+
+    if len(candles) < 30:
+        return "RANGING"
+
+    swing_highs, swing_lows = detect_swings(candles, 3)
+
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return "RANGING"
+
+    last_high = swing_highs[-1]["price"]
+    prev_high = swing_highs[-2]["price"]
+
+    last_low = swing_lows[-1]["price"]
+    prev_low = swing_lows[-2]["price"]
+
+    higher_high = last_high > prev_high
+    higher_low = last_low > prev_low
+
+    lower_high = last_high < prev_high
+    lower_low = last_low < prev_low
+
+    if higher_high and higher_low:
+        return "BULLISH"
+
+    if lower_high and lower_low:
+        return "BEARISH"
+
     return "RANGING"
 
 
-def key_support_resistance(candles: List[dict]):
-    sh, sl = detect_swings(candles, 5)
-    if not sh or not sl:
-        rh = [c["high"] for c in candles[-20:]]
-        rl = [c["low"]  for c in candles[-20:]]
-        return min(rl), max(rh)
-    key_res = max(candles[i]["high"] for i in sh[-3:]) if sh else candles[-1]["high"]
-    key_sup = min(candles[i]["low"]  for i in sl[-3:]) if sl else candles[-1]["low"]
-    return key_sup, key_res
+def analyze_market_structure(candles: List[dict]) -> dict:
+    """
+    Advanced Smart Money market structure analysis.
 
+    Returns:
+    {
+        trend,
+        structure,
+        higher_high,
+        higher_low,
+        lower_high,
+        lower_low,
+        last_high,
+        last_low,
+        previous_high,
+        previous_low,
+        trend_strength
+    }
+    """
+
+    result = {
+        "trend": "RANGING",
+        "structure": "NONE",
+        "higher_high": False,
+        "higher_low": False,
+        "lower_high": False,
+        "lower_low": False,
+        "last_high": None,
+        "last_low": None,
+        "previous_high": None,
+        "previous_low": None,
+        "trend_strength": 0,
+    }
+
+    if len(candles) < 30:
+        return result
+
+    swing_highs, swing_lows = detect_swings(candles, 3)
+
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return result
+
+    last_high = swing_highs[-1]
+    prev_high = swing_highs[-2]
+
+    last_low = swing_lows[-1]
+    prev_low = swing_lows[-2]
+
+    result["last_high"] = last_high["price"]
+    result["previous_high"] = prev_high["price"]
+
+    result["last_low"] = last_low["price"]
+    result["previous_low"] = prev_low["price"]
+
+    hh = last_high["price"] > prev_high["price"]
+    hl = last_low["price"] > prev_low["price"]
+
+    lh = last_high["price"] < prev_high["price"]
+    ll = last_low["price"] < prev_low["price"]
+
+    result["higher_high"] = hh
+    result["higher_low"] = hl
+    result["lower_high"] = lh
+    result["lower_low"] = ll
+
+    if hh and hl:
+
+        result["trend"] = "BULLISH"
+        result["structure"] = "HH_HL"
+
+    elif lh and ll:
+
+        result["trend"] = "BEARISH"
+        result["structure"] = "LH_LL"
+
+    elif hh:
+
+        result["trend"] = "BULLISH"
+        result["structure"] = "HH"
+
+    elif ll:
+
+        result["trend"] = "BEARISH"
+        result["structure"] = "LL"
+
+    else:
+
+        result["trend"] = "RANGING"
+        result["structure"] = "RANGE"
+
+    score = 0
+
+    if hh:
+        score += 25
+
+    if hl:
+        score += 25
+
+    if lh:
+        score += 25
+
+    if ll:
+        score += 25
+
+    result["trend_strength"] = score
+
+    return result
+
+
+def detect_break_of_structure(candles: List[dict], structure: dict) -> dict:
+    """
+    Detect valid Smart Money Break of Structure (BOS).
+
+    Returns:
+    {
+        "bullish_bos": bool,
+        "bearish_bos": bool,
+        "direction": "BUY" | "SELL" | None,
+        "broken_level": float | None,
+        "strength": int
+    }
+    """
+
+    result = {
+        "bullish_bos": False,
+        "bearish_bos": False,
+        "direction": None,
+        "broken_level": None,
+        "strength": 0,
+    }
+
+    if len(candles) < 5:
+        return result
+
+    atr_value = atr(candles)
+
+    if atr_value <= 0:
+        return result
+
+    last_close = candles[-1]["close"]
+
+    last_high = structure.get("last_high")
+    last_low = structure.get("last_low")
+
+    if last_high:
+
+        breakout = last_close - last_high
+
+        # Require breakout greater than 15% ATR
+        if breakout > atr_value * 0.15:
+
+            result["bullish_bos"] = True
+            result["direction"] = "BUY"
+            result["broken_level"] = last_high
+
+            strength = min(
+                100,
+                int((breakout / atr_value) * 100)
+            )
+
+            result["strength"] = strength
+
+    if last_low:
+
+        breakout = last_low - last_close
+
+        if breakout > atr_value * 0.15:
+
+            result["bearish_bos"] = True
+            result["direction"] = "SELL"
+            result["broken_level"] = last_low
+
+            strength = min(
+                100,
+                int((breakout / atr_value) * 100)
+            )
+
+            result["strength"] = strength
+
+    return result
+
+
+def detect_change_of_character(
+    candles: List[dict],
+    structure: dict,
+    bos: dict,
+) -> dict:
+    """
+    Detect Smart Money Change of Character (CHoCH).
+
+    CHoCH signals a possible trend reversal after an existing trend.
+    """
+
+    result = {
+        "bullish_choch": False,
+        "bearish_choch": False,
+        "direction": None,
+        "strength": 0,
+    }
+
+    if len(candles) < 20:
+        return result
+
+    trend = structure.get("trend")
+
+    atr_value = atr(candles)
+
+    if atr_value <= 0:
+        return result
+
+    last_close = candles[-1]["close"]
+
+    previous_high = structure.get("previous_high")
+    previous_low = structure.get("previous_low")
+
+    # ---------------------------------------
+    # Bearish trend reversing bullish
+    # ---------------------------------------
+
+    if trend == "BEARISH":
+
+        if previous_high:
+
+            breakout = last_close - previous_high
+
+            if breakout > atr_value * 0.20:
+
+                result["bullish_choch"] = True
+                result["direction"] = "BUY"
+
+                result["strength"] = min(
+                    100,
+                    int((breakout / atr_value) * 100)
+                )
+
+    # ---------------------------------------
+    # Bullish trend reversing bearish
+    # ---------------------------------------
+
+    elif trend == "BULLISH":
+
+        if previous_low:
+
+            breakout = previous_low - last_close
+
+            if breakout > atr_value * 0.20:
+
+                result["bearish_choch"] = True
+                result["direction"] = "SELL"
+
+                result["strength"] = min(
+                    100,
+                    int((breakout / atr_value) * 100)
+                )
+
+    return result
+
+
+def detect_liquidity_sweeps(
+    candles: List[dict],
+    lookback: int = 20,
+) -> dict:
+    """
+    Detect Smart Money liquidity sweeps.
+
+    Looks for:
+    - Buy-side liquidity sweep
+    - Sell-side liquidity sweep
+
+    Returns:
+    {
+        "buy_side_sweep": bool,
+        "sell_side_sweep": bool,
+        "direction": "BUY" | "SELL" | None,
+        "strength": int
+    }
+    """
+
+    result = {
+        "buy_side_sweep": False,
+        "sell_side_sweep": False,
+        "direction": None,
+        "strength": 0,
+    }
+
+    if len(candles) < lookback + 2:
+        return result
+
+    recent = candles[-lookback-1:-1]
+
+    highest = max(c["high"] for c in recent)
+    lowest = min(c["low"] for c in recent)
+
+    last = candles[-1]
+
+    atr_value = atr(candles)
+
+    if atr_value <= 0:
+        return result
+
+    # -----------------------------------------
+    # Buy-side Liquidity Sweep
+    # -----------------------------------------
+
+    if (
+        last["high"] > highest
+        and last["close"] < highest
+    ):
+
+        penetration = last["high"] - highest
+
+        if penetration > atr_value * 0.10:
+
+            result["buy_side_sweep"] = True
+            result["direction"] = "SELL"
+
+            result["strength"] = min(
+                100,
+                int((penetration / atr_value) * 100)
+            )
+
+    # -----------------------------------------
+    # Sell-side Liquidity Sweep
+    # -----------------------------------------
+
+    if (
+        last["low"] < lowest
+        and last["close"] > lowest
+    ):
+
+        penetration = lowest - last["low"]
+
+        if penetration > atr_value * 0.10:
+
+            result["sell_side_sweep"] = True
+            result["direction"] = "BUY"
+
+            result["strength"] = min(
+                100,
+                int((penetration / atr_value) * 100)
+            )
+
+    return result
+
+
+def detect_equal_highs_lows(
+    candles: List[dict],
+    tolerance_atr: float = 0.15,
+) -> dict:
+    """
+    Detect Equal Highs / Equal Lows (Liquidity Pools)
+
+    Uses swing highs and lows instead of raw candle highs.
+    """
+
+    result = {
+        "equal_highs": False,
+        "equal_lows": False,
+        "equal_high_price": None,
+        "equal_low_price": None,
+        "strength": 0,
+    }
+
+    swing_highs, swing_lows = detect_swings(candles, 3)
+
+    atr_value = atr(candles)
+
+    if atr_value <= 0:
+        return result
+
+    tolerance = atr_value * tolerance_atr
+
+    # ------------------------------------
+    # Equal Highs
+    # ------------------------------------
+
+    if len(swing_highs) >= 2:
+
+        h1 = swing_highs[-1]["price"]
+        h2 = swing_highs[-2]["price"]
+
+        if abs(h1 - h2) <= tolerance:
+
+            result["equal_highs"] = True
+            result["equal_high_price"] = (h1 + h2) / 2
+
+            score = 100 - int((abs(h1 - h2) / tolerance) * 100)
+
+            result["strength"] = max(score, result["strength"])
+
+    # ------------------------------------
+    # Equal Lows
+    # ------------------------------------
+
+    if len(swing_lows) >= 2:
+
+        l1 = swing_lows[-1]["price"]
+        l2 = swing_lows[-2]["price"]
+
+        if abs(l1 - l2) <= tolerance:
+
+            result["equal_lows"] = True
+            result["equal_low_price"] = (l1 + l2) / 2
+
+            score = 100 - int((abs(l1 - l2) / tolerance) * 100)
+
+            result["strength"] = max(score, result["strength"])
+
+    return result
+
+
+def detect_order_blocks(
+    candles: List[dict],
+    structure: dict,
+    bos: dict,
+    choch: dict,
+) -> dict:
+    """
+    Detect Institutional Order Blocks.
+
+    A bullish OB is the last bearish candle before a valid bullish BOS.
+    A bearish OB is the last bullish candle before a valid bearish BOS.
+    """
+
+    result = {
+        "bullish_order_block": None,
+        "bearish_order_block": None,
+        "direction": None,
+        "strength": 0,
+    }
+
+    if len(candles) < 15:
+        return result
+
+    # -------------------------
+    # Bullish Order Block
+    # -------------------------
+
+    if bos["bullish_bos"] or choch["bullish_choch"]:
+
+        for i in range(len(candles)-2, 5, -1):
+
+            candle = candles[i]
+
+            if candle["close"] < candle["open"]:
+
+                result["bullish_order_block"] = {
+                    "high": candle["high"],
+                    "low": candle["low"],
+                    "index": i,
+                }
+
+                result["direction"] = "BUY"
+
+                break
+
+    # -------------------------
+    # Bearish Order Block
+    # -------------------------
+
+    if bos["bearish_bos"] or choch["bearish_choch"]:
+
+        for i in range(len(candles)-2, 5, -1):
+
+            candle = candles[i]
+
+            if candle["close"] > candle["open"]:
+
+                result["bearish_order_block"] = {
+                    "high": candle["high"],
+                    "low": candle["low"],
+                    "index": i,
+                }
+
+                result["direction"] = "SELL"
+
+                break
+
+    score = 0
+
+    if bos["bullish_bos"] or bos["bearish_bos"]:
+        score += 40
+
+    if choch["bullish_choch"] or choch["bearish_choch"]:
+        score += 25
+
+    if structure["trend"] != "RANGING":
+        score += 20
+
+    if result["direction"] is not None:
+        score += 15
+
+    result["strength"] = min(score, 100)
+
+    return result
+
+
+def detect_fair_value_gaps(candles: List[dict]) -> dict:
+    """
+    Detect Fair Value Gaps (FVG).
+
+    A bullish FVG exists when:
+        Candle1 High < Candle3 Low
+
+    A bearish FVG exists when:
+        Candle1 Low > Candle3 High
+    """
+
+    result = {
+        "bullish_fvg": None,
+        "bearish_fvg": None,
+        "direction": None,
+        "strength": 0,
+    }
+
+    if len(candles) < 3:
+        return result
+
+    atr_value = atr(candles)
+
+    if atr_value <= 0:
+        return result
+
+    # Scan newest to oldest
+    for i in range(len(candles) - 3, 0, -1):
+
+        c1 = candles[i]
+        c2 = candles[i + 1]
+        c3 = candles[i + 2]
+
+        # -------------------------
+        # Bullish FVG
+        # -------------------------
+
+        if c1["high"] < c3["low"]:
+
+            gap = c3["low"] - c1["high"]
+
+            if gap > atr_value * 0.10:
+
+                result["bullish_fvg"] = {
+                    "top": c3["low"],
+                    "bottom": c1["high"],
+                    "index": i + 1,
+                }
+
+                result["direction"] = "BUY"
+
+                result["strength"] = min(
+                    100,
+                    int((gap / atr_value) * 100)
+                )
+
+                break
+
+        # -------------------------
+        # Bearish FVG
+        # -------------------------
+
+        if c1["low"] > c3["high"]:
+
+            gap = c1["low"] - c3["high"]
+
+            if gap > atr_value * 0.10:
+
+                result["bearish_fvg"] = {
+                    "top": c1["low"],
+                    "bottom": c3["high"],
+                    "index": i + 1,
+                }
+
+                result["direction"] = "SELL"
+
+                result["strength"] = min(
+                    100,
+                    int((gap / atr_value) * 100)
+                )
+
+                break
+
+    return result
+
+
+def detect_premium_discount(
+    candles: List[dict],
+    structure: dict,
+) -> dict:
+    """
+    Detect Premium and Discount zones based on the latest market structure.
+    """
+
+    result = {
+        "premium_zone": False,
+        "discount_zone": False,
+        "equilibrium": None,
+        "current_price": None,
+    }
+
+    last_high = structure.get("last_high")
+    last_low = structure.get("last_low")
+
+    if last_high is None or last_low is None:
+        return result
+
+    current_price = candles[-1]["close"]
+
+    equilibrium = (last_high + last_low) / 2
+
+    result["equilibrium"] = equilibrium
+    result["current_price"] = current_price
+
+    if current_price > equilibrium:
+        result["premium_zone"] = True
+
+    elif current_price < equilibrium:
+        result["discount_zone"] = True
+
+    return result
+
+
+def analyze_smart_money(candles: List[dict]) -> dict:
+    """
+    Complete Smart Money Analysis Engine.
+
+    Runs all Smart Money modules and returns one object.
+    """
+
+    structure = analyze_market_structure(candles)
+
+    bos = detect_break_of_structure(
+        candles,
+        structure,
+    )
+
+    choch = detect_change_of_character(
+        candles,
+        structure,
+        bos,
+    )
+
+    liquidity = detect_liquidity_sweeps(
+        candles,
+    )
+
+    equal_levels = detect_equal_highs_lows(
+        candles,
+    )
+
+    order_blocks = detect_order_blocks(
+        candles,
+        structure,
+        bos,
+        choch,
+    )
+
+    fvg = detect_fair_value_gaps(
+        candles,
+    )
+
+    premium_discount = detect_premium_discount(
+        candles,
+        structure,
+    )
+
+    return {
+        "structure": structure,
+        "bos": bos,
+        "choch": choch,
+        "liquidity": liquidity,
+        "equal_levels": equal_levels,
+        "order_blocks": order_blocks,
+        "fvg": fvg,
+        "premium_discount": premium_discount,
+    }
+
+
+def calculate_confluence(
+    htf_trend: str,
+    smc: dict,
+    momentum_bullish: bool,
+    momentum_bearish: bool,
+) -> dict:
+    """
+    Combines Smart Money + Indicators into one decision.
+
+    Returns:
+    {
+        agreement,
+        direction,
+        score,
+        reasons
+    }
+    """
+
+    result = {
+        "agreement": False,
+        "direction": None,
+        "score": 0,
+        "reasons": [],
+    }
+
+    score = 0
+
+    structure = smc["structure"]
+    bos = smc["bos"]
+    choch = smc["choch"]
+    liquidity = smc["liquidity"]
+    fvg = smc["fvg"]
+    premium = smc["premium_discount"]
+
+    # ----------------------------------
+    # BUY CONFLUENCE
+    # ----------------------------------
+
+    if htf_trend == "BULLISH":
+
+        score += 15
+        result["reasons"].append("HTF_BULL")
+
+        if momentum_bullish:
+            score += 10
+            result["reasons"].append("MOMENTUM")
+
+        if structure["trend"] == "BULLISH":
+            score += 20
+            result["reasons"].append("SMC_BULL")
+
+        if bos["bullish_bos"]:
+            score += 15
+            result["reasons"].append("BOS")
+
+        if liquidity["sell_side_sweep"]:
+            score += 15
+            result["reasons"].append("LIQUIDITY")
+
+        if fvg["bullish_fvg"]:
+            score += 10
+            result["reasons"].append("FVG")
+
+        if premium["discount_zone"]:
+            score += 15
+            result["reasons"].append("DISCOUNT")
+
+        if score >= 60:
+            result["agreement"] = True
+            result["direction"] = "BUY"
+
+    # ----------------------------------
+    # SELL CONFLUENCE
+    # ----------------------------------
+
+    elif htf_trend == "BEARISH":
+
+        score += 15
+        result["reasons"].append("HTF_BEAR")
+
+        if momentum_bearish:
+            score += 10
+            result["reasons"].append("MOMENTUM")
+
+        if structure["trend"] == "BEARISH":
+            score += 20
+            result["reasons"].append("SMC_BEAR")
+
+        if bos["bearish_bos"]:
+            score += 15
+            result["reasons"].append("BOS")
+
+        if liquidity["buy_side_sweep"]:
+            score += 15
+            result["reasons"].append("LIQUIDITY")
+
+        if fvg["bearish_fvg"]:
+            score += 10
+            result["reasons"].append("FVG")
+
+        if premium["premium_zone"]:
+            score += 15
+            result["reasons"].append("PREMIUM")
+
+        if score >= 60:
+            result["agreement"] = True
+            result["direction"] = "SELL"
+
+    result["score"] = score
+
+    return result
+
+
+def key_support_resistance(candles: List[dict]):
+    """
+    Returns nearest structural support and resistance.
+    """
+
+    swing_highs, swing_lows = detect_swings(candles, 5)
+
+    if not swing_highs or not swing_lows:
+        highs = [c["high"] for c in candles[-20:]]
+        lows = [c["low"] for c in candles[-20:]]
+        return min(lows), max(highs)
+
+    resistance = max(h["price"] for h in swing_highs[-3:])
+    support = min(l["price"] for l in swing_lows[-3:])
+
+    return support, resistance
 
 def detect_regime(candles: List[dict]) -> str:
     if len(candles) < 30: return "RANGING"
@@ -583,6 +1451,38 @@ def analyze_xauusd(ltf, mtf, htf, symbol):
     structure = market_structure(ltf)
     key_sup, key_res = key_support_resistance(ltf)
 
+    # ---------------------------------------------------
+    # SMART MONEY ENGINE
+    # ---------------------------------------------------
+
+    smc = analyze_smart_money(ltf)
+
+    bos = smc["bos"]
+    choch = smc["choch"]
+    liquidity = smc["liquidity"]
+    equal_levels = smc["equal_levels"]
+    order_blocks = smc["order_blocks"]
+    fvg = smc["fvg"]
+    premium_discount = smc["premium_discount"]
+
+    smc_structure = smc["structure"]
+
+    logger.info("DEBUG SMC TYPE: %s", type(smc_structure))
+    logger.info("DEBUG SMC VALUE: %s", smc_structure)
+
+    logger.info(
+        "SMC %s | Trend=%s | Structure=%s | HH=%s | HL=%s | LH=%s | LL=%s | LastHigh=%.2f | LastLow=%.2f",
+        symbol,
+        smc_structure["trend"],
+        smc_structure["structure"],
+        smc_structure["higher_high"],
+        smc_structure["higher_low"],
+        smc_structure["lower_high"],
+        smc_structure["lower_low"],
+        smc_structure["last_high"] or 0,
+        smc_structure["last_low"] or 0,
+    )
+
     mtf_closes = [c["close"] for c in mtf] if mtf else closes_ltf
     mtf_ema21 = ema(mtf_closes, 21); mtf_ema50 = ema(mtf_closes, 50)
     mtf_trend = "BULLISH" if mtf_ema21 > mtf_ema50 else "BEARISH"
@@ -599,6 +1499,27 @@ def analyze_xauusd(ltf, mtf, htf, symbol):
     price = closes_ltf[-1]
     recent_high = max(highs_ltf[-15:]); recent_low = min(lows_ltf[-15:])
     buy, sell, setups = 0, 0, []
+
+    buy_confluence = 0
+    sell_confluence = 0
+
+    # -------------------------------------------------------
+    # SMART MONEY - BREAK OF STRUCTURE (BOS)
+    # -------------------------------------------------------
+
+    if bos["bullish_bos"]:
+
+        buy += 10
+        buy_confluence += 1
+
+        setups.append("BULLISH_BOS")
+
+    elif bos["bearish_bos"]:
+
+        sell += 10
+        sell_confluence += 1
+
+        setups.append("BEARISH_BOS")
 
     if htf_trend == "BULLISH" and mtf_trend == "BULLISH":
         buy += 20; setups.append("HTF_MTF_BULL")

@@ -95,6 +95,11 @@ MT5_RESTART_INTERVAL_SEC  = int(os.environ.get("MT5_RESTART_INTERVAL", "3600")) 
 # the worker. Kept short on purpose: a single slow/wrong server costs at most
 # this long, once, before the account is skipped.
 LOGIN_TIMEOUT_MS          = int(os.environ.get("MT5_LOGIN_TIMEOUT_MS", "8000"))   # 8s
+# A COLD terminal relaunch (after a crash / IPC death) needs far longer than a
+# warm login — 8s isn't enough for terminal64.exe to start AND re-establish the
+# IPC pipe, which is why recovery kept failing. Use a patient timeout + retries.
+INIT_TIMEOUT_MS           = int(os.environ.get("MT5_INIT_TIMEOUT_MS", "30000"))   # 30s
+INIT_RETRIES              = int(os.environ.get("MT5_INIT_RETRIES", "3"))
 # How many TRANSIENT (non-deterministic) failures before we give up on an
 # account and mark it FAILED. Protects a GOOD account from being permanently
 # failed by a momentary network blip, while still bounding pointless churn.
@@ -154,14 +159,34 @@ def restart_mt5_if_needed() -> None:
         _last_mt5_restart = time.time()
 
 
+def _init_with_retries() -> bool:
+    """Bring the terminal up, allowing a cold start time to establish the pipe.
+    Retries with growing waits so a freshly-relaunched (or crashed) terminal
+    isn't given up on after a single short timeout."""
+    for attempt in range(1, INIT_RETRIES + 1):
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        time.sleep(2 * attempt)        # 2s, 4s, 6s — let the process die/relaunch
+        try:
+            if mt5.initialize(path=TERMINAL_PATH, timeout=INIT_TIMEOUT_MS):
+                if attempt > 1:
+                    logger.info("✅ MT5 recovered on init attempt %d", attempt)
+                return True
+        except Exception as e:
+            logger.warning("init attempt %d exception: %s", attempt, e)
+        logger.warning("init attempt %d/%d failed: %s",
+                       attempt, INIT_RETRIES, mt5.last_error())
+    return False
+
+
 def ensure_mt5_alive() -> bool:
-    """Check terminal is alive; reconnect if not."""
+    """Check terminal is alive; reconnect (with patient retries) if not."""
     if not mt5.terminal_info():
         logger.warning("⚠️ MT5 disconnected — reconnecting")
         with MT5_LOCK:
-            mt5.shutdown()
-            time.sleep(2)
-            return mt5.initialize(path=TERMINAL_PATH, timeout=LOGIN_TIMEOUT_MS)
+            return _init_with_retries()
     return True
 
 
@@ -186,10 +211,15 @@ def should_skip_due_to_backoff(account_login: str) -> bool:
 # TERMINAL HEALTH (IPC)
 # ==============================================================================
 def _ipc_is_dead() -> bool:
-    """True if the last MT5 error is the -10004 'No IPC connection' pipe loss."""
+    """True if the last MT5 error is an IPC/terminal pipe failure.
+    The old check only caught -10004; the real wedger in the logs is -10001
+    ('IPC send failed') — a login to a dead/unknown server hangs the terminal
+    and breaks the pipe. Catch the whole internal-IPC family so the terminal
+    actually gets rebuilt instead of the worker looping 'unrecoverable'."""
     try:
         err = mt5.last_error()
-        return isinstance(err, tuple) and err and err[0] == -10004
+        return (isinstance(err, tuple) and err
+                and err[0] in (-10001, -10002, -10003, -10004))
     except Exception:
         return False
 
@@ -206,16 +236,12 @@ def _rebuild_terminal() -> bool:
     except Exception:
         pass
     time.sleep(1.5)
-    try:
-        ok = mt5.initialize(path=TERMINAL_PATH, timeout=LOGIN_TIMEOUT_MS)
-        if ok:
-            logger.info("🔄 Rebuilt MT5 terminal after IPC loss")
-        else:
-            logger.warning("⚠️ Terminal rebuild failed: %s", mt5.last_error())
-        return ok
-    except Exception as e:
-        logger.warning("⚠️ Terminal rebuild exception: %s", e)
-        return False
+    ok = _init_with_retries()
+    if ok:
+        logger.info("🔄 Rebuilt MT5 terminal after IPC loss")
+    else:
+        logger.warning("⚠️ Terminal rebuild failed: %s", mt5.last_error())
+    return ok
 
 
 # ==============================================================================
@@ -288,6 +314,9 @@ def _connect_account(login_int: int, password: str, server: str) -> Tuple[bool, 
         err = mt5.last_error()
 
         # IPC pipe dead → rebuild the terminal once, then one clean retry.
+        # If it STILL dies on this same account, this account's server is what's
+        # wedging the terminal — flag it 'ipc_wedge' so it gets failed fast and
+        # removed from the queue instead of re-crashing the terminal every cycle.
         if _ipc_is_dead():
             if _rebuild_terminal():
                 if mt5.login(login_int, password=password, server=server,
@@ -295,7 +324,7 @@ def _connect_account(login_int: int, password: str, server: str) -> Tuple[bool, 
                     info = mt5.account_info()
                     if info and str(info.login) == str(login_int):
                         return True, ""
-            return False, "transient"
+            return False, "ipc_wedge"
         
         logger.warning(
             "MT5 login failed | login=%s | server=%s | error=%s",
@@ -445,6 +474,30 @@ def verify_one_account(account: ClientMT5Account, db: Session) -> bool:
             _safe_commit(db)
             logger.info("⛔ %s FAILED (bad login/password) — skipping until resubmit",
                         login_str)
+            return False
+
+        # ── IPC WEDGE — this account's server keeps crashing the terminal ─────
+        # Fail it fast (2 strikes) so it can't keep taking the whole queue down.
+        if kind == "ipc_wedge":
+            _failure_count[login_str] += 1
+            if _failure_count[login_str] >= 2:
+                account.verification_status = "FAILED"
+                account.is_verified = False
+                if hasattr(account, "verification_error"):
+                    account.verification_error = (
+                        f'Couldn\'t reach server "{account.server}". It may be '
+                        f"offline, or not added in the trading terminal yet. "
+                        f"Check the exact server name in your MT5 app "
+                        f"(e.g. 'Exness-MT5Real8') and tap Connect to retry."
+                    )
+                _safe_commit(db)
+                logger.warning("⛔ %s FAILED (server '%s' wedged the terminal) — skipping",
+                               login_str, account.server)
+            else:
+                account.verification_status = "PENDING"
+                _safe_commit(db)
+                logger.info("… %s ipc_wedge on '%s' — strike %d/2",
+                            login_str, account.server, _failure_count[login_str])
             return False
 
         # ── TRANSIENT — retry with backoff, give up after the cap ────────────

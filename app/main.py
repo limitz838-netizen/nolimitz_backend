@@ -33,6 +33,7 @@ from app.ai.routes.license_verify import router as license_verify_router
 from app.ai.routes.worker import router as worker_router
 from app.ai.routes.ai_chart_scanner import router as chart_scanner_router
 from app.ai.routes.manual_trade import router as manual_trade_router
+from app.routers.deriv import router as deriv_router
 
 Base.metadata.create_all(bind=engine)
 
@@ -117,6 +118,7 @@ app.include_router(license_verify_router)
 app.include_router(worker_router)
 app.include_router(chart_scanner_router)
 app.include_router(manual_trade_router)
+app.include_router(deriv_router)
 
 
 @app.get("/")
