@@ -1,9 +1,8 @@
 """
-NolimitzBots — Deriv OAuth 2.0 (PKCE) Router  [v3 — user_id based]
-==================================================================
+NolimitzBots — Deriv OAuth 2.0 (PKCE) Router  [v4 — themed result page]
+=======================================================================
 Deriv connection is available to ALL signed-in users (free + licensed).
-Connections are keyed on the user's account ID from NolimitzBots signup,
-NOT on a license key. License keys only gate the MT5 multi-broker features.
+Connections are keyed on the user's account ID from NolimitzBots signup.
 
 Endpoints:
   GET    /auth/deriv/login?user_id=XXX    -> redirect to Deriv login
@@ -16,8 +15,10 @@ Wire-up in main.py (unchanged):
   init_deriv_tables()
   app.include_router(deriv_router)
 
-Note: the DB column is still named license_key (kept to avoid a migration
-on the live Postgres tables) — it simply stores the user_id now.
+v4 changes:
+  - Result page restyled to the NolimitzBots black/gold theme
+  - Success page auto-redirects to https://nolimitzbots.co.ke/ after 3s
+  - "Back to NolimitzBots" button links to the website (no dead deep link)
 """
 
 import base64
@@ -41,6 +42,8 @@ DERIV_AUTH_URL = "https://auth.deriv.com/oauth2/auth"
 DERIV_TOKEN_URL = "https://auth.deriv.com/oauth2/token"
 DERIV_API_BASE = "https://api.derivws.com/trading/v1/options"
 DERIV_SCOPES = "trade account_manage"
+
+WEBSITE_URL = "https://nolimitzbots.co.ke/"  # where users return after connecting
 
 router = APIRouter(prefix="/auth/deriv", tags=["deriv-oauth"])
 
@@ -256,29 +259,39 @@ def get_deriv_token(user_id: str) -> str | None:
 
 # ------------------------------------------------------------ RESULT PAGE ---
 def _result_page(ok: bool, msg: str) -> str:
+    """NolimitzBots black/gold themed result page.
+    On success: auto-redirects back to the website after 3 seconds."""
     color = "#22c55e" if ok else "#ef4444"
     icon = "&#10003;" if ok else "&#10007;"
     title = "Connected!" if ok else "Connection failed"
+    redirect = (
+        f'<meta http-equiv="refresh" content="3;url={WEBSITE_URL}">' if ok else ""
+    )
+    note = "Taking you back to NolimitzBots&hellip;" if ok else msg
     return f"""<!doctype html>
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NolimitzBots</title><style>
+<title>NolimitzBots</title>{redirect}<style>
   body{{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
-       background:linear-gradient(135deg,#0b1220,#101c33);font-family:-apple-system,
-       Segoe UI,Roboto,sans-serif;color:#e8eefc}}
-  .card{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);
+       background:linear-gradient(135deg,#0a0804,#171204);font-family:-apple-system,
+       Segoe UI,Roboto,sans-serif;color:#f5efdc}}
+  .card{{background:rgba(255,215,120,.05);border:1px solid rgba(212,175,55,.35);
        backdrop-filter:blur(18px);border-radius:20px;padding:40px 32px;text-align:center;
-       max-width:340px;box-shadow:0 20px 60px rgba(0,0,0,.4)}}
+       max-width:340px;box-shadow:0 20px 60px rgba(0,0,0,.55)}}
+  .brand{{font-size:13px;letter-spacing:2px;color:#d4af37;font-weight:700;
+       margin-bottom:16px;text-transform:uppercase}}
   .icon{{width:64px;height:64px;border-radius:50%;background:{color}22;color:{color};
        display:flex;align-items:center;justify-content:center;font-size:30px;
        margin:0 auto 18px;border:2px solid {color}}}
-  h1{{font-size:20px;margin:0 0 8px}} p{{opacity:.75;font-size:14px;margin:0 0 22px}}
-  .btn{{display:inline-block;background:#3b82f6;color:#fff;text-decoration:none;
-       padding:12px 28px;border-radius:12px;font-weight:600;font-size:14px}}
+  h1{{font-size:20px;margin:0 0 8px;color:#fff}}
+  p{{opacity:.7;font-size:14px;margin:0 0 22px}}
+  .btn{{display:inline-block;background:#c9a227;color:#141005;text-decoration:none;
+       padding:12px 28px;border-radius:12px;font-weight:700;font-size:14px}}
 </style></head><body>
   <div class="card">
+    <div class="brand">NolimitzBots AI</div>
     <div class="icon">{icon}</div>
     <h1>{title}</h1>
-    <p>{msg}. You can return to the NolimitzBots app.</p>
-    <a class="btn" href="nolimitzbots://deriv-connected">Back to app</a>
+    <p>{note}</p>
+    <a class="btn" href="{WEBSITE_URL}">Back to NolimitzBots</a>
   </div>
 </body></html>"""
