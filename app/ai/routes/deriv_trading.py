@@ -180,7 +180,7 @@ async def deriv_buy(
     proposal: dict = {
         "proposal": 1,
         "contract_type": ctype,
-        "symbol": symbol,
+        "underlying_symbol": symbol,
         "amount": stake,
         "basis": "stake",
         "currency": currency,
