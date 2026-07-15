@@ -1,19 +1,23 @@
 """
-NolimitzBots — Deriv OAuth 2.0 (PKCE) Router  [v2 — SQLAlchemy/Postgres]
-========================================================================
-Uses the project's existing SQLAlchemy engine (app.database), so it works
-with the Render Postgres database — no separate SQLite file.
+NolimitzBots — Deriv OAuth 2.0 (PKCE) Router  [v3 — user_id based]
+==================================================================
+Deriv connection is available to ALL signed-in users (free + licensed).
+Connections are keyed on the user's account ID from NolimitzBots signup,
+NOT on a license key. License keys only gate the MT5 multi-broker features.
 
 Endpoints:
-  GET    /auth/deriv/login?license_key=XXX   -> redirect to Deriv login
-  GET    /auth/deriv/callback                -> Deriv redirects here
-  GET    /auth/deriv/status?license_key=XXX  -> {"connected": bool, ...}
-  DELETE /auth/deriv/disconnect?license_key=XXX
+  GET    /auth/deriv/login?user_id=XXX    -> redirect to Deriv login
+  GET    /auth/deriv/callback             -> Deriv redirects here
+  GET    /auth/deriv/status?user_id=XXX   -> {"connected": bool, ...}
+  DELETE /auth/deriv/disconnect?user_id=XXX
 
-Wire-up in main.py:
+Wire-up in main.py (unchanged):
   from app.ai.routes.deriv_oauth import router as deriv_router, init_deriv_tables
-  init_deriv_tables()          # after Base.metadata.create_all(...)
+  init_deriv_tables()
   app.include_router(deriv_router)
+
+Note: the DB column is still named license_key (kept to avoid a migration
+on the live Postgres tables) — it simply stores the user_id now.
 """
 
 import base64
@@ -22,7 +26,7 @@ import secrets
 import time
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import text
 
@@ -69,24 +73,6 @@ def init_deriv_tables():
         )
 
 
-def _license_exists(license_key: str) -> bool:
-    """
-    Checks the licenses table. Adjust table/column names if yours differ —
-    e.g. if your model's __tablename__ is 'licenses' and the column is 'key',
-    change the query to:  SELECT 1 FROM licenses WHERE key = :k
-    """
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT 1 FROM licenses WHERE license_key = :k LIMIT 1"),
-                {"k": license_key},
-            ).fetchone()
-        return row is not None
-    except Exception:
-        # Table/column name mismatch — don't block the flow; fix the query.
-        return True
-
-
 # ------------------------------------------------------------------ PKCE ---
 def _make_pkce():
     verifier = secrets.token_urlsafe(64)[:128]
@@ -100,10 +86,8 @@ def _make_pkce():
 
 # ------------------------------------------------------------- ENDPOINTS ---
 @router.get("/login")
-def deriv_login(license_key: str = Query(..., min_length=4)):
-    if not _license_exists(license_key):
-        raise HTTPException(404, "Unknown license key")
-
+def deriv_login(user_id: str = Query(..., min_length=1)):
+    """Open to all signed-in users — free scanner users included."""
     verifier, challenge = _make_pkce()
     state = secrets.token_urlsafe(32)
     now = int(time.time())
@@ -117,9 +101,9 @@ def deriv_login(license_key: str = Query(..., min_length=4)):
             text(
                 "INSERT INTO deriv_oauth_sessions "
                 "(state, license_key, code_verifier, created_at) "
-                "VALUES (:s, :lk, :cv, :ca)"
+                "VALUES (:s, :uid, :cv, :ca)"
             ),
-            {"s": state, "lk": license_key, "cv": verifier, "ca": now},
+            {"s": state, "uid": user_id, "cv": verifier, "ca": now},
         )
 
     auth_url = (
@@ -153,7 +137,7 @@ async def deriv_callback(code: str = "", state: str = "", error: str = ""):
     if row is None:
         return HTMLResponse(_result_page(False, "Invalid or expired session"))
 
-    license_key, verifier = row[0], row[1]
+    user_id, verifier = row[0], row[1]
 
     async with httpx.AsyncClient(timeout=20) as http:
         resp = await http.post(
@@ -201,7 +185,7 @@ async def deriv_callback(code: str = "", state: str = "", error: str = ""):
                 """INSERT INTO deriv_connections
                        (license_key, access_token, refresh_token, token_type,
                         expires_at, connected_at, accounts_json)
-                   VALUES (:lk, :at, :rt, :tt, :ea, :ca, :aj)
+                   VALUES (:uid, :at, :rt, :tt, :ea, :ca, :aj)
                    ON CONFLICT (license_key) DO UPDATE SET
                        access_token  = EXCLUDED.access_token,
                        refresh_token = EXCLUDED.refresh_token,
@@ -211,7 +195,7 @@ async def deriv_callback(code: str = "", state: str = "", error: str = ""):
                        accounts_json = EXCLUDED.accounts_json"""
             ),
             {
-                "lk": license_key,
+                "uid": user_id,
                 "at": access_token,
                 "rt": refresh_token,
                 "tt": tok.get("token_type", "Bearer"),
@@ -225,14 +209,14 @@ async def deriv_callback(code: str = "", state: str = "", error: str = ""):
 
 
 @router.get("/status")
-def deriv_status(license_key: str = Query(...)):
+def deriv_status(user_id: str = Query(...)):
     with engine.connect() as conn:
         row = conn.execute(
             text(
                 "SELECT expires_at, connected_at, accounts_json "
-                "FROM deriv_connections WHERE license_key = :lk"
+                "FROM deriv_connections WHERE license_key = :uid"
             ),
-            {"lk": license_key},
+            {"uid": user_id},
         ).fetchone()
     if row is None:
         return {"connected": False}
@@ -245,25 +229,25 @@ def deriv_status(license_key: str = Query(...)):
 
 
 @router.delete("/disconnect")
-def deriv_disconnect(license_key: str = Query(...)):
+def deriv_disconnect(user_id: str = Query(...)):
     with engine.begin() as conn:
         conn.execute(
-            text("DELETE FROM deriv_connections WHERE license_key = :lk"),
-            {"lk": license_key},
+            text("DELETE FROM deriv_connections WHERE license_key = :uid"),
+            {"uid": user_id},
         )
     return {"disconnected": True}
 
 
 # ------------------------------------------------- HELPER FOR THE WORKER ---
-def get_deriv_token(license_key: str) -> str | None:
+def get_deriv_token(user_id: str) -> str | None:
     """deriv_worker.py calls this before trading for a user."""
     with engine.connect() as conn:
         row = conn.execute(
             text(
                 "SELECT access_token, expires_at "
-                "FROM deriv_connections WHERE license_key = :lk"
+                "FROM deriv_connections WHERE license_key = :uid"
             ),
-            {"lk": license_key},
+            {"uid": user_id},
         ).fetchone()
     if row is None or row[1] <= int(time.time()):
         return None
