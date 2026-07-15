@@ -32,6 +32,7 @@ from app.ai.routes.ai_chart_scanner import router as chart_scanner_router
 from app.ai.routes.ai_market import router as ai_market_router
 from app.ai.routes.client_mt5 import router as client_mt5_router
 from app.ai.routes.deriv_oauth import router as deriv_router, init_deriv_tables
+from app.ai.routes.deriv_trading import router as deriv_trading_router
 from app.ai.routes.license_verify import router as license_verify_router
 from app.ai.routes.live_market import router as live_market_router
 from app.ai.routes.manual_trade import router as manual_trade_router
@@ -126,6 +127,7 @@ app.include_router(worker_router)
 app.include_router(chart_scanner_router)
 app.include_router(manual_trade_router)
 app.include_router(deriv_router)  # /auth/deriv/... (OAuth 2.0 + PKCE)
+app.include_router(deriv_trading_router)
 
 
 @app.get("/")
