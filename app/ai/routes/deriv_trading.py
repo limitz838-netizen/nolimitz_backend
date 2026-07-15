@@ -141,7 +141,7 @@ async def deriv_symbols():
     """Public — list tradeable symbols (Volatility, Boom/Crash, forex...)."""
     msg = await _ws_call(
         WS_PUBLIC,
-        {"active_symbols": "brief", "product_type": "basic", "req_id": 1},
+        {"active_symbols": "brief", "req_id": 1},
         "active_symbols",
     )
     return {"symbols": msg.get("active_symbols", [])}
