@@ -13,29 +13,34 @@ from sqlalchemy.orm import Session
 from app.auth import hash_password
 from app.database import Base, SessionLocal, engine
 from app.models import Admin, AdminProfile
+
+# ------------------------------------------------------- Core routers ---
 from app.routers import mt5_workers
 from app.routers.admin import router as admin_router
+from app.routers.client import router as client_router
 from app.routers.copier import router as copier_router
+from app.routers.ea import router as ea_router
+from app.routers.license import router as license_router
 from app.routers.master_account import router as master_account_router
 from app.routers.robot import router as robot_router
 from app.routers.signals import router as signals_router
-from app.routers import mt5_workers
-from app.routers.client import router as client_router
-from app.routers.ea import router as ea_router
-from app.routers.license import router as license_router
-from app.ai.routes.ai_auth import router as ai_auth_router
-from app.ai.routes.ai_market import router as ai_market_router
-from app.ai.routes.ai_assistant import router as ai_assistant_router
-from app.ai.routes.live_market import router as live_market_router
-from app.ai.routes.performance import (router as performance_router)
-from app.ai.routes.client_mt5 import (router as client_mt5_router)
-from app.ai.routes.license_verify import router as license_verify_router
-from app.ai.routes.worker import router as worker_router
-from app.ai.routes.ai_chart_scanner import router as chart_scanner_router
-from app.ai.routes.manual_trade import router as manual_trade_router
-from app.routers.deriv import router as deriv_router
 
+# --------------------------------------------------------- AI routers ---
+from app.ai.routes.ai_assistant import router as ai_assistant_router
+from app.ai.routes.ai_auth import router as ai_auth_router
+from app.ai.routes.ai_chart_scanner import router as chart_scanner_router
+from app.ai.routes.ai_market import router as ai_market_router
+from app.ai.routes.client_mt5 import router as client_mt5_router
+from app.ai.routes.deriv_oauth import router as deriv_router, init_deriv_tables
+from app.ai.routes.license_verify import router as license_verify_router
+from app.ai.routes.live_market import router as live_market_router
+from app.ai.routes.manual_trade import router as manual_trade_router
+from app.ai.routes.performance import router as performance_router
+from app.ai.routes.worker import router as worker_router
+
+# ------------------------------------------------------------ Startup ---
 Base.metadata.create_all(bind=engine)
+init_deriv_tables()  # creates deriv_oauth_sessions + deriv_connections tables
 
 app = FastAPI(title="NolimitzBots Backend", version="1.0.0")
 
@@ -80,6 +85,7 @@ def seed_super_admin():
 
 seed_super_admin()
 
+# --------------------------------------------------------------- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -98,6 +104,7 @@ app.add_middleware(
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
+# ------------------------------------------------------ Route mounting ---
 app.include_router(admin_router)
 app.include_router(ea_router)
 app.include_router(license_router)
@@ -118,7 +125,7 @@ app.include_router(license_verify_router)
 app.include_router(worker_router)
 app.include_router(chart_scanner_router)
 app.include_router(manual_trade_router)
-app.include_router(deriv_router)
+app.include_router(deriv_router)  # /auth/deriv/... (OAuth 2.0 + PKCE)
 
 
 @app.get("/")
@@ -151,6 +158,9 @@ def custom_openapi():
         "/admin/login",
         "/admin/signup",
         "/openapi.json",
+        "/auth/deriv/login",
+        "/auth/deriv/callback",
+        "/auth/deriv/status",
     }
 
     for path, path_item in openapi_schema["paths"].items():

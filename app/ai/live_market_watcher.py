@@ -49,9 +49,16 @@ class Config:
 
     STANDARD_LEAN    = 48
     STANDARD_DISPLAY = 58
-    STANDARD_SIGNAL  = 70
+    # Raised 70 → 80: forex has been the chronic loser (28-38% win rate), so
+    # only its strongest reads become tradeable signals. Dashboard display is
+    # unaffected (DISPLAY threshold unchanged).
+    STANDARD_SIGNAL  = int(os.environ.get("STANDARD_SIGNAL", "80"))
 
     MIN_RR_RATIO = float(os.environ.get("MIN_RR_RATIO", "1.5"))
+    # Minimum buy/sell score GAP before a signal is allowed off WAIT. The old
+    # value (6) let near-coin-flips trade (buy=44 vs sell=38 → "confident" BUY).
+    # 15 requires a genuinely one-sided read — fewer signals, better ones.
+    MIN_SCORE_DIFF = int(os.environ.get("MIN_SCORE_DIFF", "15"))
     # Spread limits per asset class (pips). Generous — the watcher's job is to
     # find setups, not pre-judge execution. The WORKER does final spread check
     # at order send time using real-time tick.
@@ -1425,7 +1432,7 @@ def decide_action(buy_score: int, sell_score: int, confidence: int,
     if confidence < lean_threshold:
         return "WAIT"
     score_diff = abs(buy_score - sell_score)
-    if score_diff < 6:
+    if score_diff < cfg.MIN_SCORE_DIFF:
         return "WAIT"
     return "BUY" if buy_score > sell_score else "SELL"
 
@@ -1467,10 +1474,7 @@ def analyze_xauusd(ltf, mtf, htf, symbol):
 
     smc_structure = smc["structure"]
 
-    logger.info("DEBUG SMC TYPE: %s", type(smc_structure))
-    logger.info("DEBUG SMC VALUE: %s", smc_structure)
-
-    logger.info(
+    logger.debug(
         "SMC %s | Trend=%s | Structure=%s | HH=%s | HL=%s | LH=%s | LL=%s | LastHigh=%.2f | LastLow=%.2f",
         symbol,
         smc_structure["trend"],
@@ -1584,7 +1588,18 @@ def analyze_xauusd(ltf, mtf, htf, symbol):
     lean, _, _ = get_thresholds(symbol)
     action = decide_action(buy, sell, confidence, lean)
 
-    sl_mult = 0.7 if regime == "RANGING" else 1.0 if regime == "TRENDING" else 1.3
+    # ── STRUCTURAL GATE (forex only) ─────────────────────────────────────────
+    # Points can accumulate from scraps (a divergence here, a stochastic there)
+    # without any real setup behind them — those were the 28-38% win-rate
+    # trades. A forex signal now requires FULL higher-timeframe alignment in
+    # the trade's direction: H4 and H1 both trending that way. No alignment,
+    # no trade — the dashboard still shows the lean, but no signal is saved.
+    if action == "BUY" and not (htf_trend == "BULLISH" and mtf_trend == "BULLISH"):
+        action = "WAIT"
+    elif action == "SELL" and not (htf_trend == "BEARISH" and mtf_trend == "BEARISH"):
+        action = "WAIT"
+
+    sl_mult = 0.7 if regime == "RANGING" else 0.9 if regime == "TRENDING" else 1.2
     tp_mult = 2.5 if regime == "RANGING" else 3.0 if regime == "TRENDING" else 2.2
     sl, tp = compute_sl_tp(action, price, a, regime, key_sup, key_res, sl_mult, tp_mult)
 
