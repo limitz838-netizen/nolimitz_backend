@@ -76,10 +76,11 @@ async def _get_ws_url(token: str, account_id: str) -> str:
             502, f"Deriv OTP request failed ({resp.status_code}): {resp.text[:200]}"
         )
     data = resp.json()
-    # Tolerant parsing — Deriv returns a ready-to-use WS URL in the OTP response
-    for key in ("websocket_url", "ws_url", "url"):
-        if isinstance(data.get(key), str):
-            return data[key]
+    # Deriv wraps the ready-to-use WS URL as {"data": {"url": "wss://..."}}
+    inner = data.get("data", data)
+    for key in ("url", "websocket_url", "ws_url"):
+        if isinstance(inner.get(key), str):
+            return inner[key]
     # Fallback: build it from the raw OTP if only the code is returned
     otp = data.get("otp") or data.get("token")
     if otp:
