@@ -37,7 +37,7 @@ DERIV_TOKEN_URL = "https://auth.deriv.com/oauth2/token"
 DERIV_API_BASE = "https://api.derivws.com/trading/v1/options"
 DERIV_SCOPES = "trade account_manage"
 
-WEBSITE_URL = "https://nolimitzbots.co.ke/"  # where users return after connecting
+WEBSITE_URL = "https://nolimitzbots.co.ke/trade"  # where users return after connecting
 
 router = APIRouter(prefix="/auth/deriv", tags=["deriv-oauth"])
 
