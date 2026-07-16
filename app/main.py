@@ -43,6 +43,7 @@ from app.ai.routes.deriv_bots import router as deriv_bots_router, init_bot_table
 # ------------------------------------------------------------ Startup ---
 Base.metadata.create_all(bind=engine)
 init_deriv_tables()  # creates deriv_oauth_sessions + deriv_connections tables
+init_bot_tables()
 
 app = FastAPI(title="NolimitzBots Backend", version="1.0.0")
 
