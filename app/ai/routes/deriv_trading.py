@@ -271,3 +271,20 @@ async def deriv_sell(
         "sell",
     )
     return {"ok": True, "sell": msg.get("sell", msg)}
+
+
+@router.get("/history")
+async def deriv_history(
+    user_id: str = Query(...),
+    account_id: str = Query(...),
+    limit: int = Query(25, le=100),
+):
+    """Closed/past trades (profit table)."""
+    msg = await _ws_call_auth(
+        user_id,
+        account_id,
+        {"profit_table": 1, "limit": limit, "sort": "DESC",
+         "description": 1, "req_id": 1},
+        "profit_table",
+    )
+    return msg.get("profit_table", msg)
