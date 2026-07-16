@@ -38,6 +38,7 @@ from app.ai.routes.live_market import router as live_market_router
 from app.ai.routes.manual_trade import router as manual_trade_router
 from app.ai.routes.performance import router as performance_router
 from app.ai.routes.worker import router as worker_router
+from app.ai.routes.deriv_bots import router as deriv_bots_router, init_bot_tables
 
 # ------------------------------------------------------------ Startup ---
 Base.metadata.create_all(bind=engine)
@@ -128,6 +129,7 @@ app.include_router(chart_scanner_router)
 app.include_router(manual_trade_router)
 app.include_router(deriv_router)  # /auth/deriv/... (OAuth 2.0 + PKCE)
 app.include_router(deriv_trading_router)
+app.include_router(deriv_bots_router)
 
 
 @app.get("/")
