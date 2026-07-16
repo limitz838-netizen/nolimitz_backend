@@ -1,6 +1,6 @@
 """
-NolimitzBots — Deriv OAuth 2.0 (PKCE) Router  [v4 — themed result page]
-=======================================================================
+NolimitzBots — Deriv OAuth 2.0 (PKCE) Router  [v5 — silent token refresh]
+=========================================================================
 Deriv connection is available to ALL signed-in users (free + licensed).
 Connections are keyed on the user's account ID from NolimitzBots signup.
 
@@ -10,15 +10,9 @@ Endpoints:
   GET    /auth/deriv/status?user_id=XXX   -> {"connected": bool, ...}
   DELETE /auth/deriv/disconnect?user_id=XXX
 
-Wire-up in main.py (unchanged):
-  from app.ai.routes.deriv_oauth import router as deriv_router, init_deriv_tables
-  init_deriv_tables()
-  app.include_router(deriv_router)
-
-v4 changes:
-  - Result page restyled to the NolimitzBots black/gold theme
-  - Success page auto-redirects to https://nolimitzbots.co.ke/ after 3s
-  - "Back to NolimitzBots" button links to the website (no dead deep link)
+v5 changes:
+  - get_deriv_token() now silently refreshes expired access tokens using
+    the stored refresh_token, so users stay connected beyond 1 hour.
 """
 
 import base64
@@ -216,16 +210,18 @@ def deriv_status(user_id: str = Query(...)):
     with engine.connect() as conn:
         row = conn.execute(
             text(
-                "SELECT expires_at, connected_at, accounts_json "
+                "SELECT expires_at, connected_at, accounts_json, refresh_token "
                 "FROM deriv_connections WHERE license_key = :uid"
             ),
             {"uid": user_id},
         ).fetchone()
     if row is None:
         return {"connected": False}
+    # token_valid is true if the access token is fresh OR we can refresh it
+    token_valid = row[0] > int(time.time()) or bool(row[3])
     return {
         "connected": True,
-        "token_valid": row[0] > int(time.time()),
+        "token_valid": token_valid,
         "connected_at": row[1],
         "accounts": row[2],
     }
@@ -242,19 +238,78 @@ def deriv_disconnect(user_id: str = Query(...)):
 
 
 # ------------------------------------------------- HELPER FOR THE WORKER ---
+def _refresh_deriv_token(user_id: str, refresh_token: str) -> str | None:
+    """Exchange the stored refresh_token for a fresh access token.
+    Returns the new access token, or None if Deriv refuses (user must
+    reconnect via the normal OAuth login)."""
+    try:
+        resp = httpx.post(
+            DERIV_TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "client_id": DERIV_CLIENT_ID,
+                "refresh_token": refresh_token,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=20,
+        )
+    except httpx.HTTPError:
+        return None
+
+    if resp.status_code != 200:
+        return None
+
+    tok = resp.json()
+    access_token = tok.get("access_token")
+    if not access_token:
+        return None
+
+    new_expires_at = int(time.time()) + int(tok.get("expires_in", 3600))
+    # Deriv may rotate the refresh token — keep the newest one we have
+    new_refresh = tok.get("refresh_token") or refresh_token
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE deriv_connections SET "
+                "access_token = :at, refresh_token = :rt, expires_at = :ea "
+                "WHERE license_key = :uid"
+            ),
+            {"at": access_token, "rt": new_refresh, "ea": new_expires_at,
+             "uid": user_id},
+        )
+    return access_token
+
+
 def get_deriv_token(user_id: str) -> str | None:
-    """deriv_worker.py calls this before trading for a user."""
+    """Return a valid access token for this user, silently refreshing it
+    if it has expired (or expires within the next 60 seconds).
+    Returns None only when no connection exists or refresh is impossible —
+    in that case the user must reconnect their Deriv account."""
     with engine.connect() as conn:
         row = conn.execute(
             text(
-                "SELECT access_token, expires_at "
+                "SELECT access_token, refresh_token, expires_at "
                 "FROM deriv_connections WHERE license_key = :uid"
             ),
             {"uid": user_id},
         ).fetchone()
-    if row is None or row[1] <= int(time.time()):
+
+    if row is None:
         return None
-    return row[0]
+
+    access_token, refresh_token, expires_at = row[0], row[1], row[2]
+
+    # Still valid (with a 60s safety margin)? Use it as-is.
+    if expires_at > int(time.time()) + 60:
+        return access_token
+
+    # Expired — try a silent refresh.
+    if refresh_token:
+        return _refresh_deriv_token(user_id, refresh_token)
+
+    # No refresh token stored (older connection) — reconnect required.
+    return None
 
 
 # ------------------------------------------------------------ RESULT PAGE ---
