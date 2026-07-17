@@ -1,34 +1,27 @@
 """
-NolimitzBots — Deriv Bots Engine  [v1]
-======================================
-Server-side automated trading bots ("Dbots") for connected Deriv accounts.
-Bots run as asyncio tasks inside the backend — they keep trading even when
-the user closes the app. One bot per user in v1.
+NolimitzBots — Deriv Bots Engine  [v2 — discipline + Spike Hunter]
+==================================================================
+v2 changes (safety-first upgrade):
+  1. STRICTER ENTRIES: momentum/reversal now require a CLEAN streak — every
+     tick in the window moving the same way. Mixed ticks = skip, no trade.
+  2. LOSS-STREAK PROTECTION: after `max_consec_losses` losing trades in a row
+     (default 3) the bot stops itself — stop_reason 'loss_streak_protection'.
+  3. NEW STRATEGY — Spike Hunter (Boom/Crash only): rides the spike direction
+     with a MULTIPLIER contract and hard per-trade SL/TP derived from stake
+     (TP = +100% of stake, SL = -50% of stake). If a contract is still open
+     after `mult_timeout_s`, it is force-closed at market.
+  4. NO MARTINGALE anywhere. Fixed stake always.
 
-Endpoints:
-  GET  /bots/strategies                    -> list of available strategies
+Endpoints (unchanged):
+  GET  /bots/strategies
   POST /bots/start   {user_id, account_id, strategy, config}
   POST /bots/stop    {user_id}
-  GET  /bots/status?user_id=X              -> status, session stats, trades
+  GET  /bots/status?user_id=X
 
-Strategy v1 registry:
-  momentum   — trades in the direction of the last N ticks (Rise/Fall)
-  reversal   — trades against the last N ticks (Rise/Fall)
-
-Safety (enforced server-side, all configurable per run):
-  max_trades           hard cap on trades per session       (default 10)
-  session_take_profit  stop when session profit >= this     (default 5.0)
-  session_stop_loss    stop when session loss  >= this      (default 5.0)
-  cooldown_s           pause between trades                 (default 10)
-  stake                fixed stake per trade                (default 1.0)
-
-Wire-up in main.py:
+Wire-up in main.py (unchanged):
   from app.ai.routes.deriv_bots import router as deriv_bots_router, init_bot_tables
   init_bot_tables()
   app.include_router(deriv_bots_router)
-
-NOTE: bots stop when the server restarts (e.g. on deploy). Status is set to
-'stopped' with reason 'server_restart' on startup so the UI reflects reality.
 """
 
 import asyncio
@@ -45,36 +38,48 @@ from app.ai.routes.deriv_trading import WS_PUBLIC, WS_TIMEOUT, _get_ws_url
 
 router = APIRouter(prefix="/bots", tags=["deriv-bots"])
 
-# In-process registry of running bot tasks: {user_id: asyncio.Task}
 _RUNNING: dict[str, asyncio.Task] = {}
 
 STRATEGIES = [
     {
         "id": "momentum",
         "name": "Nolimitz Momentum",
-        "description": "Follows the trend — trades in the direction of the "
-                       "last few ticks. Best on Volatility indices.",
+        "description": "Trades ONLY on a clean streak — every tick moving the "
+                       "same way. Mixed markets are skipped. Best on "
+                       "Volatility indices.",
         "risk": "medium",
     },
     {
         "id": "reversal",
         "name": "Nolimitz Reversal",
-        "description": "Fades the move — trades against the last few ticks, "
-                       "betting on a snap-back.",
+        "description": "Waits for a clean one-way streak, then fades it — "
+                       "betting on the snap-back. Skips choppy markets.",
         "risk": "medium",
+    },
+    {
+        "id": "spike",
+        "name": "Spike Hunter",
+        "description": "Boom & Crash specialist. Rides the spike direction "
+                       "with a multiplier and a hard stop: risk 50% of stake "
+                       "to win 100%. Force-closes stuck trades.",
+        "risk": "high",
     },
 ]
 
 DEFAULT_CONFIG = {
     "symbol": "R_100",
     "stake": 1.0,
-    "duration": 5,            # ticks
-    "ticks_window": 3,        # how many ticks the strategy looks at
+    "duration": 5,             # ticks (options strategies)
+    "ticks_window": 3,         # streak length required
     "max_trades": 10,
+    "max_consec_losses": 3,    # loss-streak circuit breaker
     "session_take_profit": 5.0,
     "session_stop_loss": 5.0,
     "cooldown_s": 10,
     "currency": "USD",
+    # Spike Hunter only:
+    "multiplier": 100,
+    "mult_timeout_s": 180,     # force-close if still open after this
 }
 
 
@@ -111,7 +116,6 @@ def init_bot_tables():
                    )"""
             )
         )
-        # Server just (re)started: anything marked running is no longer real
         conn.execute(
             text(
                 "UPDATE deriv_bots SET status='stopped', "
@@ -171,11 +175,10 @@ def _log_trade(user_id, contract_id, direction, stake, profit, longcode):
 
 # --------------------------------------------------------- DERIV HELPERS ---
 async def _get_ticks(symbol: str, count: int) -> list[float]:
-    """Collect `count` live ticks from the public stream."""
     prices: list[float] = []
     async with websockets.connect(WS_PUBLIC, open_timeout=WS_TIMEOUT) as ws:
         await ws.send(json.dumps({"ticks": symbol, "subscribe": 1, "req_id": 1}))
-        deadline = time.time() + 60
+        deadline = time.time() + 90
         while len(prices) < count and time.time() < deadline:
             msg = json.loads(await ws.recv())
             if msg.get("error"):
@@ -186,8 +189,20 @@ async def _get_ticks(symbol: str, count: int) -> list[float]:
     return prices
 
 
-async def _bot_buy(token_ws_url: str, contract_type: str, cfg: dict) -> dict:
-    """Proposal + buy on one authenticated WS session."""
+async def _ws_request(ws, payload: dict, expect_key: str) -> dict:
+    await ws.send(json.dumps(payload))
+    deadline = time.time() + WS_TIMEOUT
+    while time.time() < deadline:
+        msg = json.loads(await ws.recv())
+        if msg.get("error"):
+            raise RuntimeError(msg["error"].get("message", "deriv error"))
+        if expect_key in msg:
+            return msg
+    raise RuntimeError(f"timeout waiting for {expect_key}")
+
+
+async def _bot_buy_option(ws_url: str, contract_type: str, cfg: dict) -> dict:
+    """Rise/Fall option: proposal + buy."""
     proposal = {
         "proposal": 1,
         "contract_type": contract_type,
@@ -199,92 +214,129 @@ async def _bot_buy(token_ws_url: str, contract_type: str, cfg: dict) -> dict:
         "duration_unit": "t",
         "req_id": 1,
     }
-    async with websockets.connect(token_ws_url, open_timeout=WS_TIMEOUT) as ws:
-        await ws.send(json.dumps(proposal))
-        prop = None
-        deadline = time.time() + WS_TIMEOUT
-        while time.time() < deadline:
-            msg = json.loads(await ws.recv())
-            if msg.get("error"):
-                raise RuntimeError(msg["error"].get("message", "proposal error"))
-            if "proposal" in msg:
-                prop = msg["proposal"]
-                break
-        if prop is None:
-            raise RuntimeError("no proposal")
+    async with websockets.connect(ws_url, open_timeout=WS_TIMEOUT) as ws:
+        prop = (await _ws_request(ws, proposal, "proposal"))["proposal"]
+        buy = (await _ws_request(
+            ws, {"buy": prop["id"], "price": prop["ask_price"], "req_id": 2},
+            "buy"))["buy"]
+        return buy
 
-        await ws.send(json.dumps(
-            {"buy": prop["id"], "price": prop["ask_price"], "req_id": 2}))
-        deadline = time.time() + WS_TIMEOUT
-        while time.time() < deadline:
-            msg = json.loads(await ws.recv())
-            if msg.get("error"):
-                raise RuntimeError(msg["error"].get("message", "buy error"))
-            if "buy" in msg:
-                return msg["buy"]
-    raise RuntimeError("buy timeout")
+
+async def _bot_buy_multiplier(ws_url: str, contract_type: str,
+                              cfg: dict) -> dict:
+    """MULTUP/MULTDOWN with hard per-trade SL/TP derived from stake."""
+    stake = float(cfg["stake"])
+    proposal = {
+        "proposal": 1,
+        "contract_type": contract_type,
+        "underlying_symbol": cfg["symbol"],
+        "amount": stake,
+        "basis": "stake",
+        "currency": cfg.get("currency", "USD"),
+        "multiplier": int(cfg.get("multiplier", 100)),
+        "limit_order": {
+            "take_profit": round(stake * 1.0, 2),   # win 100% of stake
+            "stop_loss": round(stake * 0.5, 2),     # risk 50% of stake
+        },
+        "req_id": 1,
+    }
+    async with websockets.connect(ws_url, open_timeout=WS_TIMEOUT) as ws:
+        prop = (await _ws_request(ws, proposal, "proposal"))["proposal"]
+        buy = (await _ws_request(
+            ws, {"buy": prop["id"], "price": prop["ask_price"], "req_id": 2},
+            "buy"))["buy"]
+        return buy
+
+
+async def _force_sell(ws_url: str, contract_id: int):
+    try:
+        async with websockets.connect(ws_url, open_timeout=WS_TIMEOUT) as ws:
+            await _ws_request(
+                ws, {"sell": contract_id, "price": 0, "req_id": 1}, "sell")
+    except Exception:
+        pass  # if it already closed, that's fine
 
 
 async def _contract_profit(user_id: str, account_id: str,
                            contract_id: int) -> float | None:
-    """Look up the finished contract's profit from the profit table."""
     token = get_deriv_token(user_id)
     if token is None:
         return None
     ws_url = await _get_ws_url(token, account_id)
-    async with websockets.connect(ws_url, open_timeout=WS_TIMEOUT) as ws:
-        await ws.send(json.dumps(
-            {"profit_table": 1, "limit": 25, "sort": "DESC",
-             "description": 1, "req_id": 1}))
-        deadline = time.time() + WS_TIMEOUT
-        while time.time() < deadline:
-            msg = json.loads(await ws.recv())
-            if msg.get("error"):
-                return None
-            table = msg.get("profit_table")
-            if table:
-                for tx in table.get("transactions", []):
-                    if tx.get("contract_id") == contract_id:
-                        try:
-                            sell = float(tx.get("sell_price", 0))
-                            buy = float(tx.get("buy_price", 0))
-                            return round(sell - buy, 2)
-                        except (TypeError, ValueError):
-                            return None
-                return None
+    try:
+        async with websockets.connect(ws_url, open_timeout=WS_TIMEOUT) as ws:
+            msg = await _ws_request(
+                ws,
+                {"profit_table": 1, "limit": 25, "sort": "DESC",
+                 "description": 1, "req_id": 1},
+                "profit_table")
+            for tx in msg["profit_table"].get("transactions", []):
+                if tx.get("contract_id") == contract_id:
+                    try:
+                        return round(float(tx.get("sell_price", 0)) -
+                                     float(tx.get("buy_price", 0)), 2)
+                    except (TypeError, ValueError):
+                        return None
+    except Exception:
+        return None
+    return None
+
+
+# --------------------------------------------------------------- SIGNALS ---
+def _clean_streak(prices: list[float]) -> str | None:
+    """Return 'up'/'down' only if EVERY move in the window agrees."""
+    if len(prices) < 2:
+        return None
+    moves = [b - a for a, b in zip(prices, prices[1:])]
+    if all(m > 0 for m in moves):
+        return "up"
+    if all(m < 0 for m in moves):
+        return "down"
+    return None
+
+
+def _decide(strategy: str, prices: list[float], symbol: str) -> str | None:
+    streak = _clean_streak(prices)
+    if strategy == "momentum":
+        if streak == "up":
+            return "CALL"
+        if streak == "down":
+            return "PUT"
+        return None
+    if strategy == "reversal":
+        if streak == "up":
+            return "PUT"
+        if streak == "down":
+            return "CALL"
+        return None
+    if strategy == "spike":
+        # Boom spikes UP, Crash spikes DOWN — ride the spike direction.
+        sym = symbol.upper()
+        if "BOOM" in sym:
+            return "MULTUP"
+        if "CRASH" in sym:
+            return "MULTDOWN"
+        return None
     return None
 
 
 # -------------------------------------------------------------- BOT LOOP ---
-def _decide(strategy: str, prices: list[float]) -> str | None:
-    """Return CALL / PUT / None based on the tick window."""
-    if len(prices) < 2:
-        return None
-    ups = sum(1 for a, b in zip(prices, prices[1:]) if b > a)
-    downs = sum(1 for a, b in zip(prices, prices[1:]) if b < a)
-    if ups == downs:
-        return None  # no clear direction — skip this round
-    trend = "CALL" if ups > downs else "PUT"
-    if strategy == "momentum":
-        return trend
-    if strategy == "reversal":
-        return "PUT" if trend == "CALL" else "CALL"
-    return None
-
-
 async def _run_bot(user_id: str, account_id: str, strategy: str, cfg: dict):
     trades_done = 0
     session_pnl = 0.0
+    consec_losses = 0
     stop_reason = "finished"
 
     try:
         while trades_done < cfg["max_trades"]:
-            # Safety gates
             if session_pnl >= cfg["session_take_profit"]:
                 stop_reason = "take_profit_hit"
                 break
             if session_pnl <= -cfg["session_stop_loss"]:
                 stop_reason = "stop_loss_hit"
+                break
+            if consec_losses >= cfg.get("max_consec_losses", 3):
+                stop_reason = "loss_streak_protection"
                 break
 
             token = get_deriv_token(user_id)
@@ -292,37 +344,64 @@ async def _run_bot(user_id: str, account_id: str, strategy: str, cfg: dict):
                 stop_reason = "deriv_disconnected"
                 break
 
-            # 1) read the market
+            # 1) read the market — only trade clean setups
             prices = await _get_ticks(cfg["symbol"], cfg["ticks_window"] + 1)
-            direction = _decide(strategy, prices)
+            direction = _decide(strategy, prices, cfg["symbol"])
             if direction is None:
                 await asyncio.sleep(3)
                 continue
 
             # 2) trade
             ws_url = await _get_ws_url(token, account_id)
-            buy = await _bot_buy(ws_url, direction, cfg)
+            if direction in ("MULTUP", "MULTDOWN"):
+                buy = await _bot_buy_multiplier(ws_url, direction, cfg)
+            else:
+                buy = await _bot_buy_option(ws_url, direction, cfg)
             contract_id = buy.get("contract_id")
             longcode = buy.get("longcode", "")
             trades_done += 1
 
             # 3) wait for the contract to finish, then record the result
-            await asyncio.sleep(cfg["duration"] * 2 + 6)
-            profit = await _contract_profit(user_id, account_id, contract_id)
+            if direction in ("MULTUP", "MULTDOWN"):
+                profit = None
+                waited = 0
+                timeout = int(cfg.get("mult_timeout_s", 180))
+                while waited < timeout:
+                    await asyncio.sleep(10)
+                    waited += 10
+                    profit = await _contract_profit(
+                        user_id, account_id, contract_id)
+                    if profit is not None:
+                        break
+                if profit is None:
+                    # still open past timeout — force close, then re-check
+                    ws_url2 = await _get_ws_url(
+                        get_deriv_token(user_id) or token, account_id)
+                    await _force_sell(ws_url2, contract_id)
+                    await asyncio.sleep(6)
+                    profit = await _contract_profit(
+                        user_id, account_id, contract_id)
+            else:
+                await asyncio.sleep(cfg["duration"] * 2 + 6)
+                profit = await _contract_profit(
+                    user_id, account_id, contract_id)
+
             if profit is not None:
                 session_pnl = round(session_pnl + profit, 2)
+                consec_losses = consec_losses + 1 if profit < 0 else 0
             _log_trade(user_id, contract_id, direction, cfg["stake"],
                        profit if profit is not None else 0.0, longcode)
             _update_bot(user_id, trades_done=trades_done,
                         session_pnl=session_pnl)
 
-            # 4) cooldown
-            await asyncio.sleep(cfg["cooldown_s"])
+            # 4) cooldown (longer after a loss — cheap discipline)
+            extra = cfg["cooldown_s"] if (profit or 0) < 0 else 0
+            await asyncio.sleep(cfg["cooldown_s"] + extra)
 
     except asyncio.CancelledError:
         stop_reason = "user_stopped"
         raise
-    except Exception as exc:  # noqa: BLE001 — record and stop cleanly
+    except Exception as exc:  # noqa: BLE001
         stop_reason = f"error:{str(exc)[:40]}"
     finally:
         _RUNNING.pop(user_id, None)
@@ -351,10 +430,17 @@ async def bot_start(
         raise HTTPException(401, "Deriv not connected — connect first")
 
     cfg = {**DEFAULT_CONFIG, **(config or {})}
-    # hard server-side sanity caps
     cfg["stake"] = max(0.35, min(float(cfg["stake"]), 100.0))
     cfg["max_trades"] = max(1, min(int(cfg["max_trades"]), 50))
     cfg["cooldown_s"] = max(3, int(cfg["cooldown_s"]))
+    cfg["max_consec_losses"] = max(1, min(
+        int(cfg.get("max_consec_losses", 3)), 10))
+
+    sym = str(cfg["symbol"]).upper()
+    if strategy == "spike" and ("BOOM" not in sym and "CRASH" not in sym):
+        raise HTTPException(
+            422, "Spike Hunter only works on Boom or Crash indices — "
+                 "pick a Boom/Crash market.")
 
     _save_bot(user_id, account_id, strategy, cfg, "running")
     task = asyncio.create_task(_run_bot(user_id, account_id, strategy, cfg))
@@ -391,7 +477,6 @@ def bot_status(user_id: str = Query(...)):
     if bot is None:
         return {"exists": False, "status": "none"}
 
-    # reconcile: DB says running but no live task (shouldn't happen, but safe)
     status = bot[3]
     if status == "running" and (
         user_id not in _RUNNING or _RUNNING[user_id].done()
