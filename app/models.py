@@ -274,6 +274,12 @@ class ClientMT5Account(Base):
 
     ai_auto_trade = Column(Boolean, default=False)
 
+    # ★ USER PANIC BUTTON — the API sets this True; the execution worker then
+    # closes EVERY open position it manages on this account, sets
+    # ai_auto_trade=False, and clears the flag. Outcomes are recorded by the
+    # worker's normal reconciliation, so history and learning stay correct.
+    close_all_requested = Column(Boolean, default=False)
+
     ai_started_at = Column(DateTime(timezone=True), nullable=True)
 
     signal_cutoff_at = Column(
@@ -361,6 +367,16 @@ class LiveTrade(Base):
     status = Column(String, default="OPEN")
 
     profit = Column(Float, default=0)
+
+    # ★ SCALE-OUT STATE — persisted every cycle by the execution worker so a
+    # worker restart rebuilds exactly where each position was instead of
+    # re-firing partials on positions that already scaled:
+    #   0 = untouched, 1 = SCALE1 (50%) taken, 2 = SCALE2 (25%) taken / runner
+    scale_stage = Column(Integer, default=0)
+
+    # ★ Runner's peak profit in $ per 0.01 lot — the trailing exit's reference
+    # point, restored at startup so the trail never forgets the high.
+    peak_profit_001 = Column(Float, default=0)
 
     mt5_ticket = Column(String, nullable=True)
 
@@ -712,4 +728,19 @@ class ManualTradeRequest(Base):
     mt5_ticket = Column(String, nullable=True)
     error = Column(String, nullable=True)
     requested_at = Column(DateTime(timezone=True), server_default=func.now())
-    processed_at = Column(DateTime(timezone=True), nullable=True)  
+    processed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class WorkerHeartbeat(Base):
+    """
+    ★ NEW — one row per worker process (trader shards, watcher, verifier).
+    Each worker upserts its row every few cycles; the API's /engine-status
+    endpoint reads them so the dashboard can show "engine online, last cycle
+    Xs ago" instead of going silently dark when a Windows box dies.
+    """
+    __tablename__ = "worker_heartbeats"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    worker_name = Column(String, unique=True, nullable=False, index=True)
+    detail      = Column(String, nullable=True)          # e.g. "cycle=1041"
+    last_beat   = Column(DateTime(timezone=True), nullable=True)

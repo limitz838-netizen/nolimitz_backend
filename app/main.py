@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.auth import hash_password
@@ -31,6 +32,7 @@ from app.ai.routes.ai_auth import router as ai_auth_router
 from app.ai.routes.ai_chart_scanner import router as chart_scanner_router
 from app.ai.routes.ai_market import router as ai_market_router
 from app.ai.routes.client_mt5 import router as client_mt5_router
+from app.ai.routes.client_mt5 import admin_router as client_mt5_admin_router
 from app.ai.routes.deriv_oauth import router as deriv_router, init_deriv_tables
 from app.ai.routes.deriv_trading import router as deriv_trading_router
 from app.ai.routes.license_verify import router as license_verify_router
@@ -40,8 +42,46 @@ from app.ai.routes.performance import router as performance_router
 from app.ai.routes.worker import router as worker_router
 from app.ai.routes.deriv_bots import router as deriv_bots_router, init_bot_tables
 
+
 # ------------------------------------------------------------ Startup ---
+def run_light_migrations():
+    """
+    ★ Idempotent column additions for EXISTING databases.
+
+    Base.metadata.create_all() creates NEW tables (worker_heartbeats ✓) but
+    will NOT add new columns to tables that already exist — so the fix-pack
+    columns (live_trades.scale_stage, live_trades.peak_profit_001,
+    client_mt5_accounts.close_all_requested) are added here on every boot.
+
+    Postgres: ADD COLUMN IF NOT EXISTS is a clean no-op when present.
+    SQLite:   IF NOT EXISTS isn't supported for columns, so we retry the
+              plain form and swallow the 'duplicate column' error.
+    Each statement runs in its own transaction so one failure never blocks
+    the rest.
+    """
+    statements = [
+        "ALTER TABLE live_trades ADD COLUMN IF NOT EXISTS scale_stage INTEGER DEFAULT 0",
+        "ALTER TABLE live_trades ADD COLUMN IF NOT EXISTS peak_profit_001 FLOAT DEFAULT 0",
+        "ALTER TABLE client_mt5_accounts ADD COLUMN IF NOT EXISTS close_all_requested BOOLEAN DEFAULT FALSE",
+    ]
+    for stmt in statements:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(stmt))
+        except Exception:
+            # SQLite path: no IF NOT EXISTS for columns — try the plain form.
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(stmt.replace(" IF NOT EXISTS", "")))
+            except Exception as e2:
+                # 'duplicate column' here means it's already applied — fine.
+                msg = str(e2).lower()
+                if "duplicate" not in msg and "exists" not in msg:
+                    print(f"[migrations] skipped: {stmt} -> {e2}")
+
+
 Base.metadata.create_all(bind=engine)
+run_light_migrations()   # ★ add fix-pack columns to pre-existing tables
 init_deriv_tables()  # creates deriv_oauth_sessions + deriv_connections tables
 init_bot_tables()
 
@@ -124,6 +164,11 @@ app.include_router(ai_assistant_router)
 app.include_router(live_market_router)
 app.include_router(performance_router)
 app.include_router(client_mt5_router)
+# ★ The account-cleanup admin endpoints (/api/admin/accounts-overview,
+# clear-failed-accounts, delete-inactive-accounts, dedupe-accounts) were
+# defined in client_mt5.py but never mounted — they were unreachable. Mounted
+# here; they stay hard-disabled (503) unless NOLIMITZ_ADMIN_TOKEN is set.
+app.include_router(client_mt5_admin_router)
 app.include_router(license_verify_router)
 app.include_router(worker_router)
 app.include_router(chart_scanner_router)

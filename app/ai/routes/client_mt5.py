@@ -22,6 +22,18 @@
   REFRESH FLOW:
     - POST /ai/refresh-balance just flags the account (status → REFRESH)
       so the worker re-reads balance on its next loop. Frontend polls status.
+
+  ── FIX PACK (this revision) ──────────────────────────────────────────────────
+  1. Passwords are ENCRYPTED AT REST (Fernet, NOLIMITZ_CRED_KEY) before they
+     hit the DB. Workers decrypt just-in-time; legacy plaintext rows still work.
+  2. GET /settings is now HONEST about lots: if the user hasn't set a lot for
+     a symbol, lot_size is null and needs_lot is true — no more fabricated
+     mode-lot display while the worker silently refuses `no_lot_set` symbols.
+     The dead mode-lot display tables were removed with it.
+  3. NEW POST /close-all — user panic button. Flags the account; the execution
+     worker closes every open position and stops the AI within seconds.
+  4. NEW GET /engine-status — reads WorkerHeartbeat rows so the dashboard can
+     show "engine online, last cycle Xs ago" instead of going silently dark.
 ================================================================================
 """
 
@@ -38,10 +50,19 @@ from pydantic import BaseModel
 from app.database import get_db
 from app.models import (
     ClientMT5Account, License, LiveTrade,
-    ClientSymbolSetting, AISymbol,
+    ClientSymbolSetting, AISymbol, WorkerHeartbeat,
 )
 from app.ai.models.ai_trade_history import AITradeHistory
 from app.ai.models.ai_market_state import AIMarketState
+
+# ★ Credential encryption at rest. Safe fallback: if the module or the
+# NOLIMITZ_CRED_KEY env var isn't in place yet, passwords are stored as-is
+# (exactly the old behavior) — nothing breaks during rollout.
+try:
+    from app.security_utils import encrypt_secret
+except Exception:
+    def encrypt_secret(v):
+        return v
 
 
 logger = logging.getLogger("client_mt5")
@@ -129,46 +150,14 @@ class RiskLevelUpdate(BaseModel):
 
 
 # ============================================================================
-# DISPLAY-ONLY MODE TABLES
-# These MIRROR the execution worker's MODE_LOTS / RISK_MODE so the dashboard
-# can show the EFFECTIVE lot size and trade count the worker will actually
-# use for each symbol under the selected mode. The worker remains the source
-# of truth for execution; these are only for display. Keep them in sync with
-# execution_worker.py cfg.MODE_LOTS / RISK_MODE.
+# DISPLAY-ONLY MODE TABLE
+# ★ The old _DISPLAY_MODE_LOTS table (mode → per-class lot) was REMOVED: the
+# worker's only lot source is the user's own per-symbol value, so displaying a
+# mode lot the engine would never trade was actively misleading (a user saw
+# "0.02" while the worker refused `no_lot_set`). Only the per-mode trade count
+# remains for display. Keep in sync with execution_worker.py cfg.RISK_MODE.
 # ============================================================================
-_DISPLAY_MODE_LOTS = {
-    "normal":     {"GOLD": 0.01, "BTC": 0.10, "ETH": 0.10, "INDEX": 0.05,
-                   "OIL": 0.05, "FOREX": 0.05, "JPY": 0.05, "OTHER": 0.02},
-    "medium":     {"GOLD": 0.02, "BTC": 0.20, "ETH": 0.20, "INDEX": 0.10,
-                   "OIL": 0.10, "FOREX": 0.10, "JPY": 0.10, "OTHER": 0.05},
-    "aggressive": {"GOLD": 0.05, "BTC": 0.50, "ETH": 0.50, "INDEX": 0.25,
-                   "OIL": 0.25, "FOREX": 0.20, "JPY": 0.20, "OTHER": 0.10},
-}
 _DISPLAY_MODE_MAX_TRADES = {"normal": 1, "medium": 3, "aggressive": 5}
-
-
-def _display_classify(symbol: str) -> str:
-    s = (symbol or "").upper()
-    if "XAU" in s or "GOLD" in s:           return "GOLD"
-    if "BTC" in s:                          return "BTC"
-    if "ETH" in s:                          return "ETH"
-    if "OIL" in s or "WTI" in s or "USOIL" in s: return "OIL"
-    if any(x in s for x in ("US30", "NAS", "SPX", "GER", "UK100", "JP225")): return "INDEX"
-    if "JPY" in s:                          return "JPY"
-    if len(s) == 6 and s.isalpha():         return "FOREX"
-    return "OTHER"
-
-
-def _effective_lot_and_trades(symbol: str, risk_level: str):
-    """Return (lot_size, max_open_trades) the worker will actually use for
-    this symbol under the given mode — matching the worker's mode_first logic."""
-    mode = (risk_level or "medium").lower()
-    if mode not in _DISPLAY_MODE_LOTS:
-        mode = "medium"
-    cls = _display_classify(symbol)
-    lot = _DISPLAY_MODE_LOTS[mode].get(cls, _DISPLAY_MODE_LOTS[mode]["OTHER"])
-    trades = _DISPLAY_MODE_MAX_TRADES.get(mode, 3)
-    return lot, trades
 
 
 # ============================================================================
@@ -187,6 +176,7 @@ def get_brokers():
 
 # ============================================================================
 # SAVE MT5 ACCOUNT — saves creds, sets VERIFYING. Worker does the rest.
+# ★ Password is encrypted at rest before it hits the DB (encrypt_secret).
 # ============================================================================
 @router.post("/mt5-account")
 def save_mt5_account(data: MT5AccountCreate, db: Session = Depends(get_db)):
@@ -204,7 +194,7 @@ def save_mt5_account(data: MT5AccountCreate, db: Session = Depends(get_db)):
 
     if account:
         account.login      = data.login
-        account.password   = data.password
+        account.password   = encrypt_secret(data.password)   # ★ encrypted at rest
         account.server     = data.server
         account.risk_level = risk_level
         account.is_active  = True
@@ -219,7 +209,7 @@ def save_mt5_account(data: MT5AccountCreate, db: Session = Depends(get_db)):
         account = ClientMT5Account(
             license_id          = license_row.id,
             login               = data.login,
-            password            = data.password,
+            password            = encrypt_secret(data.password),   # ★ encrypted at rest
             server              = data.server,
             risk_level          = risk_level,
             is_active           = True,
@@ -324,8 +314,8 @@ def update_risk_level(data: RiskLevelUpdate, db: Session = Depends(get_db)):
 # Stop AI sets ai_auto_trade=False so the execution worker stops opening NEW
 # trades for this user. Existing open positions continue being managed (BE
 # lock, partials, trailing) until they close naturally — same way a pro
-# trader would close out positions cleanly. Use /stop-ai-now if a user wants
-# everything force-closed (not implemented here — needs MT5 access).
+# trader would close out positions cleanly. For "close everything NOW", use
+# POST /close-all (the panic button) below.
 # ============================================================================
 class AIToggle(BaseModel):
     license_key: str
@@ -386,6 +376,43 @@ def stop_ai(data: AIToggle, db: Session = Depends(get_db)):
     }
 
 
+# ============================================================================
+# ★ CLOSE ALL — USER PANIC BUTTON
+# Queues an immediate close-everything for this account and stops the AI.
+# The execution worker honors the flag at the top of its next cycle (within
+# ~LOOP_DELAY seconds), closes every open position it manages on this
+# account, then clears the flag. Outcomes are recorded by the worker's normal
+# reconciliation, so Trade History and the learning loop stay correct.
+# ============================================================================
+@router.post("/close-all")
+def close_all_positions(data: AIToggle, db: Session = Depends(get_db)):
+    license_row = db.query(License).filter(
+        License.license_key == data.license_key
+    ).first()
+    if not license_row:
+        raise HTTPException(status_code=400, detail="Invalid license key")
+
+    account = db.query(ClientMT5Account).filter(
+        ClientMT5Account.license_id == license_row.id
+    ).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="No MT5 account connected")
+
+    account.close_all_requested = True
+    account.ai_auto_trade = False          # panic = also stop new entries
+    db.commit()
+
+    logger.info("🧯 CLOSE-ALL queued: login=%s", account.login)
+
+    return {
+        "success": True,
+        "close_all_requested": True,
+        "ai_auto_trade": False,
+        "message": "Close-all queued — the engine will close every open "
+                   "position within seconds and stop the AI.",
+    }
+
+
 @router.get("/ai-state")
 def get_ai_state(license_key: str, db: Session = Depends(get_db)):
     """Quick check whether AI is currently running for this user."""
@@ -406,6 +433,37 @@ def get_ai_state(license_key: str, db: Session = Depends(get_db)):
         "ai_auto_trade": bool(account.ai_auto_trade),
         "verified":      bool(account.is_verified),
         "status":        account.verification_status or "PENDING",
+    }
+
+
+# ============================================================================
+# ★ ENGINE STATUS — dashboard health for the whole AI engine
+# Reads WorkerHeartbeat rows (written by the trader shards, watcher and
+# verifier every few cycles). online = beat within the last 3 minutes.
+# The app can finally show "engine online, last cycle Xs ago" instead of
+# going silently dark when a Windows box dies.
+# ============================================================================
+@router.get("/engine-status")
+def engine_status(db: Session = Depends(get_db)):
+    rows = db.query(WorkerHeartbeat).all()
+    now = datetime.now(timezone.utc)
+    workers = []
+    for r in rows:
+        lb = r.last_beat
+        if lb is not None and lb.tzinfo is None:
+            lb = lb.replace(tzinfo=timezone.utc)
+        age = int((now - lb).total_seconds()) if lb else None
+        workers.append({
+            "name":        r.worker_name,
+            "detail":      r.detail,
+            "last_beat":   lb.isoformat() if lb else None,
+            "age_seconds": age,
+            "online":      age is not None and age < 180,
+        })
+    return {
+        "success":    True,
+        "workers":    workers,
+        "all_online": bool(workers) and all(w["online"] for w in workers),
     }
 
 
@@ -551,10 +609,13 @@ def get_ai_settings(license_key: str, db: Session = Depends(get_db)):
     ).first()
     risk_level = (account.risk_level if account and account.risk_level else "medium")
 
-    # Return what the worker will ACTUALLY use: the user's own per-symbol lot
-    # (exactly as they typed it) and 1 trade per symbol (the safe operational
-    # limit). If a symbol has no lot set yet, fall back to the mode lot so the
-    # field isn't blank, but the user's typed value always wins.
+    # ★ HONEST LOT — return exactly what the worker will use: the user's own
+    # per-symbol lot, or NOTHING. The worker hard-refuses symbols with no lot
+    # set (`no_lot_set`), so the old mode-lot fallback here showed users
+    # "0.02" for symbols the engine silently never traded — a support-ticket
+    # generator. Now: lot_size is null and needs_lot is true when the user
+    # hasn't typed a lot, and the app must force the input before the symbol
+    # is presented as trading.
     mode_trades = _DISPLAY_MODE_MAX_TRADES.get((risk_level or "medium").lower(), 3)
     out_symbols = []
     for s in settings:
@@ -562,13 +623,11 @@ def get_ai_settings(license_key: str, db: Session = Depends(get_db)):
             user_lot = float(s.lot_size) if s.lot_size else 0
         except (ValueError, TypeError):
             user_lot = 0
-        if user_lot and user_lot > 0:
-            eff_lot = user_lot
-        else:
-            eff_lot, _ = _effective_lot_and_trades(s.symbol_name, risk_level)
+        has_lot = bool(user_lot and user_lot > 0)
         out_symbols.append({
             "symbol":          s.symbol_name,
-            "lot_size":        eff_lot,
+            "lot_size":        user_lot if has_lot else None,   # null = not set
+            "needs_lot":       not has_lot,                     # UI must prompt
             "max_open_trades": mode_trades,
             "trade_direction": s.trade_direction or "both",
         })
@@ -582,6 +641,7 @@ def get_ai_settings(license_key: str, db: Session = Depends(get_db)):
         # a user's saved lots show up when they reopen the settings screen.
         "symbol_configs": [
             {"symbol": s["symbol"], "lot_size": s["lot_size"],
+             "needs_lot": s["needs_lot"],
              "trade_direction": s["trade_direction"]}
             for s in out_symbols
         ],
@@ -722,7 +782,7 @@ def get_trade_history(license_key: str, db: Session = Depends(get_db)):
 
     # Show ALL AI-executed closed trades for this license. The data is kept
     # clean by (a) the corrected write_trade_outcome (close-deals-only +
-    # sanity cap) so values match MT5, and (b) the /reset-history endpoint
+    # cent scaling) so values match MT5, and (b) the /reset-history endpoint
     # the operator calls at launch to clear any legacy/buggy rows. We do NOT
     # filter by last_verified_at — that timestamp moves on every reconnect
     # and would make a user's history vanish after reconnecting.
@@ -846,8 +906,8 @@ def reset_trade_history(license_key: str = None, body: dict = Body(default=None)
     Use this once at launch (or whenever you want a fresh start) to clear out
     trades recorded by older, buggy worker versions whose profit values don't
     match MT5. After this, only NEW trades the execution worker records — using
-    the corrected close-deal-only + sanity-capped profit logic — will appear,
-    so Trade History and Signals Pro match MT5.
+    the corrected close-deal-only profit logic — will appear, so Trade History
+    and Signals Pro match MT5.
     """
     key = license_key or (body or {}).get("license_key")
     if not key:
