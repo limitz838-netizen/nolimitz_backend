@@ -9,6 +9,13 @@
   ✓ BTCUSD broker symbol variants (BTCUSD/BTC/BITCOIN/BTCUSDT)
   ✓ GBPUSD decide_action fix (no more "stuck on WAIT")
   ✓ Min candles 40 (was 60) — handles brokers with limited BTC history
+
+  ── FIX PACK (this revision) ──────────────────────────────────────────────────
+  1. HEARTBEAT TO DB. Upserts a WorkerHeartbeat row after every scan cycle so
+     the API's /engine-status endpoint can show "watcher online, last cycle
+     Xs ago" — before this, a dead watcher just meant silently stale cards.
+  2. Removed calculate_confluence() — it was never called anywhere (dead
+     weight computed on every read of the file, misleading to maintain).
 ================================================================================
 """
 
@@ -25,7 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.ai.models.ai_market_state import AIMarketState
-from app.models import AISignal, AISymbol
+from app.models import AISignal, AISymbol, WorkerHeartbeat
 from app.ai.models.ai_trade_history import AITradeHistory
 
 
@@ -149,6 +156,26 @@ def _handle_shutdown(signum, frame):
 
 sys_signal.signal(sys_signal.SIGINT, _handle_shutdown)
 sys_signal.signal(sys_signal.SIGTERM, _handle_shutdown)
+
+
+# ==============================================================================
+# ★ HEARTBEAT — lets the API/dashboard show "watcher online, last cycle Xs ago"
+# ==============================================================================
+def _beat(db: Session, name: str, detail: str = "") -> None:
+    """Upsert this worker's heartbeat row. Best-effort — never raises."""
+    try:
+        row = db.query(WorkerHeartbeat).filter_by(worker_name=name).first()
+        if not row:
+            row = WorkerHeartbeat(worker_name=name)
+            db.add(row)
+        row.detail = (detail or "")[:200]
+        row.last_beat = datetime.now(timezone.utc)
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 # ==============================================================================
@@ -1182,117 +1209,11 @@ def analyze_smart_money(candles: List[dict]) -> dict:
     }
 
 
-def calculate_confluence(
-    htf_trend: str,
-    smc: dict,
-    momentum_bullish: bool,
-    momentum_bearish: bool,
-) -> dict:
-    """
-    Combines Smart Money + Indicators into one decision.
-
-    Returns:
-    {
-        agreement,
-        direction,
-        score,
-        reasons
-    }
-    """
-
-    result = {
-        "agreement": False,
-        "direction": None,
-        "score": 0,
-        "reasons": [],
-    }
-
-    score = 0
-
-    structure = smc["structure"]
-    bos = smc["bos"]
-    choch = smc["choch"]
-    liquidity = smc["liquidity"]
-    fvg = smc["fvg"]
-    premium = smc["premium_discount"]
-
-    # ----------------------------------
-    # BUY CONFLUENCE
-    # ----------------------------------
-
-    if htf_trend == "BULLISH":
-
-        score += 15
-        result["reasons"].append("HTF_BULL")
-
-        if momentum_bullish:
-            score += 10
-            result["reasons"].append("MOMENTUM")
-
-        if structure["trend"] == "BULLISH":
-            score += 20
-            result["reasons"].append("SMC_BULL")
-
-        if bos["bullish_bos"]:
-            score += 15
-            result["reasons"].append("BOS")
-
-        if liquidity["sell_side_sweep"]:
-            score += 15
-            result["reasons"].append("LIQUIDITY")
-
-        if fvg["bullish_fvg"]:
-            score += 10
-            result["reasons"].append("FVG")
-
-        if premium["discount_zone"]:
-            score += 15
-            result["reasons"].append("DISCOUNT")
-
-        if score >= 60:
-            result["agreement"] = True
-            result["direction"] = "BUY"
-
-    # ----------------------------------
-    # SELL CONFLUENCE
-    # ----------------------------------
-
-    elif htf_trend == "BEARISH":
-
-        score += 15
-        result["reasons"].append("HTF_BEAR")
-
-        if momentum_bearish:
-            score += 10
-            result["reasons"].append("MOMENTUM")
-
-        if structure["trend"] == "BEARISH":
-            score += 20
-            result["reasons"].append("SMC_BEAR")
-
-        if bos["bearish_bos"]:
-            score += 15
-            result["reasons"].append("BOS")
-
-        if liquidity["buy_side_sweep"]:
-            score += 15
-            result["reasons"].append("LIQUIDITY")
-
-        if fvg["bearish_fvg"]:
-            score += 10
-            result["reasons"].append("FVG")
-
-        if premium["premium_zone"]:
-            score += 15
-            result["reasons"].append("PREMIUM")
-
-        if score >= 60:
-            result["agreement"] = True
-            result["direction"] = "SELL"
-
-    result["score"] = score
-
-    return result
+# ★ calculate_confluence() was REMOVED here — it was defined but never called
+# anywhere in the codebase (dead code). The SMC signals it combined are still
+# scored directly inside analyze_xauusd via the BOS block; if a full
+# confluence gate is ever wanted, reintroduce it AND wire it into the
+# strategies — a scoring function that nothing calls is worse than none.
 
 
 def key_support_resistance(candles: List[dict]):
@@ -1998,6 +1919,9 @@ def main():
         db = SessionLocal()
         try:
             scan_all_symbols(db)
+            # ★ DB heartbeat — written after every completed scan so
+            # /engine-status shows the watcher as online with cycle age.
+            _beat(db, "watcher", f"scan_completed")
         except Exception as e:
             logger.error("Main error: %s", e, exc_info=True)
         finally:

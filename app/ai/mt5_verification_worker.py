@@ -28,6 +28,13 @@
     • Honours a per-loop time budget so the loop always stays responsive to
       fresh VERIFYING/REFRESH requests.
 
+  ── FIX PACK (this revision) ──────────────────────────────────────────────────
+  1. CREDENTIALS DECRYPTED AT USE. The API now encrypts passwords at rest
+     (NOLIMITZ_CRED_KEY). This worker decrypts just-in-time at login; legacy
+     plaintext rows pass through decrypt_secret unchanged.
+  2. HEARTBEAT TO DB. Upserts a WorkerHeartbeat row (~every 30s) so the API's
+     /engine-status endpoint can show "verifier online, last beat Xs ago".
+
   NOTE: full isolation from the execution worker (so a verifier hiccup can
   never touch the trading terminal) comes from running the two workers on
   SEPARATE MT5 installs — that's the next task.
@@ -56,7 +63,17 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
-from app.models import ClientMT5Account
+from app.models import ClientMT5Account, WorkerHeartbeat
+
+# ★ Credential decryption — passwords are encrypted at rest by the API when
+# NOLIMITZ_CRED_KEY is set. decrypt_secret() returns legacy plaintext rows
+# unchanged, so this is safe with a mixed DB during rollout. Set the SAME
+# NOLIMITZ_CRED_KEY on this Windows box as on Render.
+try:
+    from app.security_utils import decrypt_secret
+except Exception:
+    def decrypt_secret(v):
+        return v
 
 # The Windows worker is the ONLY thing that touches MT5, so it owns its own
 # terminal lock. The Render API no longer imports MetaTrader5 at all.
@@ -109,6 +126,10 @@ MAX_TRANSIENT_RETRIES     = int(os.environ.get("VERIFY_MAX_TRANSIENT_RETRIES", "
 # users stay responsive instead of waiting behind a pile of slow accounts.
 LOOP_TIME_BUDGET_SEC      = int(os.environ.get("VERIFY_LOOP_BUDGET_SEC", "45"))
 
+# ★ Heartbeat cadence — upsert our WorkerHeartbeat row every N cycles.
+# At LOOP_DELAY=2s, 15 cycles ≈ every 30 seconds.
+HEARTBEAT_EVERY_CYCLES    = int(os.environ.get("VERIFY_HEARTBEAT_CYCLES", "15"))
+
 # Failure backoff schedule (seconds since last attempt before next retry)
 FAILURE_BACKOFF = [60, 120, 300, 900, 1800, 3600]
 
@@ -134,6 +155,26 @@ def _safe_commit(db: Session) -> bool:
         except Exception:
             pass
         return False
+
+
+# ==============================================================================
+# ★ HEARTBEAT — lets the API/dashboard show "verifier online, last beat Xs ago"
+# ==============================================================================
+def _beat(db: Session, name: str, detail: str = "") -> None:
+    """Upsert this worker's heartbeat row. Best-effort — never raises."""
+    try:
+        row = db.query(WorkerHeartbeat).filter_by(worker_name=name).first()
+        if not row:
+            row = WorkerHeartbeat(worker_name=name)
+            db.add(row)
+        row.detail = (detail or "")[:200]
+        row.last_beat = datetime.now(timezone.utc)
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 # ==============================================================================
@@ -411,7 +452,9 @@ def verify_one_account(account: ClientMT5Account, db: Session) -> bool:
         return False
 
     try:
-        connected, kind = _connect_account(login_int, account.password, account.server)
+        # ★ Decrypt just-in-time — legacy plaintext rows pass through unchanged.
+        connected, kind = _connect_account(
+            login_int, decrypt_secret(account.password), account.server)
 
         # ── SUCCESS ──────────────────────────────────────────────────────────
         if connected:
@@ -635,6 +678,11 @@ def main_loop():
                 elif cycle % 20 == 0:
                     # Quiet heartbeat every ~100s when nothing to do
                     logger.info("💓 idle — no accounts due for verification")
+
+                # ★ DB heartbeat (~every 30s) so /engine-status shows this
+                # worker as online. Written whether the cycle was busy or idle.
+                if cycle % HEARTBEAT_EVERY_CYCLES == 1:
+                    _beat(db, "verifier", f"cycle={cycle}")
             except Exception as e:
                 logger.error("DB cycle error: %s", e)
                 try:
