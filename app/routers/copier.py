@@ -1,5 +1,33 @@
-import asyncio
-from app.execution_dispatcher import dispatch_trade
+"""
+================================================================================
+  COPIER ROUTER  —  master account → licensed client accounts
+================================================================================
+
+  ── FIXES IN THIS REVISION ───────────────────────────────────────────────────
+  1. `TradeTicketMap.is_closed` → `is_open`. The close branch referenced a
+     column that does not exist, so EVERY /copier/close 500'd with an
+     AttributeError while opens worked. Closes would never have propagated.
+  2. Removed `import asyncio` and `from app.execution_dispatcher import
+     dispatch_trade`. The dispatch call itself was already deleted (it was the
+     `no running event loop` crash); these leftovers still dragged
+     MetaApiService into every request through the import chain.
+  3. `/copier/executions/{id}/account` referenced `mt5.mt_login` / `mt5.mt_server`,
+     which are not columns on ClientMT5Account (they are `login` / `server`), so
+     it 500'd whenever it got that far. Fixed, and the hard MetaAPI requirement
+     downgraded to an optional field since MetaAPI was dropped.
+  4. Machine-only routes (claim / update / ticket-map writes) now require the
+     same X-Worker-Token used by /worker/*. Nothing calls them over HTTP any
+     more — the execution worker reads and writes these rows directly through
+     the database — so this closes the hole without breaking a caller.
+
+  ── HOW EXECUTION ACTUALLY HAPPENS ───────────────────────────────────────────
+  This router only CREATES pending TradeExecution rows. It does not dispatch.
+  `app/ai/copier_executor.py`, running inside ai_execution_worker, polls for
+  `status == "pending"` and places the trades on each client's terminal.
+  Creating the row IS the dispatch.
+================================================================================
+"""
+
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -28,6 +56,9 @@ from app.schemas import (
     TradeTicketMapItem,
 )
 from app.security import decrypt_text
+
+# Shared machine-caller secret, defined once in the worker router.
+from app.routers.mt5_workers import require_worker_token
 
 router = APIRouter(prefix="/copier", tags=["Copier"])
 
@@ -86,7 +117,10 @@ def get_ea_by_code_for_admin(ea_code: str, current_admin: Admin, db: Session) ->
 
     return ea
 
+
 def get_ea_by_id_for_admin(ea_id: int, current_admin: Admin, db: Session) -> ExpertAdvisor:
+    """Ownership check lives here — this is what keeps one tenant's master
+    trades from ever reaching another tenant's licence holders."""
     ea = db.query(ExpertAdvisor).filter(
         ExpertAdvisor.id == ea_id,
         ExpertAdvisor.admin_id == current_admin.id,
@@ -141,35 +175,35 @@ def serialize_ticket_map(row: TradeTicketMap) -> TradeTicketMapItem:
 def normalize_symbol(symbol: str) -> str:
     return symbol.strip().upper()
 
+
 def get_symbol_aliases(symbol: str) -> list[str]:
+    """Brokers name the same instrument differently — XAUUSD, XAUUSDm, GOLD.
+    The client enabled whichever their broker offers, so match them all.
+
+    NOTE: app/ai/copier_executor.py must use the SAME alias list when it looks
+    up the client's symbol setting, or the router will create rows the executor
+    then skips as "not enabled by client".
+    """
     base = normalize_symbol(symbol)
 
     alias_map = {
-        "XAUUSD": ["XAUUSD", "XAUUSDM", "GOLD", "GOLDM", "XAUUSD.", "XAUUSDm"],
-        "BTCUSD": ["BTCUSD", "BTCUSDM", "BTCUSDT", "BTCUSD.", "BTCUSDm"],
-        "ETHUSD": ["ETHUSD", "ETHUSDM", "ETHUSDT", "ETHUSD.", "ETHUSDm"],
-        "EURUSD": ["EURUSD", "EURUSDM", "EURUSD.", "EURUSDm"],
-        "GBPUSD": ["GBPUSD", "GBPUSDM", "GBPUSD.", "GBPUSDm"],
-        "USDJPY": ["USDJPY", "USDJPYM", "USDJPY.", "USDJPYm"],
+        "XAUUSD": ["XAUUSD", "XAUUSDM", "XAUUSDC", "GOLD", "GOLDM", "XAUUSD."],
+        "BTCUSD": ["BTCUSD", "BTCUSDM", "BTCUSDT", "BTCUSD."],
+        "ETHUSD": ["ETHUSD", "ETHUSDM", "ETHUSDT", "ETHUSD."],
+        "EURUSD": ["EURUSD", "EURUSDM", "EURUSDC", "EURUSD."],
+        "GBPUSD": ["GBPUSD", "GBPUSDM", "GBPUSDC", "GBPUSD."],
+        "USDJPY": ["USDJPY", "USDJPYM", "USDJPYC", "USDJPY."],
     }
 
     return [normalize_symbol(x) for x in alias_map.get(base, [base])]
 
 
-def license_can_receive_execution(license_row: License) -> bool:
-    if not license_row.is_active:
-        return False
-
-    if hasattr(license_row, "execution_enabled") and not license_row.execution_enabled:
-        return False
-
-    if hasattr(license_row, "execution_started_at") and license_row.execution_started_at is None:
-        return False
-
-    return True
-
-
 def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> List[TradeExecution]:
+    """Fan the master event out to every eligible licence on this EA.
+
+    Scoped by ea_id, and the EA's ownership was already checked by
+    get_ea_by_id_for_admin, so this cannot cross tenants.
+    """
     licenses = db.query(License).filter(
         License.ea_id == event.ea_id,
         License.is_active == True,
@@ -181,16 +215,13 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
 
     for license_row in licenses:
 
-        # 🚨 CRITICAL FIX: REMOVE OVER-FILTERING
-        # Only check MT5 + symbol, NOT execution_enabled or start time
-
-        mt5 = db.query(ClientMT5Account).filter(
+        mt5_account = db.query(ClientMT5Account).filter(
             ClientMT5Account.license_id == license_row.id,
             ClientMT5Account.is_active == True,
             ClientMT5Account.is_verified == True,
         ).first()
 
-        if not mt5:
+        if not mt5_account:
             print(f"[SKIP] license={license_row.id} reason=no_active_verified_mt5")
             continue
 
@@ -204,7 +235,8 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
             print(f"[SKIP] license={license_row.id} reason=symbol_not_enabled")
             continue
 
-        # ✅ Direction check ONLY for OPEN
+        # Direction preference applies to OPEN only — a client who only takes
+        # buys must still be able to close and modify what they already hold.
         if event.event_type == "open":
             client_direction = (symbol_setting.trade_direction or "both").lower()
             event_action = (event.action or "").lower()
@@ -213,19 +245,20 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
                 print(f"[SKIP] license={license_row.id} reason=direction_blocked")
                 continue
 
-        # ✅ CLOSE check
+        # For CLOSE, only queue clients that actually hold an open copy of this
+        # master ticket. The column is is_open — is_closed does not exist and
+        # referencing it 500'd every close event.
         if event.event_type == "close":
             open_map = db.query(TradeTicketMap).filter(
                 TradeTicketMap.license_id == license_row.id,
                 TradeTicketMap.master_ticket == event.master_ticket,
-                TradeTicketMap.is_closed == False,
+                TradeTicketMap.is_open == True,
             ).first()
 
             if not open_map:
                 print(f"[SKIP] license={license_row.id} reason=no_open_position")
                 continue
 
-        # 🚀 CREATE EXECUTION (THIS WAS FAILING BEFORE)
         execution = TradeExecution(
             copier_event_id=event.id,
             license_id=license_row.id,
@@ -234,6 +267,8 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
             client_ticket=None,
             symbol=event.symbol,
             action=event.action,
+            # The CLIENT's lot size, never the master's. This is what makes one
+            # master trade safe across accounts of wildly different sizes.
             lot_size=symbol_setting.lot_size,
             sl=event.sl,
             tp=event.tp,
@@ -396,8 +431,16 @@ def list_my_executions(
 @router.post("/executions/claim", response_model=List[TradeExecutionItem])
 def claim_pending_executions(
     limit: int = Query(default=10, ge=1, le=100),
+    _: bool = Depends(require_worker_token),
     db: Session = Depends(get_db),
 ):
+    """Legacy HTTP claim path, kept for compatibility.
+
+    The live executor does NOT use this — it reads pending rows straight from
+    the database inside the execution worker. Left behind a worker token so an
+    anonymous caller cannot claim rows and silently stop trades reaching
+    clients.
+    """
     rows = db.query(TradeExecution).filter(
         TradeExecution.status == "pending"
     ).order_by(TradeExecution.id.asc()).limit(limit).all()
@@ -417,6 +460,7 @@ def claim_pending_executions(
 def update_execution_result(
     execution_id: int,
     payload: ExecutionUpdateRequest,
+    _: bool = Depends(require_worker_token),
     db: Session = Depends(get_db),
 ):
     row = db.query(TradeExecution).filter(
@@ -444,51 +488,50 @@ def update_execution_result(
 @router.get("/executions/{execution_id}/account")
 def get_execution_account(
     execution_id: int,
+    _: bool = Depends(require_worker_token),
     db: Session = Depends(get_db),
 ):
-    try:
-        row = db.query(TradeExecution).filter(
-            TradeExecution.id == execution_id
-        ).first()
+    """Account details for an execution.
 
-        if not row:
-            raise HTTPException(status_code=404, detail="Execution row not found")
+    Column names corrected: ClientMT5Account uses login / server, not
+    mt_login / mt_server, so this used to 500. The MetaAPI id is returned when
+    present but is no longer required — MetaAPI was dropped and demanding it
+    made this endpoint fail for every account.
 
-        license_row = db.query(License).filter(
-            License.id == row.license_id
-        ).first()
+    The password is deliberately not returned; the executor reads it from the
+    database on the same host and never over the network.
+    """
+    row = db.query(TradeExecution).filter(
+        TradeExecution.id == execution_id
+    ).first()
 
-        if not license_row:
-            raise HTTPException(status_code=404, detail="License not found for this execution")
+    if not row:
+        raise HTTPException(status_code=404, detail="Execution row not found")
 
-        mt5 = db.query(ClientMT5Account).filter(
-            ClientMT5Account.license_id == row.license_id
-        ).first()
+    license_row = db.query(License).filter(
+        License.id == row.license_id
+    ).first()
 
-        if not mt5:
-            raise HTTPException(status_code=404, detail="No MT5 account found for this execution")
+    if not license_row:
+        raise HTTPException(status_code=404, detail="License not found for this execution")
 
-        if not mt5.metaapi_account_id:
-           raise HTTPException(
-           status_code=400,
-           detail="MetaApi account is not linked for this execution"
-        )
+    account = db.query(ClientMT5Account).filter(
+        ClientMT5Account.license_id == row.license_id
+    ).first()
 
-        return {
-            "execution_id": row.id,
-            "license_id": row.license_id,
-            "license_key": license_row.license_key,
-            "mt_login": mt5.mt_login,
-            "mt_server": mt5.mt_server,
-            "metaapi_account_id": mt5.metaapi_account_id,
-            "is_active": mt5.is_active,
-            "is_verified": mt5.is_verified,
-        }
+    if not account:
+        raise HTTPException(status_code=404, detail="No MT5 account found for this execution")
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get execution account: {str(e)}")
+    return {
+        "execution_id": row.id,
+        "license_id": row.license_id,
+        "license_key": license_row.license_key,
+        "login": account.login,
+        "server": account.server,
+        "metaapi_account_id": getattr(account, "metaapi_account_id", None),
+        "is_active": account.is_active,
+        "is_verified": account.is_verified,
+    }
 
 
 # =========================
@@ -548,6 +591,7 @@ def get_ticket_maps_by_keys(
 @router.post("/ticket-maps/upsert")
 def upsert_ticket_map(
     payload: Dict[str, Any],
+    _: bool = Depends(require_worker_token),
     db: Session = Depends(get_db),
 ):
     required_fields = ["license_id", "ea_id", "master_ticket", "client_ticket", "symbol"]
@@ -602,6 +646,7 @@ def upsert_ticket_map(
 @router.post("/ticket-maps/mark-closed")
 def mark_ticket_map_closed(
     payload: Dict[str, Any],
+    _: bool = Depends(require_worker_token),
     db: Session = Depends(get_db),
 ):
     required_fields = ["license_id", "ea_id", "master_ticket"]
