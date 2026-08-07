@@ -254,9 +254,6 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
     for row in created_rows:
         db.refresh(row)
 
-        # 🚀 INSTANT EXECUTION
-        asyncio.create_task(dispatch_trade(row.id))
-
     return created_rows
 
 
