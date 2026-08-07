@@ -107,8 +107,8 @@ def get_pending_mt5_accounts(
         results.append({
             "id": row.id,
             "license_id": row.license_id,
-            "mt_login": row.mt_login,
-            "mt_server": row.mt_server,
+            "login": row.login,
+            "server": row.server,
         })
 
     return {
