@@ -332,6 +332,9 @@ def create_event_and_executions(
     price: str | None,
     comment: str | None,
 ) -> CreateExecutionsResponse:
+    # Stamp the admin's own EA name onto the trade so clients see the brand
+    # they subscribed to, not the master's raw comment. MT5 truncates at 31.
+    ea_label = (getattr(ea, "name", None) or ea.ea_code or "Copier")[:31]
     event = CopierTradeEvent(
         source_admin_id=current_admin.id,
         ea_id=ea.id,
@@ -344,7 +347,7 @@ def create_event_and_executions(
         sl=sl,
         tp=tp,
         price=price,
-        comment=comment,
+        comment=ea_label,
         status="pending",
     )
     db.add(event)
