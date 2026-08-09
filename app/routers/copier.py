@@ -4,9 +4,11 @@
 ================================================================================
 
   ── FIXES IN THIS REVISION ───────────────────────────────────────────────────
-  1. `TradeTicketMap.is_closed` → `is_open`. The close branch referenced a
-     column that does not exist, so EVERY /copier/close 500'd with an
-     AttributeError while opens worked. Closes would never have propagated.
+  1. The CLOSE branch is back to `TradeTicketMap.is_closed == False`. The real
+     columns on this table are id, license_id, execution_id, master_ticket,
+     client_ticket, symbol, is_closed, closed_by_client, closed_at, last_error,
+     created_at. There is no is_open, no ea_id and no child_ticket_index — a
+     previous revision assumed otherwise and 500'd every close.
   2. Removed `import asyncio` and `from app.execution_dispatcher import
      dispatch_trade`. The dispatch call itself was already deleted (it was the
      `no running event loop` crash); these leftovers still dragged
@@ -28,6 +30,7 @@
 ================================================================================
 """
 
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -57,10 +60,26 @@ from app.schemas import (
 )
 from app.security import decrypt_text
 
-# Shared machine-caller secret, defined once in the worker router.
-from app.routers.mt5_workers import require_worker_token
-
 router = APIRouter(prefix="/copier", tags=["Copier"])
+
+
+# =========================
+# WORKER AUTH
+# =========================
+# Defined locally rather than imported from app.routers.mt5_workers. That
+# cross-router import was the only structural change in the previous revision,
+# and the deploy hung before binding a port — so every router stays
+# self-contained from here on.
+WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
+
+
+def require_worker_token(x_worker_token: str = Header(None)):
+    """Shared secret for routes no browser should ever reach."""
+    if not WORKER_TOKEN:
+        raise HTTPException(status_code=503, detail="WORKER_TOKEN is not configured")
+    if x_worker_token != WORKER_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid worker token")
+    return True
 
 
 # =========================
@@ -155,21 +174,27 @@ def serialize_execution(row: TradeExecution) -> TradeExecutionItem:
     )
 
 
-def serialize_ticket_map(row: TradeTicketMap) -> TradeTicketMapItem:
-    return TradeTicketMapItem(
-        id=row.id,
-        license_id=row.license_id,
-        ea_id=row.ea_id,
-        master_ticket=row.master_ticket,
-        child_ticket_index=row.child_ticket_index,
-        client_ticket=row.client_ticket,
-        symbol=row.symbol,
-        action=row.action,
-        is_open=row.is_open,
-        manually_closed=row.manually_closed,
-        opened_at=row.opened_at,
-        closed_at=row.closed_at,
-    )
+def serialize_ticket_map(row: TradeTicketMap) -> Dict[str, Any]:
+    """Plain dict rather than TradeTicketMapItem.
+
+    That schema expects ea_id, child_ticket_index, action, is_open,
+    manually_closed and opened_at — none of which exist on this table — so
+    every ticket-map endpoint raised AttributeError. Returning the real columns
+    keeps them usable without touching schemas.py.
+    """
+    return {
+        "id": row.id,
+        "license_id": row.license_id,
+        "execution_id": row.execution_id,
+        "master_ticket": row.master_ticket,
+        "client_ticket": row.client_ticket,
+        "symbol": row.symbol,
+        "is_closed": row.is_closed,
+        "closed_by_client": row.closed_by_client,
+        "closed_at": row.closed_at,
+        "last_error": row.last_error,
+        "created_at": row.created_at,
+    }
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -246,13 +271,14 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
                 continue
 
         # For CLOSE, only queue clients that actually hold an open copy of this
-        # master ticket. The column is is_open — is_closed does not exist and
-        # referencing it 500'd every close event.
+        # master ticket. The real column is is_closed — there is no is_open on
+        # this table, and an earlier revision of this file wrongly "fixed" it
+        # to is_open, which is what made every close event 500.
         if event.event_type == "close":
             open_map = db.query(TradeTicketMap).filter(
                 TradeTicketMap.license_id == license_row.id,
                 TradeTicketMap.master_ticket == event.master_ticket,
-                TradeTicketMap.is_open == True,
+                TradeTicketMap.is_closed == False,  # noqa: E712
             ).first()
 
             if not open_map:
@@ -537,7 +563,7 @@ def get_execution_account(
 # =========================
 # TICKET MAPS
 # =========================
-@router.get("/ticket-maps", response_model=List[TradeTicketMapItem])
+@router.get("/ticket-maps")
 def list_ticket_maps(
     db: Session = Depends(get_db),
 ):
@@ -545,7 +571,7 @@ def list_ticket_maps(
     return [serialize_ticket_map(row) for row in rows]
 
 
-@router.get("/ticket-maps/by-execution/{execution_id}", response_model=List[TradeTicketMapItem])
+@router.get("/ticket-maps/by-execution/{execution_id}")
 def get_ticket_maps_for_execution(
     execution_id: int,
     db: Session = Depends(get_db),
@@ -559,9 +585,8 @@ def get_ticket_maps_for_execution(
 
     rows = db.query(TradeTicketMap).filter(
         TradeTicketMap.license_id == execution.license_id,
-        TradeTicketMap.ea_id == execution.ea_id,
         TradeTicketMap.master_ticket == execution.master_ticket,
-    ).order_by(TradeTicketMap.child_ticket_index.asc()).all()
+    ).order_by(TradeTicketMap.id.asc()).all()
 
     if not rows:
         raise HTTPException(status_code=404, detail="Ticket map not found")
@@ -569,7 +594,7 @@ def get_ticket_maps_for_execution(
     return [serialize_ticket_map(row) for row in rows]
 
 
-@router.get("/ticket-maps/by-keys", response_model=List[TradeTicketMapItem])
+@router.get("/ticket-maps/by-keys")
 def get_ticket_maps_by_keys(
     license_id: int,
     ea_id: int,
@@ -578,9 +603,8 @@ def get_ticket_maps_by_keys(
 ):
     rows = db.query(TradeTicketMap).filter(
         TradeTicketMap.license_id == license_id,
-        TradeTicketMap.ea_id == ea_id,
         TradeTicketMap.master_ticket == master_ticket,
-    ).order_by(TradeTicketMap.child_ticket_index.asc()).all()
+    ).order_by(TradeTicketMap.id.asc()).all()
 
     if not rows:
         raise HTTPException(status_code=404, detail="Ticket map not found")
@@ -594,47 +618,42 @@ def upsert_ticket_map(
     _: bool = Depends(require_worker_token),
     db: Session = Depends(get_db),
 ):
-    required_fields = ["license_id", "ea_id", "master_ticket", "client_ticket", "symbol"]
-    for field in required_fields:
+    """Keyed on client_ticket. Without child_ticket_index, the client ticket is
+    what distinguishes the children of a multi-trade fan-out."""
+    for field in ["license_id", "master_ticket", "client_ticket", "symbol"]:
         if field not in payload:
             raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
 
     license_id = int(payload["license_id"])
-    ea_id = int(payload["ea_id"])
     master_ticket = str(payload["master_ticket"]).strip()
-    child_ticket_index = int(payload.get("child_ticket_index", 1))
+    client_ticket = str(payload["client_ticket"])
 
     row = db.query(TradeTicketMap).filter(
         TradeTicketMap.license_id == license_id,
-        TradeTicketMap.ea_id == ea_id,
         TradeTicketMap.master_ticket == master_ticket,
-        TradeTicketMap.child_ticket_index == child_ticket_index,
+        TradeTicketMap.client_ticket == client_ticket,
     ).first()
 
     if row:
-        row.client_ticket = str(payload["client_ticket"])
         row.symbol = str(payload["symbol"]).strip()
-        row.action = payload.get("action")
-        row.is_open = bool(payload.get("is_open", row.is_open))
-        row.manually_closed = bool(payload.get("manually_closed", row.manually_closed))
-
+        row.is_closed = bool(payload.get("is_closed", row.is_closed))
+        row.closed_by_client = bool(payload.get("closed_by_client", row.closed_by_client))
+        if payload.get("execution_id") is not None:
+            row.execution_id = int(payload["execution_id"])
         if payload.get("closed_at"):
             row.closed_at = datetime.fromisoformat(str(payload["closed_at"]))
-
         db.commit()
         db.refresh(row)
         return {"message": "Ticket map updated", "id": row.id}
 
     new_row = TradeTicketMap(
         license_id=license_id,
-        ea_id=ea_id,
+        execution_id=payload.get("execution_id"),
         master_ticket=master_ticket,
-        child_ticket_index=child_ticket_index,
-        client_ticket=str(payload["client_ticket"]),
+        client_ticket=client_ticket,
         symbol=str(payload["symbol"]).strip(),
-        action=payload.get("action"),
-        is_open=bool(payload.get("is_open", True)),
-        manually_closed=bool(payload.get("manually_closed", False)),
+        is_closed=bool(payload.get("is_closed", False)),
+        closed_by_client=bool(payload.get("closed_by_client", False)),
     )
     db.add(new_row)
     db.commit()
@@ -649,16 +668,14 @@ def mark_ticket_map_closed(
     _: bool = Depends(require_worker_token),
     db: Session = Depends(get_db),
 ):
-    required_fields = ["license_id", "ea_id", "master_ticket"]
-    for field in required_fields:
+    for field in ["license_id", "master_ticket"]:
         if field not in payload:
             raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
 
     rows = db.query(TradeTicketMap).filter(
         TradeTicketMap.license_id == int(payload["license_id"]),
-        TradeTicketMap.ea_id == int(payload["ea_id"]),
         TradeTicketMap.master_ticket == str(payload["master_ticket"]).strip(),
-        TradeTicketMap.is_open == True,
+        TradeTicketMap.is_closed == False,  # noqa: E712
     ).all()
 
     if not rows:
@@ -667,8 +684,8 @@ def mark_ticket_map_closed(
     now = utc_now()
 
     for row in rows:
-        row.is_open = False
-        row.manually_closed = bool(payload.get("manually_closed", False))
+        row.is_closed = True
+        row.closed_by_client = bool(payload.get("closed_by_client", False))
         row.closed_at = now
 
     db.commit()
@@ -676,7 +693,7 @@ def mark_ticket_map_closed(
     return {"message": "Ticket maps closed successfully", "count": len(rows)}
 
 
-@router.get("/ticket-maps/by-keys/all-open", response_model=List[TradeTicketMapItem])
+@router.get("/ticket-maps/by-keys/all-open")
 def get_open_ticket_maps_by_keys(
     license_id: int,
     ea_id: int,
@@ -685,9 +702,8 @@ def get_open_ticket_maps_by_keys(
 ):
     rows = db.query(TradeTicketMap).filter(
         TradeTicketMap.license_id == license_id,
-        TradeTicketMap.ea_id == ea_id,
         TradeTicketMap.master_ticket == master_ticket,
-        TradeTicketMap.is_open == True,
-    ).order_by(TradeTicketMap.child_ticket_index.asc()).all()
+        TradeTicketMap.is_closed == False,  # noqa: E712
+    ).order_by(TradeTicketMap.id.asc()).all()
 
     return [serialize_ticket_map(row) for row in rows]
