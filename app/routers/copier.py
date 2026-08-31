@@ -4,11 +4,32 @@
 ================================================================================
 
   ── FIXES IN THIS REVISION ───────────────────────────────────────────────────
-  1. The CLOSE branch is back to `TradeTicketMap.is_closed == False`. The real
+  1. MODIFY now gets the same open-position filter as CLOSE. Previously only
+     `event_type == "close"` was checked, so every SL/TP change on the master
+     fanned out to EVERY licence on the EA, including the ones holding nothing.
+     Measured 31 Aug: 150 of 258 copier events in one hour were modifies, and
+     the fast lane spent ~4s of MT5 login on each one only to have
+     _handle_modify return "no open trades mapped to this master ticket".
+  2. Added a race guard to that filter. A close or modify can legitimately
+     arrive before the client's own OPEN has executed — on a fast scalp the
+     open is still queued, so no ticket map exists yet. Skipping on that basis
+     would strand the client in a position the master has already exited. The
+     guard defers to the slow path whenever an open is still pending or
+     processing for the same master ticket. This hole existed in the close
+     branch before this revision too.
+
+  ── PREVIOUS REVISION ────────────────────────────────────────────────────────
+  1. The CLOSE branch uses `TradeTicketMap.is_closed == False`. The real
      columns on this table are id, license_id, execution_id, master_ticket,
      client_ticket, symbol, is_closed, closed_by_client, closed_at, last_error,
      created_at. There is no is_open, no ea_id and no child_ticket_index — a
      previous revision assumed otherwise and 500'd every close.
+
+     BEWARE: a SECOND table named `trade_ticket_maps` exists in the same
+     database with exactly those legacy columns (is_open, ea_id,
+     child_ticket_index, manually_closed). It holds 0 rows and nothing writes
+     to it. The live table is `ticket_maps` — always confirm against
+     TradeTicketMap.__tablename__ rather than the table name that reads better.
   2. Removed `import asyncio` and `from app.execution_dispatcher import
      dispatch_trade`. The dispatch call itself was already deleted (it was the
      `no running event loop` crash); these leftovers still dragged
@@ -24,7 +45,7 @@
 
   ── HOW EXECUTION ACTUALLY HAPPENS ───────────────────────────────────────────
   This router only CREATES pending TradeExecution rows. It does not dispatch.
-  `app/ai/copier_executor.py`, running inside ai_execution_worker, polls for
+  `app/ai/copier_executor.py`, running inside the copier fast lane, polls for
   `status == "pending"` and places the trades on each client's terminal.
   Creating the row IS the dispatch.
 ================================================================================
@@ -205,9 +226,10 @@ def get_symbol_aliases(symbol: str) -> list[str]:
     """Brokers name the same instrument differently — XAUUSD, XAUUSDm, GOLD.
     The client enabled whichever their broker offers, so match them all.
 
-    NOTE: app/ai/copier_executor.py must use the SAME alias list when it looks
-    up the client's symbol setting, or the router will create rows the executor
-    then skips as "not enabled by client".
+    NOTE: app/ai/copier_executor.py resolves symbols against the client's own
+    terminal now, but it still looks up ClientSymbolSetting by a canonical key,
+    so a symbol missing from this map can still create rows the executor then
+    skips as "not enabled by client".
     """
     base = normalize_symbol(symbol)
 
@@ -270,18 +292,39 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
                 print(f"[SKIP] license={license_row.id} reason=direction_blocked")
                 continue
 
-        # For CLOSE, only queue clients that actually hold an open copy of this
-        # master ticket. The real column is is_closed — there is no is_open on
-        # this table, and an earlier revision of this file wrongly "fixed" it
-        # to is_open, which is what made every close event 500.
-        if event.event_type == "close":
+        # For CLOSE and MODIFY, only queue clients that actually hold an open
+        # copy of this master ticket.
+        #
+        # MODIFY was previously excluded from this check, which is why a
+        # trailing stop fanned out to every licence on the EA — 150 of 258
+        # events in one measured hour, most of them resolving to "no open
+        # trades mapped to this master ticket" only after a ~4s MT5 login.
+        #
+        # The real column is is_closed. There is no is_open on this table, and
+        # an earlier revision wrongly "fixed" it to is_open, which 500'd every
+        # close event.
+        if event.event_type in ("close", "modify"):
             open_map = db.query(TradeTicketMap).filter(
                 TradeTicketMap.license_id == license_row.id,
                 TradeTicketMap.master_ticket == event.master_ticket,
                 TradeTicketMap.is_closed == False,  # noqa: E712
             ).first()
 
-            if not open_map:
+            # A close or modify can legitimately arrive before this client's
+            # own OPEN has executed — on a fast scalp the open is still sitting
+            # in the queue, so no ticket map exists yet. Dropping the close on
+            # that basis would leave the client holding a position the master
+            # has already exited, with nothing left to close it. Whenever an
+            # open is still in flight, let the row through and let the executor
+            # decide with the terminal in hand.
+            open_in_flight = db.query(TradeExecution).filter(
+                TradeExecution.license_id == license_row.id,
+                TradeExecution.master_ticket == event.master_ticket,
+                TradeExecution.event_type == "open",
+                TradeExecution.status.in_(("pending", "processing")),
+            ).first()
+
+            if not open_map and not open_in_flight:
                 print(f"[SKIP] license={license_row.id} reason=no_open_position")
                 continue
 
