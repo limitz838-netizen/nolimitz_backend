@@ -4,44 +4,47 @@
 ================================================================================
 
   ── FIXES IN THIS REVISION ───────────────────────────────────────────────────
-  1. MODIFY now gets the same open-position filter as CLOSE. Previously only
+  1. SYMBOLS ARE NO LONGER HARDCODED. get_symbol_aliases() held a fixed map of
+     six instruments and anything else fell through to an exact-name match. So
+     an admin could add NAS100 or Volatility 75 Index to their licence keys and
+     every fan-out would skip with "symbol_not_enabled" the moment a client's
+     broker spelled it differently. Replaced with _canonical(), the same
+     matcher app/ai/copier_executor.py uses. Any instrument now works without
+     being listed anywhere.
+
+     KEEP THE MATCHER BLOCK IDENTICAL to the one in copier_executor.py. If they
+     disagree, this router creates rows the executor silently skips as "not
+     enabled by client".
+
+  2. MODIFY now gets the same open-position filter as CLOSE. Previously only
      `event_type == "close"` was checked, so every SL/TP change on the master
-     fanned out to EVERY licence on the EA, including the ones holding nothing.
-     Measured 31 Aug: 150 of 258 copier events in one hour were modifies, and
-     the fast lane spent ~4s of MT5 login on each one only to have
-     _handle_modify return "no open trades mapped to this master ticket".
-  2. Added a race guard to that filter. A close or modify can legitimately
+     fanned out to EVERY licence on the EA. Measured 31 Aug: 150 of 258 copier
+     events in one hour were modifies, each costing ~4s of MT5 login only for
+     _handle_modify to return "no open trades mapped to this master ticket".
+
+  3. Added a race guard to that filter. A close or modify can legitimately
      arrive before the client's own OPEN has executed — on a fast scalp the
      open is still queued, so no ticket map exists yet. Skipping on that basis
      would strand the client in a position the master has already exited. The
-     guard defers to the slow path whenever an open is still pending or
-     processing for the same master ticket. This hole existed in the close
-     branch before this revision too.
+     guard defers to the slow path whenever an open is still in flight. This
+     hole existed in the close branch before this revision too.
 
   ── PREVIOUS REVISION ────────────────────────────────────────────────────────
   1. The CLOSE branch uses `TradeTicketMap.is_closed == False`. The real
-     columns on this table are id, license_id, execution_id, master_ticket,
-     client_ticket, symbol, is_closed, closed_by_client, closed_at, last_error,
-     created_at. There is no is_open, no ea_id and no child_ticket_index — a
-     previous revision assumed otherwise and 500'd every close.
+     columns are id, license_id, execution_id, master_ticket, client_ticket,
+     symbol, is_closed, closed_by_client, closed_at, last_error, created_at.
+     There is no is_open, no ea_id and no child_ticket_index — an earlier
+     revision assumed otherwise and 500'd every close.
 
      BEWARE: a SECOND table named `trade_ticket_maps` exists in the same
-     database with exactly those legacy columns (is_open, ea_id,
-     child_ticket_index, manually_closed). It holds 0 rows and nothing writes
-     to it. The live table is `ticket_maps` — always confirm against
-     TradeTicketMap.__tablename__ rather than the table name that reads better.
-  2. Removed `import asyncio` and `from app.execution_dispatcher import
-     dispatch_trade`. The dispatch call itself was already deleted (it was the
-     `no running event loop` crash); these leftovers still dragged
-     MetaApiService into every request through the import chain.
-  3. `/copier/executions/{id}/account` referenced `mt5.mt_login` / `mt5.mt_server`,
-     which are not columns on ClientMT5Account (they are `login` / `server`), so
-     it 500'd whenever it got that far. Fixed, and the hard MetaAPI requirement
-     downgraded to an optional field since MetaAPI was dropped.
-  4. Machine-only routes (claim / update / ticket-map writes) now require the
-     same X-Worker-Token used by /worker/*. Nothing calls them over HTTP any
-     more — the execution worker reads and writes these rows directly through
-     the database — so this closes the hole without breaking a caller.
+     database with exactly those legacy columns. It holds 0 rows and nothing
+     writes to it. The live table is `ticket_maps` — always confirm against
+     TradeTicketMap.__tablename__ rather than the name that reads better.
+  2. Removed `import asyncio` and the execution_dispatcher import, which
+     dragged MetaApiService into every request through the import chain.
+  3. `/copier/executions/{id}/account` used mt5.mt_login / mt5.mt_server, which
+     are not columns on ClientMT5Account (they are login / server).
+  4. Machine-only routes require the same X-Worker-Token used by /worker/*.
 
   ── HOW EXECUTION ACTUALLY HAPPENS ───────────────────────────────────────────
   This router only CREATES pending TradeExecution rows. It does not dispatch.
@@ -88,9 +91,9 @@ router = APIRouter(prefix="/copier", tags=["Copier"])
 # WORKER AUTH
 # =========================
 # Defined locally rather than imported from app.routers.mt5_workers. That
-# cross-router import was the only structural change in the previous revision,
+# cross-router import was the only structural change in an earlier revision,
 # and the deploy hung before binding a port — so every router stays
-# self-contained from here on.
+# self-contained. The symbol matcher below is duplicated for the same reason.
 WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
 
 
@@ -222,27 +225,164 @@ def normalize_symbol(symbol: str) -> str:
     return symbol.strip().upper()
 
 
-def get_symbol_aliases(symbol: str) -> list[str]:
-    """Brokers name the same instrument differently — XAUUSD, XAUUSDm, GOLD.
-    The client enabled whichever their broker offers, so match them all.
+# ==============================================================================
+# SYMBOL MATCHING  —  any instrument, any broker naming
+# ==============================================================================
+# MUST STAY IDENTICAL to the block in app/ai/copier_executor.py.
+#
+# TWO BUGS THIS DESIGN AVOIDS:
+#  1. COLLIDING SYNTHETICS. Truncating long names to their first 6 letters made
+#     "Volatility 75 Index", "Volatility 25 Index" and "Volatility 100 Index"
+#     all become "VOLATI" — a master trade on V75 would have matched a client's
+#     V25 setting and opened the wrong instrument. Anything containing a digit
+#     keeps its full identity, because in synthetics the number IS the symbol.
+#  2. "GOLD BASKET" BECAME "GOLD". The letter-trimming loop chewed
+#     "GOLDBASKET" down to "GOLD" and matched it to XAUUSD. Trimming is now
+#     applied only to single-token names (XAUUSDc, GOLDmicro, EURUSDz); a name
+#     containing a space is descriptive, not decorated, and is kept whole.
+#
+# HOW A SYMBOL IS MATCHED:
+#   1. strip separator decoration (. _ - # /) and collapse spaces
+#   2. exact synonym hit wins
+#   3. contains a digit, or the original had a space  -> keep whole
+#   4. otherwise treat as an FX-style token: trim trailing broker letters,
+#      checking synonyms at every length, then fall back to first 6 letters
 
-    NOTE: app/ai/copier_executor.py resolves symbols against the client's own
-    terminal now, but it still looks up ClientSymbolSetting by a canonical key,
-    so a symbol missing from this map can still create rows the executor then
-    skips as "not enabled by client".
+_DERIV_VOL = (10, 25, 50, 75, 100)
+_DERIV_VOL_1S = (10, 25, 50, 75, 100, 150, 200, 250, 300)
+_DERIV_JUMP = (10, 25, 50, 75, 100)
+_DERIV_BOOM_CRASH = (300, 500, 1000)
+
+_SYNONYM_GROUPS = [
+    {"XAUUSD", "GOLD", "GOLDUSD"},
+    {"XAGUSD", "SILVER", "SILVERUSD"},
+    {"BTCUSD", "BTCUSDT", "BITCOIN"},
+    {"ETHUSD", "ETHUSDT", "ETHEREUM"},
+    {"US30", "DJ30", "DOW", "WS30", "USA30", "DJI30"},
+    {"NAS100", "USTEC", "NDX100", "USA100", "NASUSD"},
+    {"SPX500", "US500", "USA500", "SP500"},
+    {"USOIL", "WTI", "CRUDE", "XTIUSD", "OIL"},
+    {"UKOIL", "BRENT", "XBRUSD"},
+    {"GER40", "DE40", "DAX40", "GER30", "DAX"},
+    {"UK100", "FTSE100", "FTSE"},
+    {"JP225", "NIKKEI", "JPN225"},
+    {"STEPINDEX", "STEP"},
+    {"MULTISTEPINDEX", "MULTISTEP"},
+]
+
+# Deriv synthetics, generated rather than typed out — there are too many to
+# keep correct by hand, and a typo means a client silently gets no trades.
+# The (1s) variants are DIFFERENT instruments from the plain ones and are
+# deliberately kept in separate groups.
+for _n in _DERIV_VOL:
+    _SYNONYM_GROUPS.append({
+        f"VOLATILITY{_n}INDEX", f"VOLATILITY{_n}", f"V{_n}", f"VIX{_n}", f"VOL{_n}",
+    })
+for _n in _DERIV_VOL_1S:
+    _SYNONYM_GROUPS.append({
+        f"VOLATILITY{_n}(1S)INDEX", f"VOLATILITY{_n}(1S)",
+        f"V{_n}(1S)", f"VOL{_n}(1S)",
+    })
+for _n in _DERIV_JUMP:
+    _SYNONYM_GROUPS.append({f"JUMP{_n}INDEX", f"JUMP{_n}", f"J{_n}"})
+for _n in _DERIV_BOOM_CRASH:
+    _SYNONYM_GROUPS.append({f"BOOM{_n}INDEX", f"BOOM{_n}", f"B{_n}"})
+    _SYNONYM_GROUPS.append({f"CRASH{_n}INDEX", f"CRASH{_n}", f"C{_n}"})
+for _n in (100, 200):
+    _SYNONYM_GROUPS.append({f"RANGEBREAK{_n}INDEX", f"RANGEBREAK{_n}", f"RB{_n}"})
+for _n in (200, 500):
+    _SYNONYM_GROUPS.append({f"STEP{_n}INDEX", f"STEP{_n}"})
+for _n in (10, 20, 30):
+    _SYNONYM_GROUPS.append({f"DRIFTSWITCHINDEX{_n}", f"DRIFTSWITCH{_n}", f"DSI{_n}"})
+for _n in (600, 900, 1500):
+    for _d in ("UP", "DOWN"):
+        _SYNONYM_GROUPS.append({f"DEX{_n}{_d}INDEX", f"DEX{_n}{_d}"})
+for _b in ("AUD", "EUR", "GBP", "USD", "GOLD"):
+    _SYNONYM_GROUPS.append({f"{_b}BASKET", f"{_b}BASKETINDEX"})
+
+_SYNONYM_LOOKUP: Dict[str, str] = {}
+for _group in _SYNONYM_GROUPS:
+    _canon_name = sorted(_group)[0]
+    for _name in _group:
+        _SYNONYM_LOOKUP[_name] = _canon_name
+
+
+def _strip_decoration(sym: str) -> str:
+    """Remove separator-based broker decoration and collapse spaces.
+
+    XAUUSD.raw          -> XAUUSD
+    US30.cash           -> US30
+    Volatility 75 Index -> VOLATILITY75INDEX
     """
-    base = normalize_symbol(symbol)
+    s = (sym or "").upper().strip()
+    for sep in (".", "_", "-", "#", "/"):
+        if sep in s:
+            s = s.split(sep, 1)[0]
+    # Spaces are formatting, not identity: "Volatility 75 Index" and
+    # "Volatility75Index" are the same instrument at different brokers.
+    return s.replace(" ", "")
 
-    alias_map = {
-        "XAUUSD": ["XAUUSD", "XAUUSDM", "XAUUSDC", "GOLD", "GOLDM", "XAUUSD."],
-        "BTCUSD": ["BTCUSD", "BTCUSDM", "BTCUSDT", "BTCUSD."],
-        "ETHUSD": ["ETHUSD", "ETHUSDM", "ETHUSDT", "ETHUSD."],
-        "EURUSD": ["EURUSD", "EURUSDM", "EURUSDC", "EURUSD."],
-        "GBPUSD": ["GBPUSD", "GBPUSDM", "GBPUSDC", "GBPUSD."],
-        "USDJPY": ["USDJPY", "USDJPYM", "USDJPYC", "USDJPY."],
-    }
 
-    return [normalize_symbol(x) for x in alias_map.get(base, [base])]
+def _canonical(sym: str) -> str:
+    """Reduce a broker symbol to a comparable key.
+
+    XAUUSDc -> XAUUSD,  GOLDmicro -> XAUUSD,  EURUSDz -> EURUSD,
+    US30.cash -> US30,  Volatility 75 Index -> V75,  Gold Basket -> GOLDBASKET
+    """
+    raw = (sym or "").upper().strip()
+    s = _strip_decoration(raw)
+    if not s:
+        return ""
+
+    if s in _SYNONYM_LOOKUP:
+        return _SYNONYM_LOOKUP[s]
+
+    # A digit means the number carries the identity (Volatility 75 vs 25,
+    # Boom 500 vs 1000, DEX 600 UP vs DOWN). A space means a descriptive
+    # multi-word name (Gold Basket, Multi Step Index) rather than a decorated
+    # ticker. Neither may be trimmed.
+    if any(ch.isdigit() for ch in s) or " " in raw:
+        return s
+
+    # Single alphabetic token from here, so FX-style assumptions are safe.
+    fx_guess = None
+    for cut in range(1, 7):
+        if len(s) - cut < 3:
+            break
+        cand = s[:len(s) - cut]
+        if cand in _SYNONYM_LOOKUP:
+            return _SYNONYM_LOOKUP[cand]
+        if fx_guess is None and len(cand) == 6 and cand.isalpha():
+            fx_guess = cand
+
+    if fx_guess:
+        return fx_guess
+    if len(s) > 6:
+        return s[:6]
+    return s
+
+
+def find_symbol_setting(db: Session, license_id: int, master_symbol: str):
+    """The client's enabled setting for this instrument, whatever either side
+    calls it.
+
+    Replaces the old alias-map lookup. The client's rows are read once and
+    compared on the canonical key, so a symbol an admin added last week works
+    with no code change — which is the whole point of admin-managed symbols.
+    """
+    want = _canonical(master_symbol)
+    if not want:
+        return None
+
+    rows = db.query(ClientSymbolSetting).filter(
+        ClientSymbolSetting.license_id == license_id,
+        ClientSymbolSetting.enabled == True,  # noqa: E712
+    ).all()
+
+    for setting in rows:
+        if _canonical(getattr(setting, "symbol_name", "")) == want:
+            return setting
+    return None
 
 
 def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> List[TradeExecution]:
@@ -257,8 +397,6 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
     ).all()
 
     created_rows: List[TradeExecution] = []
-    normalized_symbol = normalize_symbol(event.symbol)
-    symbol_aliases = get_symbol_aliases(normalized_symbol)
 
     for license_row in licenses:
 
@@ -272,14 +410,13 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
             print(f"[SKIP] license={license_row.id} reason=no_active_verified_mt5")
             continue
 
-        symbol_setting = db.query(ClientSymbolSetting).filter(
-            ClientSymbolSetting.license_id == license_row.id,
-            ClientSymbolSetting.symbol_name.in_(symbol_aliases),
-            ClientSymbolSetting.enabled == True,
-        ).first()
+        # Canonical match — works for any symbol the admin has added, not just
+        # a fixed list of six.
+        symbol_setting = find_symbol_setting(db, license_row.id, event.symbol)
 
         if not symbol_setting:
-            print(f"[SKIP] license={license_row.id} reason=symbol_not_enabled")
+            print(f"[SKIP] license={license_row.id} reason=symbol_not_enabled "
+                  f"symbol={event.symbol}")
             continue
 
         # Direction preference applies to OPEN only — a client who only takes
@@ -297,12 +434,8 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
         #
         # MODIFY was previously excluded from this check, which is why a
         # trailing stop fanned out to every licence on the EA — 150 of 258
-        # events in one measured hour, most of them resolving to "no open
-        # trades mapped to this master ticket" only after a ~4s MT5 login.
-        #
-        # The real column is is_closed. There is no is_open on this table, and
-        # an earlier revision wrongly "fixed" it to is_open, which 500'd every
-        # close event.
+        # events in one measured hour, most resolving to "no open trades mapped
+        # to this master ticket" only after paying a ~4s MT5 login.
         if event.event_type in ("close", "modify"):
             open_map = db.query(TradeTicketMap).filter(
                 TradeTicketMap.license_id == license_row.id,
@@ -351,7 +484,7 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
         db.add(execution)
         created_rows.append(execution)
 
-        print(f"[EXEC CREATED] license={license_row.id}")
+        print(f"[EXEC CREATED] license={license_row.id} symbol={event.symbol}")
 
     db.commit()
 
@@ -509,7 +642,7 @@ def claim_pending_executions(
     """Legacy HTTP claim path, kept for compatibility.
 
     The live executor does NOT use this — it reads pending rows straight from
-    the database inside the execution worker. Left behind a worker token so an
+    the database inside the copier fast lane. Left behind a worker token so an
     anonymous caller cannot claim rows and silently stop trades reaching
     clients.
     """
