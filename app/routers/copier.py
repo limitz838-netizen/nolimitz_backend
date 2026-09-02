@@ -253,36 +253,40 @@ _DERIV_VOL_1S = (10, 25, 50, 75, 100, 150, 200, 250, 300)
 _DERIV_JUMP = (10, 25, 50, 75, 100)
 _DERIV_BOOM_CRASH = (300, 500, 1000)
 
+_NOISE_SUFFIX = {
+    "CASH", "SPOT", "IDX", "INDEX", "RAW", "ECN", "PRO", "STD", "STP", "MICRO",
+    "MINI", "M", "C", "Z", "E", "R", "X", "FT", "FUT", "ROLL", "RFD", "SB",
+}
+
 _SYNONYM_GROUPS = [
-    {"XAUUSD", "GOLD", "GOLDUSD"},
+    {"XAUUSD", "GOLD", "GOLDUSD", "GOLDSPOT"},
     {"XAGUSD", "SILVER", "SILVERUSD"},
+    {"XCUUSD", "COPPER"},
+    {"XPTUSD", "PLATINUM"},
     {"BTCUSD", "BTCUSDT", "BITCOIN"},
     {"ETHUSD", "ETHUSDT", "ETHEREUM"},
-    {"US30", "DJ30", "DOW", "WS30", "USA30", "DJI30"},
-    {"NAS100", "USTEC", "NDX100", "USA100", "NASUSD"},
-    {"SPX500", "US500", "USA500", "SP500"},
-    {"USOIL", "WTI", "CRUDE", "XTIUSD", "OIL"},
-    {"UKOIL", "BRENT", "XBRUSD"},
-    {"GER40", "DE40", "DAX40", "GER30", "DAX"},
-    {"UK100", "FTSE100", "FTSE"},
-    {"JP225", "NIKKEI", "JPN225"},
+    {"US30", "DJ30", "DOW", "DOW30", "WS30", "USA30", "DJI30", "YM", "US30CASH"},
+    {"NAS100", "US100", "USTEC", "NDX100", "USA100", "TECH100", "NQ100", "NQ", "USTECH100"},
+    {"SPX500", "US500", "SP500", "USA500", "ES", "SPX"},
+    {"USOIL", "WTI", "CRUDE", "XTIUSD", "USOUSD", "WTIUSD", "CL", "CRUDEOIL"},
+    {"UKOIL", "BRENT", "XBRUSD", "UKOUSD", "BRENTUSD"},
+    {"NATGAS", "NGAS", "XNGUSD", "NATURALGAS"},
+    {"GER40", "DE40", "DAX40", "GER30", "DE30", "DAX", "GERMANY40", "GERMANY30"},
+    {"UK100", "FTSE100", "FTSE", "GB100", "BRITAIN100"},
+    {"JP225", "JPN225", "NIKKEI", "N225", "JAPAN225"},
+    {"FRA40", "CAC40", "FR40", "FRANCE40"},
+    {"AUS200", "AU200", "ASX200", "AUSTRALIA200"},
+    {"HK50", "HKG33", "HSI", "HONGKONG50"},
+    {"EU50", "STOXX50", "EUSTX50", "ESX50", "EUROPE50"},
+    {"US2000", "RUSSELL2000", "RUT", "USA2000"},
     {"STEPINDEX", "STEP"},
     {"MULTISTEPINDEX", "MULTISTEP"},
 ]
 
-# Deriv synthetics, generated rather than typed out — there are too many to
-# keep correct by hand, and a typo means a client silently gets no trades.
-# The (1s) variants are DIFFERENT instruments from the plain ones and are
-# deliberately kept in separate groups.
 for _n in _DERIV_VOL:
-    _SYNONYM_GROUPS.append({
-        f"VOLATILITY{_n}INDEX", f"VOLATILITY{_n}", f"V{_n}", f"VIX{_n}", f"VOL{_n}",
-    })
+    _SYNONYM_GROUPS.append({f"VOLATILITY{_n}INDEX", f"VOLATILITY{_n}", f"V{_n}", f"VIX{_n}", f"VOL{_n}"})
 for _n in _DERIV_VOL_1S:
-    _SYNONYM_GROUPS.append({
-        f"VOLATILITY{_n}(1S)INDEX", f"VOLATILITY{_n}(1S)",
-        f"V{_n}(1S)", f"VOL{_n}(1S)",
-    })
+    _SYNONYM_GROUPS.append({f"VOLATILITY{_n}(1S)INDEX", f"VOLATILITY{_n}(1S)", f"V{_n}(1S)", f"VOL{_n}(1S)"})
 for _n in _DERIV_JUMP:
     _SYNONYM_GROUPS.append({f"JUMP{_n}INDEX", f"JUMP{_n}", f"J{_n}"})
 for _n in _DERIV_BOOM_CRASH:
@@ -308,43 +312,46 @@ for _group in _SYNONYM_GROUPS:
 
 
 def _strip_decoration(sym: str) -> str:
-    """Remove separator-based broker decoration and collapse spaces.
-
-    XAUUSD.raw          -> XAUUSD
-    US30.cash           -> US30
-    Volatility 75 Index -> VOLATILITY75INDEX
-    """
     s = (sym or "").upper().strip()
-    for sep in (".", "_", "-", "#", "/"):
-        if sep in s:
-            s = s.split(sep, 1)[0]
-    # Spaces are formatting, not identity: "Volatility 75 Index" and
-    # "Volatility75Index" are the same instrument at different brokers.
-    return s.replace(" ", "")
+    s = s.lstrip(".#_-/ ")
+    parts, buf = [], ""
+    for ch in s:
+        if ch in "._-#/ ":
+            if buf:
+                parts.append(buf); buf = ""
+        else:
+            buf += ch
+    if buf:
+        parts.append(buf)
+    if not parts:
+        return ""
+    while len(parts) > 1 and parts[-1] in _NOISE_SUFFIX:
+        parts.pop()
+    return "".join(parts)
 
 
 def _canonical(sym: str) -> str:
-    """Reduce a broker symbol to a comparable key.
-
-    XAUUSDc -> XAUUSD,  GOLDmicro -> XAUUSD,  EURUSDz -> EURUSD,
-    US30.cash -> US30,  Volatility 75 Index -> V75,  Gold Basket -> GOLDBASKET
-    """
     raw = (sym or "").upper().strip()
     s = _strip_decoration(raw)
     if not s:
         return ""
-
     if s in _SYNONYM_LOOKUP:
         return _SYNONYM_LOOKUP[s]
 
-    # A digit means the number carries the identity (Volatility 75 vs 25,
-    # Boom 500 vs 1000, DEX 600 UP vs DOWN). A space means a descriptive
-    # multi-word name (Gold Basket, Multi Step Index) rather than a decorated
-    # ticker. Neither may be trimmed.
-    if any(ch.isdigit() for ch in s) or " " in raw:
+    if any(ch.isdigit() for ch in s):
+        tail = ""
+        while s and s[-1].isalpha():
+            tail = s[-1] + tail
+            s = s[:-1]
+            if s in _SYNONYM_LOOKUP:
+                return _SYNONYM_LOOKUP[s]
+            if tail in _NOISE_SUFFIX and s and s[-1].isdigit():
+                break
+        return _strip_decoration(raw)
+
+    if " " in raw:
         return s
 
-    # Single alphabetic token from here, so FX-style assumptions are safe.
     fx_guess = None
     for cut in range(1, 7):
         if len(s) - cut < 3:
@@ -354,7 +361,6 @@ def _canonical(sym: str) -> str:
             return _SYNONYM_LOOKUP[cand]
         if fx_guess is None and len(cand) == 6 and cand.isalpha():
             fx_guess = cand
-
     if fx_guess:
         return fx_guess
     if len(s) > 6:
