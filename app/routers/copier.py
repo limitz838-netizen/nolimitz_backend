@@ -176,6 +176,51 @@ def get_ea_by_id_for_admin(ea_id: int, current_admin: Admin, db: Session) -> Exp
     return ea
 
 
+def resolve_ea_and_admin(
+    ea_id: int,
+    authorization: str | None,
+    x_worker_token: str | None,
+    db: Session,
+):
+    """Authorise a copier event from EITHER a logged-in admin OR a machine.
+
+    WHY THIS EXISTS
+    master_mt5_bridge.py is a server process, not a person, but it was sending
+    an ADMIN LOGIN TOKEN. Those expire, and a machine has no way to renew one —
+    so every few weeks the bridge started answering
+        ✗ OPEN FAILED [401] {"detail":"Invalid or expired token"}
+    and every master trade silently stopped reaching clients until someone
+    noticed and minted a new token by hand. It failed that way on 11 Aug and
+    again on 2 Sep.
+
+    The bridge already sends X-Worker-Token on every request — the same static
+    secret the /worker/* routes use, which never expires. This accepts it.
+
+    WHEN THE WORKER TOKEN IS USED the owning admin is derived from the EA
+    itself rather than from a login, so a bridge cannot address an EA that does
+    not exist, and tenant scoping still comes from ea_id exactly as before.
+    Anything holding the worker token is already trusted machine-side.
+
+    Browser callers are unaffected: no worker token means the normal admin JWT
+    path, ownership check included.
+    """
+    if WORKER_TOKEN and x_worker_token and x_worker_token == WORKER_TOKEN:
+        ea = db.query(ExpertAdvisor).filter(
+            ExpertAdvisor.id == ea_id,
+            ExpertAdvisor.is_active == True,
+        ).first()
+        if not ea:
+            raise HTTPException(status_code=404, detail="EA not found or inactive")
+
+        admin = db.query(Admin).filter(Admin.id == ea.admin_id).first()
+        if not admin:
+            raise HTTPException(status_code=404, detail="EA has no owning admin")
+        return ea, admin
+
+    current_admin = get_current_admin(authorization, db)
+    return get_ea_by_id_for_admin(ea_id, current_admin, db), current_admin
+
+
 def serialize_execution(row: TradeExecution) -> TradeExecutionItem:
     return TradeExecutionItem(
         id=row.id,
@@ -552,10 +597,14 @@ def create_event_and_executions(
 @router.post("/open", response_model=CreateExecutionsResponse)
 def copier_open_trade(
     payload: CopierOpenTradeRequest,
-    current_admin: Admin = Depends(get_current_admin),
+    authorization: str = Header(None),
+    x_worker_token: str = Header(None),
     db: Session = Depends(get_db),
 ):
-    ea = get_ea_by_id_for_admin(payload.ea_id, current_admin, db)
+    # Accepts an admin JWT from the dashboard OR the static worker token from
+    # master_mt5_bridge.py. See resolve_ea_and_admin for why.
+    ea, current_admin = resolve_ea_and_admin(
+        payload.ea_id, authorization, x_worker_token, db)
 
     action = payload.action.lower().strip()
     if action not in ["buy", "sell"]:
@@ -579,10 +628,12 @@ def copier_open_trade(
 @router.post("/modify", response_model=CreateExecutionsResponse)
 def copier_modify_trade(
     payload: CopierModifyTradeRequest,
-    current_admin: Admin = Depends(get_current_admin),
+    authorization: str = Header(None),
+    x_worker_token: str = Header(None),
     db: Session = Depends(get_db),
 ):
-    ea = get_ea_by_id_for_admin(payload.ea_id, current_admin, db)
+    ea, current_admin = resolve_ea_and_admin(
+        payload.ea_id, authorization, x_worker_token, db)
 
     return create_event_and_executions(
         db=db,
@@ -602,10 +653,12 @@ def copier_modify_trade(
 @router.post("/close", response_model=CreateExecutionsResponse)
 def copier_close_trade(
     payload: CopierCloseTradeRequest,
-    current_admin: Admin = Depends(get_current_admin),
+    authorization: str = Header(None),
+    x_worker_token: str = Header(None),
     db: Session = Depends(get_db),
 ):
-    ea = get_ea_by_id_for_admin(payload.ea_id, current_admin, db)
+    ea, current_admin = resolve_ea_and_admin(
+        payload.ea_id, authorization, x_worker_token, db)
 
     return create_event_and_executions(
         db=db,
