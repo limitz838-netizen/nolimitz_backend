@@ -85,35 +85,48 @@ PLAN_EXPECTED_USD = {"monthly": 18.99, "annual": 79.99, "lifetime": 170.00}
 
 
 def verify_signature(raw_body: bytes, signature: Optional[str]) -> bool:
-    """HMAC-SHA256 of the raw request body with the shared secret.
+    """HMAC check, with a diagnostic mode.
 
-    Compared with compare_digest, which takes the same time whether the first
-    byte differs or the last — a plain == leaks the correct signature one byte
-    at a time to anyone willing to send enough requests.
-
-    The RAW body matters: re-serialising the parsed JSON changes whitespace and
-    key order, and the hash no longer matches.
+    Bachs documents only "signed using HMAC", and providers differ on hex vs
+    base64, on whether the signed payload includes a timestamp, and on whether
+    the whsec_ prefix is part of the key. Rather than guess, BACHS_DEBUG_SIG
+    logs which variant matches so the right one can be hard-coded and the rest
+    removed.
     """
-    if not BACHS_WEBHOOK_SECRET:
-        logger.error("BACHS_WEBHOOK_SECRET is not set — refusing all webhooks")
-        return False
-    if not signature:
+    if not BACHS_WEBHOOK_SECRET or not signature:
         return False
 
-    expected = hmac.new(BACHS_WEBHOOK_SECRET.encode(), raw_body,
-                        hashlib.sha256).hexdigest()
+    import base64
+    secrets = [BACHS_WEBHOOK_SECRET]
+    if BACHS_WEBHOOK_SECRET.startswith("whsec_"):
+        secrets.append(BACHS_WEBHOOK_SECRET[6:])
 
-    # Providers vary on formatting: bare hex, "sha256=<hex>", or a comma-joined
-    # list during a secret rotation. Accept any element that matches.
-    candidates = []
+    variants = {}
+    for i, sec in enumerate(secrets):
+        tag = "raw" if i == 0 else "noprefix"
+        mac = hmac.new(sec.encode(), raw_body, hashlib.sha256)
+        variants[f"{tag}_hex"] = mac.hexdigest()
+        variants[f"{tag}_b64"] = base64.b64encode(mac.digest()).decode()
+
+    received = []
     for part in signature.split(","):
         part = part.strip()
         if "=" in part:
             part = part.split("=", 1)[1].strip()
         if part:
-            candidates.append(part)
+            received.append(part)
 
-    return any(hmac.compare_digest(expected, c) for c in candidates)
+    for name, val in variants.items():
+        if any(hmac.compare_digest(val, r) for r in received):
+            logger.info("signature matched variant: %s", name)
+            return True
+
+    if os.getenv("BACHS_DEBUG_SIG", "").lower() == "true":
+        logger.error("SIG MISMATCH. header=%r", signature[:80])
+        for name, val in variants.items():
+            logger.error("  %-14s starts %s", name, val[:16])
+
+    return False
 
 
 @router.post("/bachs-webhook")
