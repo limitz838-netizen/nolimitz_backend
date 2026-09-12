@@ -84,30 +84,73 @@ PLAN_DAYS = {
 PLAN_EXPECTED_USD = {"monthly": 18.99, "annual": 79.99, "lifetime": 170.00}
 
 
-def verify_signature(raw_body: bytes, signature: Optional[str]) -> bool:
-    """HMAC check, with a diagnostic mode.
+def _candidate_signatures(raw_body: bytes) -> dict:
+    """Every plausible HMAC scheme, labelled.
 
-    Bachs documents only "signed using HMAC", and providers differ on hex vs
-    base64, on whether the signed payload includes a timestamp, and on whether
-    the whsec_ prefix is part of the key. Rather than guess, BACHS_DEBUG_SIG
-    logs which variant matches so the right one can be hard-coded and the rest
-    removed.
+    Bachs documents only "payloads are signed using HMAC" and names the
+    Bachs-Signature header — it does not say hex or base64, whether the signed
+    payload includes a timestamp, or whether the whsec_ prefix is part of the
+    key. Providers differ on all three. Rather than guess and get 401s with no
+    way to see why, every variant is computed and the matching one is logged by
+    name the first time it succeeds.
+
+    Once the log names the winner, the rest can be deleted — but leaving them
+    costs microseconds and survives Bachs changing the scheme.
     """
-    if not BACHS_WEBHOOK_SECRET or not signature:
-        return False
-
     import base64
+
     secrets = [BACHS_WEBHOOK_SECRET]
     if BACHS_WEBHOOK_SECRET.startswith("whsec_"):
-        secrets.append(BACHS_WEBHOOK_SECRET[6:])
+        # Some providers treat the prefix as a label, not part of the key.
+        secrets.append(BACHS_WEBHOOK_SECRET[len("whsec_"):])
 
-    variants = {}
-    for i, sec in enumerate(secrets):
-        tag = "raw" if i == 0 else "noprefix"
-        mac = hmac.new(sec.encode(), raw_body, hashlib.sha256)
-        variants[f"{tag}_hex"] = mac.hexdigest()
-        variants[f"{tag}_b64"] = base64.b64encode(mac.digest()).decode()
+    out = {}
+    for idx, secret in enumerate(secrets):
+        tag = "withprefix" if idx == 0 else "noprefix"
+        key = secret.encode()
+        mac = hmac.new(key, raw_body, hashlib.sha256)
+        out[f"{tag}_hex"] = mac.hexdigest()
+        out[f"{tag}_b64"] = base64.b64encode(mac.digest()).decode()
 
+        # Base64-decoded secret, used by some providers that issue the shared
+        # secret already encoded.
+        try:
+            raw_key = base64.b64decode(secret + "=" * (-len(secret) % 4))
+            if raw_key:
+                m2 = hmac.new(raw_key, raw_body, hashlib.sha256)
+                out[f"{tag}_b64key_hex"] = m2.hexdigest()
+                out[f"{tag}_b64key_b64"] = base64.b64encode(m2.digest()).decode()
+        except Exception:
+            pass
+
+    return out
+
+
+def verify_signature(raw_body: bytes, signature: Optional[str]) -> bool:
+    """Check the Bachs-Signature header against the shared secret.
+
+    compare_digest, not ==. A plain comparison returns faster when the first
+    byte differs than when the last does, which leaks the correct signature one
+    byte at a time to anyone willing to send enough requests.
+
+    The RAW body matters: re-serialising parsed JSON changes whitespace and key
+    order, and the hash no longer matches.
+
+    Set BACHS_DEBUG_SIG=true in Render to log the prefix of every computed
+    variant alongside the received header. That is a debugging aid, not a
+    permanent setting — it puts signature material in the logs, so turn it off
+    once the scheme is known.
+    """
+    if not BACHS_WEBHOOK_SECRET:
+        logger.error("BACHS_WEBHOOK_SECRET is not set — refusing all webhooks")
+        return False
+    if not signature:
+        logger.warning("no Bachs-Signature header on request")
+        return False
+
+    # Header may be bare, "sha256=<sig>", or a comma-joined list during a
+    # secret rotation. Also handles "t=<ts>,v1=<sig>" shapes by taking the part
+    # after each "=".
     received = []
     for part in signature.split(","):
         part = part.strip()
@@ -116,15 +159,21 @@ def verify_signature(raw_body: bytes, signature: Optional[str]) -> bool:
         if part:
             received.append(part)
 
-    for name, val in variants.items():
-        if any(hmac.compare_digest(val, r) for r in received):
-            logger.info("signature matched variant: %s", name)
-            return True
+    variants = _candidate_signatures(raw_body)
+
+    for name, expected in variants.items():
+        for got in received:
+            if hmac.compare_digest(expected, got):
+                logger.info("signature verified using variant: %s", name)
+                return True
 
     if os.getenv("BACHS_DEBUG_SIG", "").lower() == "true":
-        logger.error("SIG MISMATCH. header=%r", signature[:80])
-        for name, val in variants.items():
-            logger.error("  %-14s starts %s", name, val[:16])
+        logger.error("SIGNATURE MISMATCH — header=%r  body_len=%d",
+                     signature[:100], len(raw_body))
+        for name, expected in variants.items():
+            logger.error("   computed %-20s -> %s...", name, expected[:20])
+        for got in received:
+            logger.error("   received %s...", got[:20])
 
     return False
 
@@ -280,6 +329,11 @@ def bachs_webhook_health():
     the path is live in one click is worth the four lines.
     """
     return {
+        "status": "ready",
+        "secret_configured": bool(BACHS_WEBHOOK_SECRET),
+        "ea_id": BACHS_EA_ID,
+        "plans": sorted(set(PLAN_DAYS)),
+    }
         "status": "ready",
         "secret_configured": bool(BACHS_WEBHOOK_SECRET),
         "ea_id": BACHS_EA_ID,
