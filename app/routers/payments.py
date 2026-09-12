@@ -84,18 +84,19 @@ PLAN_DAYS = {
 PLAN_EXPECTED_USD = {"monthly": 18.99, "annual": 79.99, "lifetime": 170.00}
 
 
-def _candidate_signatures(raw_body: bytes) -> dict:
+def _candidate_signatures(raw_body: bytes, timestamp: Optional[str] = None) -> dict:
     """Every plausible HMAC scheme, labelled.
 
-    Bachs documents only "payloads are signed using HMAC" and names the
-    Bachs-Signature header — it does not say hex or base64, whether the signed
-    payload includes a timestamp, or whether the whsec_ prefix is part of the
-    key. Providers differ on all three. Rather than guess and get 401s with no
-    way to see why, every variant is computed and the matching one is logged by
-    name the first time it succeeds.
+    THE TIMESTAMP IS THE POINT. Live requests carry x-bachs-signature AND
+    x-bachs-timestamp, and no body-only hash ever matched. Providers that send
+    a timestamp almost always sign the two together — "<ts>.<body>" is the
+    common form — because signing the body alone lets an attacker replay a
+    captured request forever.
 
-    Once the log names the winner, the rest can be deleted — but leaving them
-    costs microseconds and survives Bachs changing the scheme.
+    Every combination is computed because Bachs documents none of them: the
+    delimiter, the order, hex vs base64, and whether the whsec_ prefix is part
+    of the key. The matching one is logged by name, so once it appears in the
+    log the rest can be deleted.
     """
     import base64
 
@@ -104,29 +105,38 @@ def _candidate_signatures(raw_body: bytes) -> dict:
         # Some providers treat the prefix as a label, not part of the key.
         secrets.append(BACHS_WEBHOOK_SECRET[len("whsec_"):])
 
+    payloads = {"body": raw_body}
+    if timestamp:
+        ts = str(timestamp).encode()
+        payloads["ts.body"] = ts + b"." + raw_body
+        payloads["ts:body"] = ts + b":" + raw_body
+        payloads["tsbody"] = ts + raw_body
+        payloads["body.ts"] = raw_body + b"." + ts
+        payloads["bodyts"] = raw_body + ts
+
     out = {}
     for idx, secret in enumerate(secrets):
-        tag = "withprefix" if idx == 0 else "noprefix"
-        key = secret.encode()
-        mac = hmac.new(key, raw_body, hashlib.sha256)
-        out[f"{tag}_hex"] = mac.hexdigest()
-        out[f"{tag}_b64"] = base64.b64encode(mac.digest()).decode()
-
-        # Base64-decoded secret, used by some providers that issue the shared
-        # secret already encoded.
+        stag = "wp" if idx == 0 else "np"     # with / no whsec_ prefix
+        keys = {"str": secret.encode()}
         try:
-            raw_key = base64.b64decode(secret + "=" * (-len(secret) % 4))
-            if raw_key:
-                m2 = hmac.new(raw_key, raw_body, hashlib.sha256)
-                out[f"{tag}_b64key_hex"] = m2.hexdigest()
-                out[f"{tag}_b64key_b64"] = base64.b64encode(m2.digest()).decode()
+            decoded = base64.b64decode(secret + "=" * (-len(secret) % 4))
+            if decoded:
+                keys["b64key"] = decoded
         except Exception:
             pass
+
+        for ktag, key in keys.items():
+            for ptag, payload in payloads.items():
+                mac = hmac.new(key, payload, hashlib.sha256)
+                out[f"{stag}_{ktag}_{ptag}_hex"] = mac.hexdigest()
+                out[f"{stag}_{ktag}_{ptag}_b64"] = base64.b64encode(
+                    mac.digest()).decode()
 
     return out
 
 
-def verify_signature(raw_body: bytes, signature: Optional[str]) -> bool:
+def verify_signature(raw_body: bytes, signature: Optional[str],
+                     timestamp: Optional[str] = None) -> bool:
     """Check the Bachs-Signature header against the shared secret.
 
     compare_digest, not ==. A plain comparison returns faster when the first
@@ -159,7 +169,7 @@ def verify_signature(raw_body: bytes, signature: Optional[str]) -> bool:
         if part:
             received.append(part)
 
-    variants = _candidate_signatures(raw_body)
+    variants = _candidate_signatures(raw_body, timestamp)
 
     for name, expected in variants.items():
         for got in received:
@@ -168,14 +178,32 @@ def verify_signature(raw_body: bytes, signature: Optional[str]) -> bool:
                 return True
 
     if os.getenv("BACHS_DEBUG_SIG", "").lower() == "true":
-        logger.error("SIGNATURE MISMATCH — header=%r  body_len=%d",
-                     signature[:100], len(raw_body))
+        logger.error("SIGNATURE MISMATCH — header=%r  ts=%r  body_len=%d  "
+                     "(%d variants tried)",
+                     signature[:80], timestamp, len(raw_body), len(variants))
+        # Only the hex variants are printed: there are too many to log in full
+        # and the received value is hex, so base64 forms cannot match anyway.
         for name, expected in variants.items():
-            logger.error("   computed %-20s -> %s...", name, expected[:20])
+            if name.endswith("_hex"):
+                logger.error("   computed %-28s -> %s...", name, expected[:20])
         for got in received:
             logger.error("   received %s...", got[:20])
 
     return False
+
+
+def _find_timestamp_header(request: Request) -> Optional[str]:
+    """The timestamp that goes into the signed payload.
+
+    x-bachs-timestamp on live requests, with x-syncpay-timestamp carrying the
+    same value (Bachs runs on SyncPay). Matched by suffix so either works, and
+    so a rename does not break it.
+    """
+    for key, value in request.headers.items():
+        low = key.lower()
+        if low.endswith("-timestamp") or low in ("timestamp", "x-timestamp"):
+            return value
+    return None
 
 
 def _find_signature_header(request: Request, declared: Optional[str]) -> tuple:
@@ -223,11 +251,12 @@ async def bachs_webhook(
         logger.error("INBOUND HEADERS: %s", dict(request.headers))
 
     sig, header_used = _find_signature_header(request, bachs_signature)
+    ts = _find_timestamp_header(request)
     if header_used and header_used != "Bachs-Signature":
         logger.info("signature taken from header %r (not Bachs-Signature)",
                     header_used)
 
-    if not verify_signature(raw, sig):
+    if not verify_signature(raw, sig, ts):
         # 401, not 200. This endpoint mints licence keys — an unsigned caller
         # who found the URL must get nothing.
         logger.warning("rejected webhook with bad or missing signature")
