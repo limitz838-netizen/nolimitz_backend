@@ -53,6 +53,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -296,9 +297,18 @@ async def bachs_webhook(
     # no payments table — crude, but it makes the check real rather than
     # theoretical.
     if charge_id:
-        existing = db.query(License).filter(
-            License.branding_snapshot["bachs_charge_id"].astext == str(charge_id)
-        ).first()
+        # Raw SQL with an explicit ::jsonb cast. The ORM form
+        # License.branding_snapshot["bachs_charge_id"].astext only compiles
+        # against a JSONB column; this one is plain JSON, so it raised
+        # AttributeError at request time — a 500 on a real payment. Casting in
+        # SQL works for either column type and cannot break if the type
+        # changes later.
+        existing = db.execute(text(
+            "select id, license_key from licenses "
+            "where branding_snapshot::jsonb ->> 'bachs_charge_id' = :cid "
+            "limit 1"
+        ), {"cid": str(charge_id)}).first()
+
         if existing:
             logger.info("charge %s already issued licence %s — not duplicating",
                         charge_id, existing.id)
