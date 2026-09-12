@@ -334,8 +334,3 @@ def bachs_webhook_health():
         "ea_id": BACHS_EA_ID,
         "plans": sorted(set(PLAN_DAYS)),
     }
-        "status": "ready",
-        "secret_configured": bool(BACHS_WEBHOOK_SECRET),
-        "ea_id": BACHS_EA_ID,
-        "plans": sorted(set(PLAN_DAYS)),
-    }
