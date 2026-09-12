@@ -145,7 +145,7 @@ def verify_signature(raw_body: bytes, signature: Optional[str]) -> bool:
         logger.error("BACHS_WEBHOOK_SECRET is not set — refusing all webhooks")
         return False
     if not signature:
-        logger.warning("no Bachs-Signature header on request")
+        logger.warning("no signature header found on request")
         return False
 
     # Header may be bare, "sha256=<sig>", or a comma-joined list during a
@@ -178,6 +178,27 @@ def verify_signature(raw_body: bytes, signature: Optional[str]) -> bool:
     return False
 
 
+def _find_signature_header(request: Request, declared: Optional[str]) -> tuple:
+    """Locate the signature header, whatever Bachs calls it.
+
+    The declared Bachs-Signature parameter came back EMPTY on live retries
+    while the request itself arrived fine, which means the header being sent is
+    not the one documented. Rather than keep guessing names one deploy at a
+    time, this scans for anything signature-shaped and reports what it used.
+
+    Returns (value, header_name_used).
+    """
+    if declared:
+        return declared, "Bachs-Signature"
+
+    for key, value in request.headers.items():
+        low = key.lower()
+        if "signature" in low or low.endswith("-sig") or low.endswith("-hmac"):
+            return value, key
+
+    return None, None
+
+
 @router.post("/bachs-webhook")
 async def bachs_webhook(
     request: Request,
@@ -193,7 +214,20 @@ async def bachs_webhook(
     """
     raw = await request.body()
 
-    if not verify_signature(raw, bachs_signature):
+    if os.getenv("BACHS_DEBUG_SIG", "").lower() == "true":
+        # Every header, verbatim. "no Bachs-Signature header on request" told
+        # us the expected name is wrong but not what the right one is, and
+        # without seeing the actual request there is nothing to reason from.
+        # Turn this off once the header name is known — headers can carry
+        # credentials and this puts them in the log.
+        logger.error("INBOUND HEADERS: %s", dict(request.headers))
+
+    sig, header_used = _find_signature_header(request, bachs_signature)
+    if header_used and header_used != "Bachs-Signature":
+        logger.info("signature taken from header %r (not Bachs-Signature)",
+                    header_used)
+
+    if not verify_signature(raw, sig):
         # 401, not 200. This endpoint mints licence keys — an unsigned caller
         # who found the URL must get nothing.
         logger.warning("rejected webhook with bad or missing signature")
