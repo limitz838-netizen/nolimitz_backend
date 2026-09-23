@@ -153,16 +153,31 @@ def generate_license_key(db: Session):
 
 
 def calculate_expiry(duration: str) -> Optional[datetime]:
+    """Map the dropdown's duration value to an expiry date.
+
+    The dropdown used to offer "30 Days" and "1 Month" as separate options
+    while both returned 30 days — the same plan sold twice under two names.
+    "30days" is now "15days", a genuinely different length.
+
+    "30days" is still ACCEPTED here on purpose. The frontend is deployed
+    separately, so for the window between this going live and Lovable
+    shipping, the old value must keep working or every key generated in
+    that window fails with "Invalid duration selected". It can be deleted
+    once the frontend has been live for a while.
+    """
     now = datetime.utcnow()
 
-    if duration == "30days":
-        return now + timedelta(days=30)
+    if duration == "15days":
+        return now + timedelta(days=15)
     elif duration == "1month":
         return now + timedelta(days=30)
     elif duration == "1year":
         return now + timedelta(days=365)
     elif duration == "lifetime":
         return now + timedelta(days=36500)
+    elif duration == "30days":
+        # Legacy value from the old dropdown. Same as 1month.
+        return now + timedelta(days=30)
     else:
         raise HTTPException(status_code=400, detail="Invalid duration selected")
 
@@ -332,10 +347,6 @@ def deactivate_license(
     if not license:
         raise HTTPException(status_code=404, detail="License not found")
 
-    license.is_active = False
-    db.commit()
-
-    return {"message": "License deactivated"}
     license.is_active = False
     db.commit()
 
