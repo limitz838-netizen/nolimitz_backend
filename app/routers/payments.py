@@ -10,24 +10,34 @@
   /payments/bachs-webhook on this backend and got 404, because the route did
   not exist. This is that route.
 
-  No payment is lost: every failed delivery is still in the Bachs dashboard
-  with a Retry button. Once this deploys, retrying replays them.
+  ── DURATION IS RESOLVED, NOT GUESSED ────────────────────────────────────────
+  Plan resolution now lives in app/routers/bachs_plans.py. This file asks it
+  and does what it says. The order there is:
 
-  ── DURATION COMES FROM plan_id, NOT PRICE ───────────────────────────────────
-  Confirmed from live events:
-      metadata.plan_id = "monthly"   -> 30 days   ($18.99)
-      metadata.plan_id = "annual"    -> 365 days  ($79.99)
-      metadata.plan_id = "lifetime"  -> lifetime  ($170.00)
+      1. metadata.plan_id      hosted checkout sets it
+      2. payment link id       via BACHS_LINK_PLANS   (precise)
+      3. settlement amount     via BACHS_AMOUNT_PLANS (blunt, opt-in)
+      4. refuse                no licence, 200 + action_required
 
-  Price is deliberately NOT the discriminator. Two live payments settled at
-  $9.99 on a promotional payment link while still being monthly plans — an
-  amount-based mapping would have mispriced those, and a customer given the
-  wrong expiry is worse than one who waits for a manual key.
+  WHY: hosted checkout sends plan_id, payment links do not. On 23 September
+  four people paid through links and this endpoint refused all four, correctly,
+  because it had nothing to go on. Rules 2 and 3 give it something.
 
-  An UNKNOWN plan_id creates no licence and returns 200 with a flag. Returning
-  an error would make Bachs retry forever; creating a guessed licence would
-  give someone the wrong access. Neither is acceptable, so it records the
-  payment and tells you.
+  A CORRECTION worth keeping. An earlier version of this comment said $9.99 was
+  a promotional MONTHLY link. It is not — $9.99 is the 15-day plan. Anything
+  built on that stale note would have handed every $9.99 customer 30 days for a
+  15-day payment. Prices and durations live in Render env vars now, set from
+  the actual links, and not in a comment that can quietly go out of date:
+
+      15 days   $9.99    pl_28c868d8f88b
+      30 days   $18.99   pl_6e12a159e723
+      1 year    $79.99   pl_458d0a58b52d
+      lifetime  $170.00  pl_d57eca0307f7
+
+  An UNRESOLVED payment creates no licence and returns 200 with a flag.
+  Returning an error would make Bachs retry forever; creating a guessed licence
+  would give someone the wrong access. Neither is acceptable, so it records the
+  payment and tells you — with the exact env line that would fix it.
 
   ── SETUP ────────────────────────────────────────────────────────────────────
   Render environment:
@@ -36,12 +46,23 @@
                                                ever buy this EA)
       BACHS_ADMIN_ID       = 2                (owning admin for created keys)
 
-  Then in the Bachs dashboard set the webhook URL to:
+      BACHS_LINK_PLANS     = pl_28c868d8f88b:15days, pl_6e12a159e723:30days,
+                             pl_458d0a58b52d:1year, pl_d57eca0307f7:lifetime
+      BACHS_AMOUNT_PLANS   = 9.99:15days, 18.99:30days, 79.99:1year, 170:lifetime
+
+  (BACHS_LINK_PLANS goes on ONE line — wrapped here only to fit.)
+
+  Bachs dashboard webhook URL:
       https://nolimitz-backend-yfne.onrender.com/payments/bachs-webhook
 
   And in app/main.py:
       from app.routers import payments
       app.include_router(payments.router)
+
+  DEPLOY ORDER: app/routers/bachs_plans.py must exist in the repo before or
+  alongside this file. The import below is at module level, so a missing
+  bachs_plans.py does not fail this route — it fails the whole application at
+  startup.
 ================================================================================
 """
 
@@ -59,6 +80,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import Admin, ExpertAdvisor, License
 from app.routers.license import deliver_license, generate_license_key
+from app.routers.bachs_plans import resolve_plan, config_summary
 
 router = APIRouter(prefix="/payments", tags=["Payments"])
 logger = logging.getLogger("payments")
@@ -67,22 +89,23 @@ BACHS_WEBHOOK_SECRET = os.getenv("BACHS_WEBHOOK_SECRET", "")
 BACHS_EA_ID = int(os.getenv("BACHS_EA_ID", "1"))
 BACHS_ADMIN_ID = int(os.getenv("BACHS_ADMIN_ID", "2"))
 
-# plan_id -> days. "lifetime" matches what license.py already does for its
-# lifetime option, so a key bought here behaves like one issued by hand.
-PLAN_DAYS = {
-    "monthly": 30,
-    "month": 30,
-    "30days": 30,
-    "annual": 365,
-    "yearly": 365,
-    "year": 365,
-    "lifetime": 36500,
-}
+# NOTE: the PLAN_DAYS dict that used to live here has been REMOVED, not moved.
+# bachs_plans.PLAN_DAYS is the single authority for duration now. Two copies of
+# the same mapping in two files is how one of them silently goes stale — which
+# is exactly what happened to the $9.99 comment above.
 
-# What each plan SHOULD cost, used only as a sanity check in the log. A
-# mismatch is worth seeing (promo link, price change, or something wrong) but
-# must never change the duration — plan_id is the authority.
-PLAN_EXPECTED_USD = {"monthly": 18.99, "annual": 79.99, "lifetime": 170.00}
+# What each DURATION should cost, as a sanity check in the log only. Keyed by
+# days rather than plan name, so it works whichever alias resolved ("15days",
+# "monthly", "1year"...) without needing an entry per alias.
+#
+# A mismatch is worth seeing — promo, price change, or something wrong — but it
+# must never change the duration. The resolver is the authority.
+PLAN_EXPECTED_USD = {
+    15: 9.99,
+    30: 18.99,
+    365: 79.99,
+    36500: 170.00,
+}
 
 
 def _candidate_signatures(raw_body: bytes, timestamp: Optional[str] = None) -> dict:
@@ -283,7 +306,6 @@ async def bachs_webhook(
     charge_id = data.get("charge_id")
     email = (customer.get("email") or "").strip()
     name = (customer.get("name") or "").strip() or None
-    plan_id = (meta.get("plan_id") or "").strip().lower()
     settlement = data.get("settlement_amount")
 
     if not email:
@@ -296,6 +318,12 @@ async def bachs_webhook(
     # keys. The charge id is stored in the branding snapshot because there is
     # no payments table — crude, but it makes the check real rather than
     # theoretical.
+    #
+    # LIMIT: this only sees licences created BY THIS WEBHOOK. A key you issued
+    # by hand carries no bachs_charge_id, so pressing Retry on a payment you
+    # already served manually WILL mint a second licence. The check guards
+    # against Bachs retrying itself; it cannot know about work done outside the
+    # system.
     if charge_id:
         # Raw SQL with an explicit ::jsonb cast. The ORM form
         # License.branding_snapshot["bachs_charge_id"].astext only compiles
@@ -315,24 +343,28 @@ async def bachs_webhook(
             return {"received": True, "duplicate": True,
                     "license_key": existing.license_key}
 
-    days = PLAN_DAYS.get(plan_id)
+    # ---- WHICH PLAN DID THEY BUY? -------------------------------------------
+    # Delegated. resolve_plan returns (plan, days, how) and has already logged
+    # the link id, the amount, the full metadata and the exact env line that
+    # would map this payment, if it could not decide.
+    plan_id, days, how = resolve_plan(data, meta)
     if days is None:
         # Do NOT guess. A wrong expiry is worse than a manual key: the customer
         # either loses access early or gets more than they paid for, and
         # neither is visible until they complain.
-        logger.error("UNKNOWN plan_id %r on charge %s (%s, %s) — no licence "
-                     "created, issue this one by hand",
-                     plan_id, charge_id, email, settlement)
-        return {"received": True, "error": f"unknown plan_id: {plan_id}",
+        return {"received": True, "error": "could not determine plan",
                 "action_required": "issue this licence manually"}
+
+    logger.info("charge %s resolved to plan %s (%s days) via %s",
+                charge_id, plan_id, days, how)
 
     # Price sanity check — logged, never acted on.
     try:
-        expected = PLAN_EXPECTED_USD.get(plan_id)
+        expected = PLAN_EXPECTED_USD.get(days)
         if expected and settlement and abs(float(settlement) - expected) > 0.5:
-            logger.warning("charge %s: plan %s settled at %s, expected ~%s "
-                           "(promo link or price change?)",
-                           charge_id, plan_id, settlement, expected)
+            logger.warning("charge %s: plan %s (%s days) settled at %s, "
+                           "expected ~%s (promo link or price change?)",
+                           charge_id, plan_id, days, settlement, expected)
     except Exception:
         pass
 
@@ -362,6 +394,10 @@ async def bachs_webhook(
             "bachs_event_id": event_id,
             "bachs_plan_id": plan_id,
             "bachs_settlement": str(settlement) if settlement else None,
+            # WHICH RULE decided the duration. If a customer ever disputes
+            # their expiry, this says whether it came from checkout, from a
+            # mapped link, or from the price — without re-reading the logs.
+            "bachs_resolved_by": how,
             "source": "bachs",
         },
         ai_enabled=True,
@@ -390,20 +426,25 @@ async def bachs_webhook(
         "license_key": lic.license_key,
         "plan": plan_id,
         "days": days,
+        "resolved_by": how,
         "emailed": sent,
     }
 
 
 @router.get("/bachs-webhook")
 def bachs_webhook_health():
-    """So a browser hit tells you the route exists.
+    """So a browser hit tells you the route exists — and what it is configured
+    with.
 
     The 404s in the Bachs dashboard were the whole problem; being able to check
     the path is live in one click is worth the four lines.
+
+    config_summary() adds the live link and amount maps, so you can confirm an
+    env var actually took effect without making a real payment to find out.
     """
     return {
         "status": "ready",
         "secret_configured": bool(BACHS_WEBHOOK_SECRET),
         "ea_id": BACHS_EA_ID,
-        "plans": sorted(set(PLAN_DAYS)),
+        **config_summary(),
     }
