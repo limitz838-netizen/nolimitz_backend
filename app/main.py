@@ -26,6 +26,7 @@ from app.routers.master_account import router as master_account_router
 from app.routers.robot import router as robot_router
 from app.routers.signals import router as signals_router
 from app.routers import payments
+from app.routers import reminders
 
 # --------------------------------------------------------- AI routers ---
 from app.ai.routes.ai_assistant import router as ai_assistant_router
@@ -178,6 +179,7 @@ app.include_router(deriv_router)  # /auth/deriv/... (OAuth 2.0 + PKCE)
 app.include_router(deriv_trading_router)
 app.include_router(deriv_bots_router)
 app.include_router(payments.router)
+app.include_router(reminders.router)
 
 
 @app.get("/")
