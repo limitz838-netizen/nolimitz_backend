@@ -28,6 +28,7 @@ from app.routers.signals import router as signals_router
 from app.routers import payments
 from app.routers import reminders
 from app.routers import entitlement
+from app.routers import telegram_copier
 
 # --------------------------------------------------------- AI routers ---
 from app.ai.routes.ai_assistant import router as ai_assistant_router
@@ -182,6 +183,7 @@ app.include_router(deriv_bots_router)
 app.include_router(payments.router)
 app.include_router(reminders.router)
 app.include_router(entitlement.router)
+app.include_router(telegram_copier.router)
 
 
 @app.get("/")
