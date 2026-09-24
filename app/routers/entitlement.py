@@ -130,15 +130,20 @@ def check_entitlement(
         key_rows = {r["license_key"]: r for r in rows}
 
     # ---- one query for every email, so renewals under a new key count ------
-    email_live = set()
+    # Maps email -> latest live expiry, NOT just a set of emails. The expiry is
+    # what lets a caller repair a stale profile instead of only being told not to
+    # demote it. Without it, a renewed customer is skipped as "unsure" every run,
+    # for ever, and the self-healing half of the job never happens.
+    email_live = {}
     if emails:
         rows = db.execute(text("""
-            select distinct lower(trim(client_email)) as em
+            select lower(trim(client_email)) as em, max(expires_at) as latest
             from licenses
             where lower(trim(client_email)) = any(:emails)
               and is_active and expires_at > now()
+            group by 1
         """), {"emails": emails}).mappings().all()
-        email_live = {r["em"] for r in rows}
+        email_live = {r["em"]: r["latest"] for r in rows}
 
     results = []
     counts = {"entitled": 0, "expired": 0, "key_unknown": 0, "no_identifiers": 0}
@@ -160,6 +165,10 @@ def check_entitlement(
             counts["entitled"] += 1
             results.append({"key": a.key, "email": a.email, "entitled": True,
                             "reason": "active_licence_on_email",
+                            # MUST be present. The caller repairs a stale
+                            # premium_until from this value; omitting it left
+                            # renewed customers stuck as "unsure" on every run.
+                            "expires_at": str(email_live[email]),
                             "safe_to_demote": False})
             continue
 
