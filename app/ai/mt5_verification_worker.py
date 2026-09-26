@@ -57,6 +57,7 @@ from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.models import ClientMT5Account
+from app.ai.day_pnl import realised_pnl_today
 
 # The Windows worker is the ONLY thing that touches MT5, so it owns its own
 # terminal lock. The Render API no longer imports MetaTrader5 at all.
@@ -140,7 +141,7 @@ def _safe_commit(db: Session) -> bool:
 # MT5 LIFECYCLE
 # ==============================================================================
 def init_mt5() -> bool:
-    if not mt5.initialize(path=TERMINAL_PATH, timeout=LOGIN_TIMEOUT_MS):
+    if not mt5.initialize(path=TERMINAL_PATH, timeout=INIT_TIMEOUT_MS):
         logger.critical("MT5 INIT FAILED: %s", mt5.last_error())
         return False
     logger.info("✅ MT5 verifier connected")
@@ -157,6 +158,24 @@ def restart_mt5_if_needed() -> None:
             time.sleep(2)
             mt5.initialize(path=TERMINAL_PATH, timeout=LOGIN_TIMEOUT_MS)
         _last_mt5_restart = time.time()
+
+
+def _force_kill_terminal() -> None:
+    """Kill a zombied terminal64.exe. Once the process wedges it returns
+    -10005 on every initialize() forever, and shutdown()+initialize() cannot
+    revive it — the process must actually die. Matched by EXACT path so this
+    can never touch a trader shard's terminal."""
+    try:
+        import subprocess
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-Process terminal64 -ErrorAction SilentlyContinue | "
+             f"Where-Object {{ $_.Path -eq '{TERMINAL_PATH}' }} | Stop-Process -Force"],
+            timeout=20, capture_output=True,
+        )
+        logger.warning("🔪 force-killed wedged verifier terminal")
+    except Exception as e:
+        logger.warning("force-kill failed: %s", e)     
 
 
 def _init_with_retries() -> bool:
@@ -178,6 +197,14 @@ def _init_with_retries() -> bool:
             logger.warning("init attempt %d exception: %s", attempt, e)
         logger.warning("init attempt %d/%d failed: %s",
                        attempt, INIT_RETRIES, mt5.last_error())
+
+        # A zombied terminal returns -10005 forever and shutdown() can't
+        # revive it. After the first failure, kill the process so attempt 2
+        # gets a genuinely fresh terminal.
+        if attempt == 1:
+            _force_kill_terminal()
+            time.sleep(5)
+
     return False
 
 
@@ -262,11 +289,9 @@ def _classify_login_failure(err) -> str:
     text = ((err[1] if isinstance(err, tuple) and len(err) > 1 else "") or "").lower()
 
     # Authorization problems = wrong login or password. Retrying never helps.
-    if (code in (-6, 134, 10004, 10015)
-            or "authoriz" in text
+    if (code in (134, 10004, 10015)
             or "invalid account" in text
-            or "account disabled" in text
-            or "password" in text):
+            or "account disabled" in text):
         return "bad_auth"
 
     # Server name not known to the terminal = wrong/misspelled server.
@@ -430,6 +455,24 @@ def verify_one_account(account: ClientMT5Account, db: Session) -> bool:
             account.balance             = float(info.balance or 0)
             account.equity              = float(info.equity or 0)
             account.last_verified_at    = datetime.now(timezone.utc)
+            # Today's realised P&L, from the broker's deal history, while this
+            # account is the one the terminal is bound to.
+            #
+            # Wrapped, deliberately: this worker's job is keeping balance fresh,
+            # and a P&L read must never be able to break that. If the broker
+            # won't answer, the old value stays and goes stale, and the API
+            # stops serving it — the card shows a dash, nothing else changes.
+            try:
+                _pnl, _day_key, _n_deals = realised_pnl_today(login_str)
+                if _pnl is not None:
+                    account.day_realized_pnl = _pnl
+                    account.day_pnl_key      = _day_key
+                    account.day_pnl_at       = datetime.now(timezone.utc)
+                    if _n_deals:
+                        logger.info("   day P&L %s: $%.2f from %d deal(s) on %s",
+                                    login_str, _pnl, _n_deals, _day_key)
+            except Exception as _e:
+                logger.warning("day P&L skipped for %s: %s", login_str, _e)
             # Clear any stale error from a previous failed attempt.
             if hasattr(account, "verification_error"):
                 account.verification_error = None
