@@ -237,6 +237,18 @@ class ClientMT5Account(Base):
     balance = Column(Float, default=0)
     equity = Column(Float, default=0)
 
+    # ── Today's P&L ──────────────────────────────────────────────────────────
+    # Written by mt5_verification_worker from the broker's own deal history,
+    # because live_trades.profit was never populated and there is nothing in
+    # this database to sum. REALISED only — floating P&L is (equity - balance)
+    # and the API adds it at read time, from this same snapshot, so the two
+    # halves are never from different moments.
+    day_realized_pnl = Column(Float, nullable=True)
+    # The BROKER'S date this figure belongs to, e.g. '2026-09-26'. Text, not a
+    # date, so nothing helpfully converts a server date into our time zone.
+    day_pnl_key = Column(String, nullable=True)
+    day_pnl_at = Column(DateTime(timezone=True), nullable=True)
+
     # MetaApi info
     metaapi_account_id = Column(String, nullable=True, unique=True)
     metaapi_state = Column(String, nullable=True)
