@@ -29,6 +29,7 @@ from app.routers import payments
 from app.routers import reminders
 from app.routers import entitlement
 from app.routers import telegram_copier
+from app.routers import telegram_user_copier
 
 # --------------------------------------------------------- AI routers ---
 from app.ai.routes.ai_assistant import router as ai_assistant_router
