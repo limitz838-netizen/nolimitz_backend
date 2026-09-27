@@ -184,6 +184,8 @@ app.include_router(payments.router)
 app.include_router(reminders.router)
 app.include_router(entitlement.router)
 app.include_router(telegram_copier.router)
+app.include_router(telegram_user_copier.router)
+app.include_router(telegram_user_copier.worker_router)
 
 
 @app.get("/")
