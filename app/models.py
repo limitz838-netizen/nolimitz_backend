@@ -237,15 +237,12 @@ class ClientMT5Account(Base):
     balance = Column(Float, default=0)
     equity = Column(Float, default=0)
 
-    # ── Today's P&L ──────────────────────────────────────────────────────────
-    # Written by mt5_verification_worker from the broker's own deal history,
-    # because live_trades.profit was never populated and there is nothing in
-    # this database to sum. REALISED only — floating P&L is (equity - balance)
-    # and the API adds it at read time, from this same snapshot, so the two
-    # halves are never from different moments.
+    # ---- Day P&L: written by mt5_verification_worker from broker deal history.
+    # REALISED only. Floating P&L is (equity - balance) and the API adds it at
+    # read time from this same snapshot, so both halves are one moment.
     day_realized_pnl = Column(Float, nullable=True)
-    # The BROKER'S date this figure belongs to, e.g. '2026-09-26'. Text, not a
-    # date, so nothing helpfully converts a server date into our time zone.
+    # The BROKER date this figure belongs to, e.g. 2026-09-26. Text, not a date,
+    # so nothing converts a server date into our own time zone.
     day_pnl_key = Column(String, nullable=True)
     day_pnl_at = Column(DateTime(timezone=True), nullable=True)
 
@@ -653,6 +650,13 @@ class TradeExecution(Base):
 
     retry_count = Column(Integer, default=0)
     retry_at = Column(DateTime(timezone=True), nullable=True)
+
+    # How many positions ONE row may open. NULL keeps the historic
+    # behaviour where risk_level multiplies in copier_executor._handle_open:
+    # normal 1, medium 3, aggressive 5. Telegram sets this to 1, because a
+    # signal from a channel is one trade, not three. Every master-copier row
+    # leaves it NULL and is completely unaffected.
+    per_signal = Column(Integer, nullable=True)
 
     symbol = Column(String, nullable=False, index=True)
     action = Column(String, nullable=True)
