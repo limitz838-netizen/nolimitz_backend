@@ -81,6 +81,12 @@ _AT_WORDS = {"AT", "@", "FROM"}
 # Closure vocabulary.
 # NOT "TAKE": "TAKE PROFIT: 1.0920" would route the whole message down the
 # closure path and silently discard its stop loss. Found by the test suite.
+# Words that mean "no single entry was given". Refused wherever they appear in
+# the instruction line, because picking one price out of a zone is a decision
+# only the trader may make.
+_ZONE_WORDS = {"AROUND", "BETWEEN", "ZONE", "AREA", "NEAR", "RANGE", "APPROX",
+               "ABOVE", "BELOW", "RETEST", "REGION"}
+
 _CLOSE_WORDS = {"CLOSE", "CLOSED", "EXIT"}
 _ALL_WORDS = {"ALL", "EVERYTHING", "EVERY"}
 
@@ -94,18 +100,36 @@ _NUM = r"\d+(?:[.,]\d+)?"
 # order type, so "SELL STOP 1.0820" would have had its entry price eaten as a
 # stop loss and then been executed at market.
 _SL_LABEL = r"(?:SL|S\.L\.?|STOP\s*-?\s*LOSS|STOPLOSS)"
-_TP_LABEL = r"(?:TP|T\.P\.?|TAKE\s*-?\s*PROFIT|TAKEPROFIT|TARGET|TG)"
+# "T2:" is a real take-profit label. TP is tried first so "TP1" never splits.
+_TP_LABEL = (r"(?:TP|T\.P\.?|TAKE\s*-?\s*PROFIT|TAKEPROFIT|TARGET|TGT|TG"
+             r"|T(?=[1-5]))")
 _ENTRY_LABEL = r"(?:ENTRY\s*PRICE|ENTRY|ENTER|EP)"
 
-# The optional index digit binds TIGHT to the label -- "SL1", "TP2" -- with no
+# The optional index binds TIGHT to the label -- "SL1", "TP2", "T3" -- with NO
 # space allowed. Written as `\s*\d?` it ate the first digit of the price, so
-# "SL 3720" parsed as 720 and the trade would have carried a stop 3000 points
-# away. Also found by the test suite.
-_RE_SL = re.compile(rf"\b{_SL_LABEL}\d?\s*[:=@\-]?\s*({_NUM})", re.I)
+# "SL 3720" parsed as 720 and the trade carried a stop 3000 points away.
+#
+# The separator class includes "." because KOJOFOREX writes "TP1. 4376.00" and
+# "SL. 4344.00", and without it that entire signal was refused.
+_SEP = r"[:=@.\-\)]*"
+
+# "2648-2652", "2648/2652" -- a range written as one token.
+_RE_RANGE = re.compile(rf"{_NUM}\s*[-/]\s*{_NUM}")
+
+# A range that CONTINUES past a captured number: "Entry 2648-2652" matches the
+# entry label, yields 2648, and the "-2652" is blanked out with the span and
+# never seen again. Checked against what follows the match instead.
+_RE_RANGE_TAIL = re.compile(r"\s*[-/]\s*\d")
+
+_RE_SL = re.compile(rf"\b{_SL_LABEL}([0-9]?)\s*{_SEP}\s*({_NUM})", re.I)
 # [ \t,/]* not [\s,/]* -- \s includes the newline, so the run of numbers would
 # cross into the next line and swallow "1.5%" from a risk note.
-_RE_TP = re.compile(rf"\b{_TP_LABEL}\d?\s*[:=@\-]?\s*((?:{_NUM}[ \t,/]*)+)", re.I)
-_RE_ENTRY = re.compile(rf"\b{_ENTRY_LABEL}\d?\s*[:=@\-]?\s*({_NUM})", re.I)
+_RE_TP = re.compile(
+    rf"\b{_TP_LABEL}([0-9]?)\s*{_SEP}\s*((?:{_NUM}[ \t,/]*)+)", re.I)
+_RE_ENTRY = re.compile(rf"\b{_ENTRY_LABEL}([0-9]?)\s*{_SEP}\s*({_NUM})", re.I)
+
+_RE_SL_MENTION = re.compile(rf"\b{_SL_LABEL}\b", re.I)
+_RE_TP_MENTION = re.compile(rf"\b{_TP_LABEL}\b", re.I)
 
 # ---------------------------------------------------------------------------
 # What may be an instrument name
@@ -115,8 +139,8 @@ _RE_ENTRY = re.compile(rf"\b{_ENTRY_LABEL}\d?\s*[:=@\-]?\s*({_NUM})", re.I)
 #
 # A token is a candidate instrument if it contains a digit (NAS100, V75,
 # BOOM1000), is a known instrument word, or is 6-8 letters beginning with a
-# currency/metal code (EURUSD, XAUUSDm, GBPJPYc). Everything else is refused
-# by name, which gives the user an honest reason in the feed.
+# currency/metal code (EURUSD, XAUUSDm, GBPJPYc). Everything else is refused by
+# name, which gives the user an honest reason in the feed.
 
 _CCY_PREFIX = {
     "EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF", "SEK", "NOK",
@@ -147,9 +171,7 @@ def _looks_like_instrument(tok, extra):
         return True
     return False
 
-# Used to detect that a label is PRESENT even when no clean value follows it.
-_RE_SL_MENTION = re.compile(rf"\b{_SL_LABEL}\b", re.I)
-_RE_TP_MENTION = re.compile(rf"\b{_TP_LABEL}\b", re.I)
+
 
 
 class Refusal(Exception):
@@ -173,7 +195,11 @@ def _clean(text):
             # Emoji, arrows, box characters -> a space. Channels lean on them
             # heavily for layout and none of them carry meaning we need.
             out.append(" ")
-        elif ch in "*_`~|[]()\"'":
+        elif ch in "*_`~|[]\"'":
+            # NOTE: ( and ) are deliberately NOT stripped. Deriv names a real
+            # instrument "Volatility 75 (1s)", and the copier's synonym table
+            # keys it as V75(1S). Flattening the brackets split it into two
+            # tokens and the whole signal was refused as "multiple_symbols".
             out.append(" ")
         else:
             out.append(ch)
@@ -231,7 +257,17 @@ def parse_signal(text, extra_symbols=None):
     if words & _CLOSE_WORDS:
         return _parse_close(upper, words)
 
+    # ---- is this even an instruction? -------------------------------------
+    # Checked BEFORE the SL/TP scan. Most of what a signal channel posts is
+    # commentary, and a post-mortem saying "we took an SL on our first trade"
+    # was being refused as "a stop loss is mentioned but no clear price follows
+    # it" -- which reads, wrongly, like the parser choking on a real signal. No
+    # BUY and no SELL anywhere means it was never an instruction at all.
+    if not (set(re.findall(r"[A-Z]+", upper)) & (_BUY_WORDS | _SELL_WORDS)):
+        raise Refusal("not_a_signal", "No BUY or SELL found.")
+
     # ---- pull the labelled fields out of the whole message ----------------
+    tp_unspecified = False
     stop_loss = None
     take_profits = []
     entry_price_labelled = None
@@ -239,7 +275,10 @@ def parse_signal(text, extra_symbols=None):
 
     m = _RE_SL.search(upper)
     if m:
-        stop_loss = _to_float(m.group(1))
+        if _RE_RANGE_TAIL.match(upper[m.end():]):
+            raise Refusal("sl_ambiguous",
+                          "The stop loss is given as a range, not one price.")
+        stop_loss = _to_float(m.group(2))
         spans.append(m.span())
     elif _RE_SL_MENTION.search(upper):
         # A stop loss was mentioned and we could not read it. Refusing is the
@@ -249,15 +288,35 @@ def parse_signal(text, extra_symbols=None):
                       "A stop loss is mentioned but no clear price follows it.")
 
     for m in _RE_TP.finditer(upper):
-        take_profits.extend(_numbers(m.group(1)))
+        nums = _numbers(m.group(2))
+        # "TP 1 16262" -- the index is detached from the label, so it arrives as
+        # the first number. A leading bare 1-9 followed by MORE numbers is an
+        # index, not a price: no instrument has a take profit of 1. Only dropped
+        # when something follows it, so a genuine "TP 5" still counts.
+        if not m.group(1) and len(nums) > 1 and nums[0].is_integer() \
+                and 1 <= nums[0] <= 9:
+            nums = nums[1:]
+        take_profits.extend(nums)
         spans.append(m.span())
+    # A TP mentioned with no number -- "TP WILL BE UPDATED", "TP soon" -- is
+    # treated as NO take profit, not as a refusal. The asymmetry with the stop
+    # loss above is the whole point and it is about bounded risk:
+    #
+    #   no take profit  -> the trade runs to its stop. Bounded.
+    #   no stop loss    -> the trade runs until the account cannot hold it.
+    #
+    # A real channel message refused for this was the first thing real traffic
+    # showed: "SELL v75 (1s) / SL: 3921 / TP WILL BE UPDATED" is a perfectly
+    # tradeable signal, and refusing it taught the user the copier was broken.
     if not take_profits and _RE_TP_MENTION.search(upper):
-        raise Refusal("tp_ambiguous",
-                      "A take profit is mentioned but no clear price follows it.")
+        tp_unspecified = True
 
     m = _RE_ENTRY.search(upper)
     if m:
-        entry_price_labelled = _to_float(m.group(1))
+        if _RE_RANGE_TAIL.match(upper[m.end():]):
+            raise Refusal("entry_ambiguous",
+                          "The entry is given as a range, not one price.")
+        entry_price_labelled = _to_float(m.group(2))
         spans.append(m.span())
 
     # Blank out what we consumed so the head scan cannot see it again.
@@ -291,52 +350,102 @@ def parse_signal(text, extra_symbols=None):
     if head_line is None:
         raise Refusal("not_a_signal", "No BUY or SELL found.")
 
-    # ---- whitelist the head ----------------------------------------------
+    # ---- whitelist the instruction, not the whole line ---------------------
+    # Real channels bury the signal at the END of a chatty line:
+    #
+    #   "Manage your risk always , let me share with you guys the TPS and the
+    #    SL [emoji] SELL v75 (1s)"
+    #
+    # Whitelisting that entire line refuses on "MANAGE" and throws away a real
+    # tradeable signal. So instead: find the direction word, then walk OUTWARDS
+    # in both directions for as long as the tokens are ones we understand, and
+    # stop at the first that is not. Everything outside that span is commentary
+    # and is recorded in ignored_lines.
+    #
+    # This stays a whitelist -- every token we ACT on is still one we recognise.
+    # What it no longer does is demand that the author wrote nothing else.
     direction = None
     entry_type = "MARKET"
     entry_price = None
     symbol_raw = None
 
-    tokens = [t for t in re.split(r"[\s,;:]+", head_line) if t]
-    for tok in tokens:
-        if tok in _BUY_WORDS or tok in _SELL_WORDS:
-            if direction is not None:
-                raise Refusal("multiple_signals", "Two directions in one line.")
-            direction = "BUY" if tok in _BUY_WORDS else "SELL"
-            continue
-        if tok in _MARKET_WORDS:
-            continue
-        if tok in _AT_WORDS:
-            continue
-        if tok in _LIMIT_WORDS:
-            entry_type = "LIMIT"
-            continue
-        if tok in _STOP_WORDS:
-            entry_type = "STOP"
-            continue
-        if re.fullmatch(_NUM, tok):
-            if entry_price is not None:
-                # Two bare numbers is a range ("2648 2652") or a typo. Either
-                # way we do not know which one the author meant.
-                raise Refusal(
-                    "entry_ambiguous",
-                    "More than one entry price. A price range cannot be "
-                    "traded as a single entry.")
-            entry_price = _to_float(tok)
-            continue
-        if re.fullmatch(r"[A-Z0-9]{2,20}", tok) and _looks_like_instrument(tok, extra):
-            if symbol_raw is not None:
-                raise Refusal("multiple_symbols",
-                              f"More than one instrument named "
-                              f"({symbol_raw} and {tok}).")
-            symbol_raw = tok
-            continue
-        # Anything else. "AROUND", "2648-2652", "BETWEEN", "ZONE", "MORNING" all
-        # land here, and all of them mean the instruction is not precise enough
-        # to trade.
-        raise Refusal("unrecognised_token",
-                      f"'{tok}' is not something this parser understands, so "
-                      f"the whole signal was refused rather than guessed at.")
+    # Trailing punctuation must not make a known word unknown ("NOW." -> NOW),
+    # and a lone dash between symbol and direction -- "XAUUSD - BUY" -- must not
+    # stop the scan. An em dash already vanished as non-ASCII; a plain hyphen
+    # did not, and it cost a real TradewithAhmed signal.
+    #
+    # Only LEADING and TRAILING punctuation goes. "2648-2652" keeps its dash,
+    # stays unrecognised, and is still refused as a range.
+    tokens = [t.strip(".-|/") for t in re.split(r"[\s,;:]+", head_line)
+              if t.strip(".-|/")]
+
+    dir_idx = [i for i, t in enumerate(tokens)
+               if t in _BUY_WORDS or t in _SELL_WORDS]
+    if len(dir_idx) > 1:
+        raise Refusal("multiple_signals", "Two directions in one line.")
+    if not dir_idx:
+        raise Refusal("not_a_signal", "No BUY or SELL found.")
+    d = dir_idx[0]
+    direction = "BUY" if tokens[d] in _BUY_WORDS else "SELL"
+
+    # An entry ZONE is refused however it is written, and this check looks at the
+    # whole line rather than only the accepted span. "buy gold around 2648-2652"
+    # does not name one entry, and quietly choosing market on the author's behalf
+    # is a decision the user never made.
+    for t in tokens:
+        if t in _ZONE_WORDS:
+            raise Refusal(
+                "entry_ambiguous",
+                f"'{t}' means no single entry price was given, so this cannot "
+                f"be traded as one entry.")
+        # A bare numeric range -- "2648-2652" -- with no zone word at all. The
+        # window scan would otherwise stop at this unrecognised token and treat
+        # it as commentary, quietly turning a price RANGE into a market order.
+        # Refusing here is the difference between "we could not read it" and
+        # "we picked an entry the author never gave".
+        if _RE_RANGE.fullmatch(t):
+            raise Refusal(
+                "entry_ambiguous",
+                f"'{t}' is a price range, not a single entry.")
+
+    accepted = [d]
+    for step in (-1, 1):
+        i = d + step
+        while 0 <= i < len(tokens):
+            tok = tokens[i]
+            if tok in _MARKET_WORDS or tok in _AT_WORDS:
+                pass
+            elif tok in _LIMIT_WORDS:
+                entry_type = "LIMIT"
+            elif tok in _STOP_WORDS:
+                entry_type = "STOP"
+            elif re.fullmatch(_NUM, tok):
+                if entry_price is not None:
+                    raise Refusal(
+                        "entry_ambiguous",
+                        "More than one entry price. A price range cannot be "
+                        "traded as a single entry.")
+                entry_price = _to_float(tok)
+            elif re.fullmatch(r"\(1S\)", tok) and symbol_raw:
+                # "V75 (1s)" arrives as two tokens. Rejoin them: V75(1S) is a key
+                # in the copier's own synonym table and V75 alone is a DIFFERENT
+                # instrument.
+                symbol_raw += tok
+            elif (re.fullmatch(r"[A-Z0-9()]{2,20}", tok)
+                  and _looks_like_instrument(tok, extra)):
+                if symbol_raw is not None:
+                    raise Refusal("multiple_symbols",
+                                  f"More than one instrument named "
+                                  f"({symbol_raw} and {tok}).")
+                symbol_raw = tok
+            else:
+                break            # commentary begins here
+            accepted.append(i)
+            i += step
+
+    skipped = [tokens[i] for i in range(len(tokens)) if i not in set(accepted)]
+    if skipped:
+        ignored.append(" ".join(skipped))
 
     if direction is None:
         raise Refusal("not_a_signal", "No BUY or SELL found.")
@@ -361,6 +470,10 @@ def parse_signal(text, extra_symbols=None):
         "entry_price": entry_price,
         "stop_loss": stop_loss,
         "take_profits": take_profits,
+        # True when the channel said a TP exists but gave no number. The risk
+        # gate does not care -- no TP is no TP -- but the feed can show the user
+        # why their trade has no target.
+        "tp_unspecified": tp_unspecified,
         "ignored_lines": ignored,
     }
 
