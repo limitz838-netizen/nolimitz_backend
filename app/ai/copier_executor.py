@@ -707,7 +707,12 @@ def _handle_open(db: Session, row: TradeExecution, broker_symbol: str,
     # aggressive 5. That same number is the ceiling on how many copier
     # positions may be open on the symbol at once.
     cap = _risk_cap(account)
-    per_signal = cap
+    # A row may ask for a single trade instead of inheriting the
+    # risk-mode multiplier. Telegram sets per_signal=1. NULL is every
+    # master-copier row ever written and keeps todays exact behaviour.
+    # min() means a row can only ever ask for FEWER trades, never more.
+    _want = getattr(row, 'per_signal', None)
+    per_signal = cap if _want is None else max(1, min(cap, int(_want)))
     max_open = cap
 
     current = len(_copier_positions(broker_symbol))
