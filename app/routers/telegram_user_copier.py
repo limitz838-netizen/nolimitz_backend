@@ -113,6 +113,15 @@ CONSENT_VERSION = os.getenv("TELEGRAM_CONSENT_VERSION", "2026-09-27")
 # A session older than this with no listener heartbeat is reported offline.
 LISTENER_STALE_SEC = int(os.getenv("TELEGRAM_LISTENER_STALE_SEC", "300"))
 
+# How old a Telegram message may be, by its own send time, and still trade.
+#
+# Telethon's catch-up ("Got difference") re-delivers messages sent while the
+# listener was down. Without this, restarting after an outage would trade
+# yesterday's signals at today's price -- and every other staleness guard in the
+# system misses it, because the execution row is created NOW and therefore looks
+# fresh to the executor's MAX_OPEN_EVENT_AGE_SEC.
+MAX_SIGNAL_AGE_SEC = int(os.getenv("TELEGRAM_MAX_SIGNAL_AGE_SEC", "180"))
+
 # Shared secret for the listener intake. Same variable the copier worker routes
 # use, so the VPS has it already.
 WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
@@ -184,6 +193,27 @@ def _own_source(db: Session, lic: License, source_id: int) -> TelegramSource:
     return src
 
 
+def _signal_age_sec(sent_at: Optional[str]) -> Optional[float]:
+    """Seconds between Telegram's send time and now, or None if unknowable.
+
+    None means "do not judge", not "fresh" -- an older listener sends no
+    timestamp, and inventing an age for it would refuse every signal it posts.
+    A clock skew that puts the message slightly in the future clamps to 0
+    rather than going negative and silently passing a later comparison.
+    """
+    if not sent_at:
+        return None
+    try:
+        s = str(sent_at).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        logger.warning("unparseable sent_at from listener: %r", sent_at)
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+
+
 def _mask_phone(phone: Optional[str]) -> Optional[str]:
     if not phone:
         return None
@@ -242,6 +272,11 @@ class IncomingSignal(BaseModel):
     message_id: str
     text: str
     reply_to_message_id: Optional[str] = None
+
+    # When Telegram says the message was SENT, not when it reached us. Optional
+    # so an older listener keeps working -- absent means the age check is
+    # skipped, which is the behaviour that existed before this field.
+    sent_at: Optional[str] = None
 
 
 # ==============================================================================
@@ -518,6 +553,19 @@ def list_signals(license_key: str, limit: int = 100,
             TelegramSource.license_id == lic.id).all()
     }
 
+    # Read through to the execution rather than waiting for someone to copy
+    # values onto the log. trade_executions is what the lane actually updates,
+    # so it is the one place that knows a ticket exists -- and an earlier
+    # version of this file left executed_at and mt5_ticket permanently null
+    # because it assumed "the lane" would write them here. The lane has never
+    # heard of this table.
+    exec_ids = [r.execution_id for r in rows if r.execution_id]
+    execs = {}
+    if exec_ids:
+        for e in db.query(TradeExecution).filter(
+                TradeExecution.id.in_(exec_ids[:500])).all():
+            execs[e.id] = e
+
     out = []
     for r in rows:
         parsed = {}
@@ -541,10 +589,44 @@ def list_signals(license_key: str, limit: int = 100,
             "received_at": r.received_at.isoformat() if r.received_at else None,
             "parsed_at": r.parsed_at.isoformat() if r.parsed_at else None,
             "validated_at": r.validated_at.isoformat() if r.validated_at else None,
-            "executed_at": r.executed_at.isoformat() if r.executed_at else None,
-            "mt5_ticket": r.mt5_ticket,
+            "executed_at": _executed_at(r, execs),
+            "mt5_ticket": _ticket(r, execs),
+            # What the lane is doing with it, and why it failed if it did. This
+            # is where "No money" becomes visible to the user who owns the
+            # account instead of only to whoever reads the worker log.
+            "execution_status": _exec_field(r, execs, "status"),
+            "execution_error": _exec_field(r, execs, "error_message"),
         })
     return {"success": True, "signals": out}
+
+
+def _exec_field(row, execs, field):
+    ex = execs.get(row.execution_id) if row.execution_id else None
+    return getattr(ex, field, None) if ex is not None else None
+
+
+def _ticket(row, execs):
+    """The broker's ticket, from the execution; the log's own column is a
+    fallback for anything written before the join existed."""
+    ex = execs.get(row.execution_id) if row.execution_id else None
+    if ex is not None and ex.client_ticket:
+        return str(ex.client_ticket)
+    return row.mt5_ticket
+
+
+def _executed_at(row, execs):
+    """When the order actually reached the broker.
+
+    Keyed off the ticket, not off a status string: a ticket exists only if the
+    broker accepted the order, whereas status spellings are the executor's
+    business and would make this quietly wrong the day one of them changes.
+    """
+    if row.executed_at:
+        return row.executed_at.isoformat()
+    ex = execs.get(row.execution_id) if row.execution_id else None
+    if ex is not None and ex.client_ticket and ex.updated_at:
+        return ex.updated_at.isoformat()
+    return None
 
 
 # ==============================================================================
@@ -770,6 +852,15 @@ def incoming_signal(data: IncomingSignal,
 
     if not src.enabled:
         return finish("REFUSED_RISK", "source is paused")
+
+    age = _signal_age_sec(data.sent_at)
+    if age is not None and age > MAX_SIGNAL_AGE_SEC:
+        # Refused, never queued late. A signal is a statement about a price at a
+        # moment; acting on it an hour later is a different trade that nobody
+        # chose. The row is still written, so the feed shows what was skipped.
+        return finish("REFUSED_RISK",
+                      f"signal was sent {int(age)}s ago "
+                      f"(limit {MAX_SIGNAL_AGE_SEC}s)")
 
     exp = lic.expires_at
     if exp is not None and exp.tzinfo is None:
