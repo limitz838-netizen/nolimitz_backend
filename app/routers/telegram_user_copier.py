@@ -61,6 +61,7 @@
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
@@ -191,6 +192,71 @@ def _own_source(db: Session, lic: License, source_id: int) -> TelegramSource:
     if not src:
         raise HTTPException(status_code=404, detail="Source not found")
     return src
+
+
+# The MT5 order comment. The terminal's field is 31 characters and tolerates
+# little beyond plain ASCII, while Telegram channel names routinely carry emoji,
+# decorative unicode and double spaces -- "DELEON TRADING COMMUNITY [chart]" or
+# "[trophy]OptimistFxTrader [trophy] [chart][phone]". Those are stripped rather
+# than sent, because a comment the terminal mangles is worse than a short one.
+ORDER_COMMENT_PREFIX = os.getenv("TELEGRAM_ORDER_PREFIX", "NOLIMITZ Ai")
+_MT5_COMMENT_MAX = 31
+
+
+def _order_comment(src) -> str:
+    """"<prefix> <channel>", trimmed to what MT5 will actually carry.
+
+    The prefix comes first on purpose: when a long channel name forces a
+    truncation, what survives is the part that tells the user which system
+    opened the trade. Losing the tail of a channel name is recoverable -- the
+    signal feed has the full name -- but a comment that starts mid-word tells
+    them nothing at all.
+    """
+    title = (src.chat_title or src.chat_id or "").strip()
+    title = "".join(ch for ch in title if 32 <= ord(ch) < 127)
+    title = re.sub(r"\s+", " ", title).strip(" -|")
+    return f"{ORDER_COMMENT_PREFIX} {title}".strip()[:_MT5_COMMENT_MAX].strip()
+
+
+# ==============================================================================
+# RISK CAPS  --  mirrored from app/ai/copier_executor.py
+# ==============================================================================
+# KEEP THESE IDENTICAL to copier_executor's. The executor enforces max_open from
+# its own copy, so a mapping that disagreed here would queue rows it then
+# refuses -- three positions planned, two skipped, and a user watching a signal
+# half-fill with no explanation. copier_executor.py cannot be imported on Render
+# at all: it imports MetaTrader5, which exists only on the VPS.
+#
+# DEFAULT_RISK is "medium", not "normal". An account with no risk_level set gets
+# three positions, not one.
+RISK_CAPS = {"normal": 1, "medium": 3, "aggressive": 5}
+DEFAULT_RISK = "medium"
+
+
+def _risk_cap(account) -> int:
+    level = (getattr(account, "risk_level", None) or DEFAULT_RISK).strip().lower()
+    return RISK_CAPS.get(level, RISK_CAPS[DEFAULT_RISK])
+
+
+def _tp_plan(take_profits, cap):
+    """How many positions to open at each take profit: [(tp, count), ...].
+
+    The cap is spread across the targets the channel actually published,
+    earliest first, because the early targets are the ones that get hit. On
+    medium (cap 3): three targets is one position each, two targets is two at
+    TP1 and one at TP2, and a single target is all three there. A signal with
+    no target at all still opens cap positions, carrying the stop and nothing
+    else -- "TP WILL BE UPDATED" is a real message from a real channel.
+
+    Targets beyond the cap are dropped rather than crowded in: on normal, a
+    five-target signal is one position at TP1, not five at a fifth of the lot.
+    """
+    cap = max(1, int(cap))
+    tps = list(take_profits or [])[:cap]
+    if not tps:
+        return [(None, cap)]
+    base, extra = divmod(cap, len(tps))
+    return [(tp, base + (1 if i < extra else 0)) for i, tp in enumerate(tps)]
 
 
 def _signal_age_sec(sent_at: Optional[str]) -> Optional[float]:
@@ -691,66 +757,81 @@ def _sl_tp_sane(direction: str, entry: Optional[float],
 # ==============================================================================
 # THE PER-USER EXECUTION CREATOR
 # ==============================================================================
-def _create_execution(db: Session, lic: License, src: TelegramSource,
-                      account: ClientMT5Account, setting: ClientSymbolSetting,
-                      symbol_canon: str, direction: str,
-                      sl: Optional[float], tp: Optional[float],
-                      entry: Optional[float], master_ticket: str,
-                      event_type: str = "open") -> TradeExecution:
-    """ONE event, ONE execution, for ONE licence.
+def _create_executions(db: Session, lic: License, src: TelegramSource,
+                       account: ClientMT5Account, setting: ClientSymbolSetting,
+                       symbol_canon: str, direction: str,
+                       sl: Optional[float], tps, entry: Optional[float],
+                       master_ticket: str, event_type: str = "open"):
+    """ONE row per take profit, for ONE licence. Returns (executions, plan).
 
     Deliberately not copier.create_execution_rows_for_event, which fans out to
     every licence on the EA. Here that would trade one user's private channel on
     every account that happens to share their Expert Advisor.
+
+    The risk mode decides how many positions in total; the channel's targets
+    decide how they are spread. Each row carries per_signal = its share, so the
+    executor's existing multi-open path does the work and copier_executor.py --
+    running live on seven lanes -- needs no change at all.
+
+    Master tickets are suffixed with the target's index. They have to differ or
+    the executor's ticket map would treat three positions as one, and closing
+    TP1's position would be indistinguishable from closing TP3's.
     """
     ea = db.query(ExpertAdvisor).filter(ExpertAdvisor.id == lic.ea_id).first()
     ea_code = getattr(ea, "ea_code", None) or "TELEGRAM"
 
-    # The MT5 order comment, so the user can see in their terminal where a trade
-    # came from. MT5 truncates at 31.
-    label = ("TG " + (src.chat_title or src.chat_id))[:31]
+    label = _order_comment(src)
+    plan = _tp_plan(tps if src.copy_tp else [], _risk_cap(account))
 
-    event = CopierTradeEvent(
-        source_admin_id=lic.admin_id,
-        ea_id=lic.ea_id,
-        ea_code=ea_code,
-        event_type=event_type,
-        master_ticket=master_ticket,
-        symbol=symbol_canon,
-        action=_ACTION[direction],          # lowercase. See note 1 in the header.
-        lot_size=None,                      # never the provider's lot
-        sl=str(sl) if sl is not None else None,
-        tp=str(tp) if tp is not None else None,
-        price=str(entry) if entry is not None else None,
-        comment=label,
-        status="pending",
-    )
-    db.add(event)
-    db.flush()                              # need event.id for the FK
+    executions = []
+    for idx, (tp, count) in enumerate(plan, start=1):
+        ticket = f"{master_ticket}-{idx}"
+        tp_str = str(tp) if tp is not None else None
+        sl_str = str(sl) if sl is not None else None
 
-    execution = TradeExecution(
-        copier_event_id=event.id,
-        license_id=lic.id,
-        ea_id=lic.ea_id,
-        master_ticket=master_ticket,
-        client_ticket=None,
-        symbol=symbol_canon,
-        action=_ACTION[direction],
-        # THE USER'S OWN LOT, always. Never the number in the Telegram message.
-        lot_size=str(setting.lot_size),
-        sl=str(sl) if (sl is not None and src.copy_sl) else None,
-        tp=str(tp) if (tp is not None and src.copy_tp) else None,
-        price=str(entry) if entry is not None else None,
-        comment=label,
-        event_type=event_type,
-        status="pending",
-        # One signal, one trade. Without this, risk mode multiplies it to three
-        # on a medium account and five on aggressive.
-        per_signal=1,
-    )
-    db.add(execution)
-    db.flush()
-    return execution
+        event = CopierTradeEvent(
+            source_admin_id=lic.admin_id,
+            ea_id=lic.ea_id,
+            ea_code=ea_code,
+            event_type=event_type,
+            master_ticket=ticket,
+            symbol=symbol_canon,
+            action=_ACTION[direction],      # lowercase. See note 1 in the header.
+            lot_size=None,                  # never the provider's lot
+            sl=sl_str,
+            tp=tp_str,
+            price=str(entry) if entry is not None else None,
+            comment=label,
+            status="pending",
+        )
+        db.add(event)
+        db.flush()                          # need event.id for the FK
+
+        execution = TradeExecution(
+            copier_event_id=event.id,
+            license_id=lic.id,
+            ea_id=lic.ea_id,
+            master_ticket=ticket,
+            client_ticket=None,
+            symbol=symbol_canon,
+            action=_ACTION[direction],
+            # THE USER'S OWN LOT, always. Never the number in the Telegram
+            # message. Note it is the lot PER POSITION, so a three-target
+            # signal is three times the exposure of a one-target signal.
+            lot_size=str(setting.lot_size),
+            sl=sl_str if src.copy_sl else None,
+            tp=tp_str if src.copy_tp else None,
+            price=str(entry) if entry is not None else None,
+            comment=label,
+            event_type=event_type,
+            status="pending",
+            per_signal=count,
+        )
+        db.add(execution)
+        db.flush()
+        executions.append(execution)
+
+    return executions, plan
 
 
 # ==============================================================================
@@ -909,14 +990,16 @@ def incoming_signal(data: IncomingSignal,
 
     sl = parsed["stop_loss"] if src.copy_sl else None
     tps = parsed["take_profits"] if src.copy_tp else []
-    tp = tps[0] if tps else None
 
     if src.require_sl and sl is None:
         return finish("REFUSED_RISK", "this source requires a stop loss")
 
-    bad = _sl_tp_sane(direction, parsed["entry_price"], sl, tp)
-    if bad:
-        return finish("REFUSED_RISK", bad)
+    # Every target, not just the first. Each one becomes its own position now,
+    # so an inverted TP3 is a trade born losing exactly like an inverted TP1.
+    for _t in (tps or [None]):
+        bad = _sl_tp_sane(direction, parsed["entry_price"], sl, _t)
+        if bad:
+            return finish("REFUSED_RISK", bad)
 
     if not _within_hours(src):
         return finish("REFUSED_RISK",
@@ -957,11 +1040,12 @@ def incoming_signal(data: IncomingSignal,
     # ---- queue it ----------------------------------------------------------
     master_ticket = f"TGU-{data.chat_id}-{data.message_id}-{lic.id}"
     try:
-        execution = _create_execution(
+        executions, plan = _create_executions(
             db, lic, src, account, setting, symbol_canon, direction,
-            sl, tp, parsed["entry_price"], master_ticket)
-        log.execution_id = execution.id
-        log.executed_at = None              # set by the lane, not by us
+            sl, tps, parsed["entry_price"], master_ticket)
+        # The first row is the anchor the feed links to. The rest are siblings
+        # of the same message, found by the shared master_ticket prefix.
+        log.execution_id = executions[0].id
         db.commit()
     except Exception as e:
         db.rollback()
@@ -969,12 +1053,17 @@ def incoming_signal(data: IncomingSignal,
                      lic.id, e)
         return finish("REFUSED_RISK", f"could not queue: {e}")
 
-    logger.info("telegram QUEUED licence=%s %s %s lot=%s exec=%s",
-                lic.id, _ACTION[direction], symbol_canon, lot, execution.id)
+    total = sum(n for _, n in plan)
+    spread = ", ".join(
+        f"{n}@{'no TP' if t is None else t}" for t, n in plan)
+    logger.info("telegram QUEUED licence=%s %s %s lot=%s x%d (%s) rows=%s",
+                lic.id, _ACTION[direction], symbol_canon, lot, total, spread,
+                [e.id for e in executions])
 
     return finish("QUEUED",
                   f"queued for your MT5 ({_ACTION[direction]} {symbol_canon} "
-                  f"lot {lot})")
+                  f"lot {lot}, {total} position{'' if total == 1 else 's'}: "
+                  f"{spread})")
 
 
 @worker_router.post("/heartbeat")
