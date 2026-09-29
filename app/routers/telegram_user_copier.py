@@ -63,7 +63,7 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
@@ -322,7 +322,14 @@ class SourceUpdate(BaseModel):
     copy_sl: Optional[bool] = None
     copy_tp: Optional[bool] = None
     copy_closures: Optional[bool] = None
-    allowed_symbols: Optional[str] = None
+    # A LIST OR A STRING, both accepted on purpose. The dashboard holds this as
+    # an array and sends ["XAUUSD","US30"]; older callers send "XAUUSD,US30".
+    # Declaring it str-only made Pydantic reject the array with 422 before the
+    # handler ever ran, so EVERY "Save settings" press failed while the
+    # LIVE/SHADOW switch -- which posts only {mode} -- kept working. Accepting
+    # both is what lets already-published dashboards start saving again with no
+    # frontend release. Stored as a comma string either way; see below.
+    allowed_symbols: Optional[Union[str, List[str]]] = None
     max_lot: Optional[float] = None
     max_trades_per_day: Optional[int] = None
     max_open_positions: Optional[int] = None
@@ -530,7 +537,7 @@ def list_sources(license_key: str, db: Session = Depends(get_db)):
             "copy_buy": bool(s.copy_buy), "copy_sell": bool(s.copy_sell),
             "copy_sl": bool(s.copy_sl), "copy_tp": bool(s.copy_tp),
             "copy_closures": bool(s.copy_closures),
-            "allowed_symbols": s.allowed_symbols,
+            "allowed_symbols": _symbols_to_list(s.allowed_symbols),
             "max_lot": s.max_lot,
             "max_trades_per_day": s.max_trades_per_day,
             "max_open_positions": s.max_open_positions,
@@ -564,7 +571,7 @@ def update_source(source_id: int, data: SourceUpdate,
             setattr(src, field, bool(v))
 
     if data.allowed_symbols is not None:
-        src.allowed_symbols = data.allowed_symbols.strip().upper() or None
+        src.allowed_symbols = _symbols_to_stored(data.allowed_symbols)
 
     # Bounds, not suggestions. A user typing 500 into max_trades_per_day should
     # not be able to turn one channel into a margin call.
@@ -704,6 +711,39 @@ def _valid_hhmm(v: str) -> bool:
         return 0 <= int(h) <= 23 and 0 <= int(m) <= 59
     except Exception:
         return False
+
+
+# ---- allowed_symbols: one column, two shapes -------------------------------
+#
+# The COLUMN stays a comma string. It is read by the risk gate further down as
+# src.allowed_symbols.split(","), and by nothing else, so changing the storage
+# would mean changing a live gate for no benefit.
+#
+# The API speaks lists, because the dashboard does. Sending a string where the
+# dashboard expects an array is what silently emptied the field on every page
+# load: it does Array.isArray(...) ? ... : [], so a string became [], and the
+# next save would have wiped the user's symbols even if the save had worked.
+
+def _symbols_to_list(stored) -> List[str]:
+    """Comma string from the DB -> list for the dashboard. Never None."""
+    if not stored:
+        return []
+    if isinstance(stored, (list, tuple)):
+        items = stored
+    else:
+        items = str(stored).split(",")
+    return [s.strip().upper() for s in items if str(s).strip()]
+
+
+def _symbols_to_stored(value) -> Optional[str]:
+    """List or comma string from the client -> the comma string we store.
+
+    Empty in any shape ([], "", "  ,  ") means "no restriction", which the gate
+    expresses as NULL -- not as an empty string, which would be a subtly
+    different thing to test for.
+    """
+    items = _symbols_to_list(value)
+    return ",".join(items) or None
 
 
 def _trades_today(db: Session, src: TelegramSource) -> int:
