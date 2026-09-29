@@ -120,6 +120,10 @@ _RE_RANGE = re.compile(rf"{_NUM}\s*[-/]\s*{_NUM}")
 # entry label, yields 2648, and the "-2652" is blanked out with the span and
 # never seen again. Checked against what follows the match instead.
 _RE_RANGE_TAIL = re.compile(r"\s*[-/]\s*\d")
+# _RE_RANGE_TAIL only has to PROVE a range follows, so one digit is enough for
+# it and its .end() is meaningless as a slice bound. This one captures the whole
+# second number, for quoting the zone back to the user.
+_RE_RANGE_TAIL_FULL = re.compile(rf"\s*[-/]\s*{_NUM}")
 
 _RE_SL = re.compile(rf"\b{_SL_LABEL}([0-9]?)\s*{_SEP}\s*({_NUM})", re.I)
 # [ \t,/]* not [\s,/]* -- \s includes the newline, so the run of numbers would
@@ -364,7 +368,15 @@ def parse_signal(text, extra_symbols=None):
                               "The entry is given as a range, not one price.")
             # Market was stated, so the range is where price was, not an
             # instruction. Recorded for the feed, not used for execution.
-            entry_zone = upper[m.start():m.end() + 12].strip()
+            #
+            # Stop at the end of the LINE. Taking a fixed number of characters
+            # past the match ran straight through the newline and produced
+            # "ENTRY: 4150-4155\nSL: 41" -- a field the user reads in the feed,
+            # showing half of the next line's stop loss.
+            tail = upper[m.end():].split("\n", 1)[0]
+            zone_tail = _RE_RANGE_TAIL_FULL.match(tail)
+            entry_zone = (upper[m.start():m.end()]
+                          + (tail[:zone_tail.end()] if zone_tail else "")).strip()
         else:
             entry_price_labelled = _to_float(m.group(2))
         spans.append(m.span())
@@ -567,6 +579,11 @@ def _parse_close(upper, words):
         # Unknown words in a closure are not fatal the way they are in an open:
         # "close XAUUSD now please" is unambiguous. Only the instrument matters.
 
+    if symbol_raw is None:
+        raise Refusal("close_without_symbol",
+                      "A close instruction with no instrument named.")
+
+    return {"kind": "CLOSE", "symbol_raw": symbol_raw, "direction": direction}
     if symbol_raw is None:
         raise Refusal("close_without_symbol",
                       "A close instruction with no instrument named.")
