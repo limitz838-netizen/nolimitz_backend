@@ -131,6 +131,27 @@ _RE_ENTRY = re.compile(rf"\b{_ENTRY_LABEL}([0-9]?)\s*{_SEP}\s*({_NUM})", re.I)
 _RE_SL_MENTION = re.compile(rf"\b{_SL_LABEL}\b", re.I)
 _RE_TP_MENTION = re.compile(rf"\b{_TP_LABEL}\b", re.I)
 
+# "TP 1 40PIPS" -- the target is a DISTANCE, not a price. Read as a price it
+# becomes a take profit of 40 on gold at 4150, which the broker rejects outright
+# or fills as something the channel never said. Converting it needs the live
+# price, which this file cannot see, so a pip target is treated as "a target
+# exists, we do not know the number" and a pip STOP is refused: an unreadable
+# stop must never become no stop.
+_RE_PIP_UNIT = re.compile(r"^\s*(?:PIPS?|POINTS?|PTS)\b", re.I)
+
+# An explicit market word states the ORDER TYPE, and it is the author who
+# states it. Checked across the whole message because the labelled-entry scan
+# below runs before the head has been found.
+#
+# RUNNING and OPEN are deliberately absent: both are far too common in ordinary
+# commentary ("trade is running", "open another one") to be read as an order
+# type from anywhere in the text.
+_RE_MARKET_ANY = re.compile(r"\b(?:NOW|MARKET|MKT|INSTANT)\b")
+# STOP LOSS / STOP-LOSS / STOPLOSS is not a pending order type. Without the
+# lookahead every signal carrying a stop would look like a pending order and
+# lose the market reading it is entitled to.
+_RE_PENDING_ANY = re.compile(r"\b(?:LIMIT|LMT|STP|STOP(?!\s*-?\s*LOSS))\b")
+
 # ---------------------------------------------------------------------------
 # What may be an instrument name
 # ---------------------------------------------------------------------------
@@ -266,11 +287,24 @@ def parse_signal(text, extra_symbols=None):
     if not (set(re.findall(r"[A-Z]+", upper)) & (_BUY_WORDS | _SELL_WORDS)):
         raise Refusal("not_a_signal", "No BUY or SELL found.")
 
+    # ---- did the author state the order type? -----------------------------
+    # "GOLD BUY NOW 4154-4150" is not a request to pick a price out of a range.
+    # It is "enter now", with the range saying where price was when it was
+    # written. Refusing it as ambiguous cost a paying customer a real signal.
+    #
+    # When the author has NOT said market, a range stays fatal: the order type
+    # is then unknown, and choosing market would be our decision rather than
+    # theirs. That is the case this parser was built to refuse and it still
+    # does.
+    market_explicit = (bool(_RE_MARKET_ANY.search(upper))
+                       and not _RE_PENDING_ANY.search(upper))
+
     # ---- pull the labelled fields out of the whole message ----------------
     tp_unspecified = False
     stop_loss = None
     take_profits = []
     entry_price_labelled = None
+    entry_zone = None
     spans = []
 
     m = _RE_SL.search(upper)
@@ -278,6 +312,10 @@ def parse_signal(text, extra_symbols=None):
         if _RE_RANGE_TAIL.match(upper[m.end():]):
             raise Refusal("sl_ambiguous",
                           "The stop loss is given as a range, not one price.")
+        if _RE_PIP_UNIT.match(upper[m.end():]):
+            raise Refusal("sl_in_pips",
+                          "The stop loss is given in pips, not a price, and "
+                          "cannot be converted without the entry price.")
         stop_loss = _to_float(m.group(2))
         spans.append(m.span())
     elif _RE_SL_MENTION.search(upper):
@@ -288,6 +326,13 @@ def parse_signal(text, extra_symbols=None):
                       "A stop loss is mentioned but no clear price follows it.")
 
     for m in _RE_TP.finditer(upper):
+        # A target in pips is a distance from an entry we do not yet have. The
+        # trade still opens and still carries its stop, so risk stays bounded;
+        # it simply goes on without a target rather than with a wrong one.
+        if _RE_PIP_UNIT.match(upper[m.end():]):
+            tp_unspecified = True
+            spans.append(m.span())
+            continue
         nums = _numbers(m.group(2))
         # "TP 1 16262" -- the index is detached from the label, so it arrives as
         # the first number. A leading bare 1-9 followed by MORE numbers is an
@@ -314,9 +359,14 @@ def parse_signal(text, extra_symbols=None):
     m = _RE_ENTRY.search(upper)
     if m:
         if _RE_RANGE_TAIL.match(upper[m.end():]):
-            raise Refusal("entry_ambiguous",
-                          "The entry is given as a range, not one price.")
-        entry_price_labelled = _to_float(m.group(2))
+            if not market_explicit:
+                raise Refusal("entry_ambiguous",
+                              "The entry is given as a range, not one price.")
+            # Market was stated, so the range is where price was, not an
+            # instruction. Recorded for the feed, not used for execution.
+            entry_zone = upper[m.start():m.end() + 12].strip()
+        else:
+            entry_price_labelled = _to_float(m.group(2))
         spans.append(m.span())
 
     # Blank out what we consumed so the head scan cannot see it again.
@@ -394,6 +444,8 @@ def parse_signal(text, extra_symbols=None):
     # is a decision the user never made.
     for t in tokens:
         if t in _ZONE_WORDS:
+            if market_explicit:
+                continue
             raise Refusal(
                 "entry_ambiguous",
                 f"'{t}' means no single entry price was given, so this cannot "
@@ -404,6 +456,9 @@ def parse_signal(text, extra_symbols=None):
         # Refusing here is the difference between "we could not read it" and
         # "we picked an entry the author never gave".
         if _RE_RANGE.fullmatch(t):
+            if market_explicit:
+                entry_zone = entry_zone or t
+                continue
             raise Refusal(
                 "entry_ambiguous",
                 f"'{t}' is a price range, not a single entry.")
@@ -468,6 +523,11 @@ def parse_signal(text, extra_symbols=None):
         "direction": direction,
         "entry_type": entry_type,
         "entry_price": entry_price,
+        # The range the channel quoted, when it said market and gave a spread
+        # of prices rather than one. Never used for execution -- the order goes
+        # at market, which is what "NOW" asked for -- but shown in the feed so
+        # the user can see what the channel actually wrote.
+        "entry_zone": entry_zone,
         "stop_loss": stop_loss,
         "take_profits": take_profits,
         # True when the channel said a TP exists but gave no number. The risk
