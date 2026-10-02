@@ -209,23 +209,71 @@ def _own_source(db: Session, lic: License, source_id: int) -> TelegramSource:
 # decorative unicode and double spaces -- "DELEON TRADING COMMUNITY [chart]" or
 # "[trophy]OptimistFxTrader [trophy] [chart][phone]". Those are stripped rather
 # than sent, because a comment the terminal mangles is worse than a short one.
-ORDER_COMMENT_PREFIX = os.getenv("TELEGRAM_ORDER_PREFIX", "NOLIMITZ Ai")
-_MT5_COMMENT_MAX = 31
+# The name that goes in the MT5 order comment, in brackets after the channel:
+#
+#     KOJOFOREX - (Nolimitz Ai)
+#
+# A NEW variable name on purpose. TELEGRAM_ORDER_PREFIX is no longer read, so a
+# value left set on Render from the old "<brand> <channel>" format cannot quietly
+# come back and put the brand at the front again.
+ORDER_COMMENT_BRAND = os.getenv("TELEGRAM_ORDER_BRAND", "Nolimitz Ai")
+
+# MT5 rejects an over-long comment outright -- order_send comes back with
+# (-2, 'Invalid "comment" argument') and the TRADE IS LOST, not just the label.
+#
+# MEASURED, not assumed. Across every Telegram trade queued so far:
+#
+#     NOLIMITZBOTS UPDATES    32 chars   0 executed, 3 comment failures
+#     CARTEL CIRCLE (VVIP)    32 chars   0 executed, 1 comment failure
+#     The Traders Hub         27 chars   4 executed, 0 failures
+#     NOLIMITZ VIP            24 chars   9 executed, 0 failures
+#     Syndicate Fx            24 chars   6 executed, 0 failures
+#
+# A clean split: everything at 27 or below filled, everything that reached the
+# old 31-character trim failed. The MqlTradeRequest field is char[32], so the
+# terminator has to live somewhere -- 31 does not fit.
+#
+# 30 is the documented ceiling less that terminator. If any comment failures
+# show up after this ships, drop this to 27 -- the longest length we have
+# actually watched succeed -- with the env var and no deploy.
+_MT5_COMMENT_MAX = int(os.getenv("TELEGRAM_COMMENT_MAX", "30"))
 
 
 def _order_comment(src) -> str:
-    """"<prefix> <channel>", trimmed to what MT5 will actually carry.
+    """"<channel> - (<brand>)", built to fit MT5's 31-character comment.
 
-    The prefix comes first on purpose: when a long channel name forces a
-    truncation, what survives is the part that tells the user which system
-    opened the trade. Losing the tail of a channel name is recoverable -- the
-    signal feed has the full name -- but a comment that starts mid-word tells
-    them nothing at all.
+        KOJOFOREX - (Nolimitz Ai)
+
+    The channel leads because that is what the trader recognises in their
+    terminal; the brand follows in brackets so every trade is still clearly
+    ours. The brand is never the part that gets cut -- the suffix is reserved
+    first and the channel name is fitted into whatever is left, trimmed at a
+    word boundary where one is close enough to the limit to be worth using.
+
+    Non-ASCII goes. Channel names are full of emoji -- "CARTEL CIRCLE (VVIP)",
+    "Market Psychology Lab" and friends all carry them -- and a comment MT5
+    will not accept costs the whole trade, not just the label.
     """
     title = (src.chat_title or src.chat_id or "").strip()
     title = "".join(ch for ch in title if 32 <= ord(ch) < 127)
-    title = re.sub(r"\s+", " ", title).strip(" -|")
-    return f"{ORDER_COMMENT_PREFIX} {title}".strip()[:_MT5_COMMENT_MAX].strip()
+    title = re.sub(r"\s+", " ", title).strip(" -|()")
+
+    suffix = " - (%s)" % ORDER_COMMENT_BRAND
+    room = _MT5_COMMENT_MAX - len(suffix)
+
+    # A brand long enough to leave no room for a channel name is a
+    # misconfiguration, not a reason to emit a broken comment.
+    if room < 3 or not title:
+        return ORDER_COMMENT_BRAND[:_MT5_COMMENT_MAX].strip()
+
+    if len(title) > room:
+        cut = title[:room]
+        # Prefer a whole word, but not at the cost of most of the name.
+        if " " in cut and len(cut.rsplit(" ", 1)[0]) >= room // 2:
+            cut = cut.rsplit(" ", 1)[0]
+        title = cut.strip(" -|")
+
+    return ("%s%s" % (title, suffix))[:_MT5_COMMENT_MAX]
 
 
 # ==============================================================================
