@@ -537,7 +537,11 @@ def list_sources(license_key: str, db: Session = Depends(get_db)):
             "copy_buy": bool(s.copy_buy), "copy_sell": bool(s.copy_sell),
             "copy_sl": bool(s.copy_sl), "copy_tp": bool(s.copy_tp),
             "copy_closures": bool(s.copy_closures),
-            "allowed_symbols": _symbols_to_list(s.allowed_symbols),
+            # STAYS A STRING. The dashboard build now in production sends and
+            # expects a comma string here; returning a list would empty the
+            # field on every page load. Checked against live rows on 2 Oct:
+            # sources 10/11/21/36 hold "XAUUSD", source 35 holds "GOLD".
+            "allowed_symbols": s.allowed_symbols,
             "max_lot": s.max_lot,
             "max_trades_per_day": s.max_trades_per_day,
             "max_open_positions": s.max_open_positions,
