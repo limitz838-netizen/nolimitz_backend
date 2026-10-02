@@ -88,6 +88,49 @@ _ZONE_WORDS = {"AROUND", "BETWEEN", "ZONE", "AREA", "NEAR", "RANGE", "APPROX",
                "ABOVE", "BELOW", "RETEST", "REGION"}
 
 _CLOSE_WORDS = {"CLOSE", "CLOSED", "EXIT"}
+
+
+def _is_closure(upper, words):
+    """Is a close word an INSTRUCTION here, or just a word in the commentary?
+
+    It used to be enough that CLOSE, CLOSED or EXIT appeared anywhere in the
+    message. That handed the whole message to the closure path, and real
+    signals went with it -- this one, from a live channel, was refused as
+    "closures_not_enabled_yet" while carrying a complete setup:
+
+        WACIEKO SELL SIGNAL
+        Symbol: XAUUSD
+        Entry: 4182
+        SL: 4203
+        TP1: 4162 ... TP4: 4101
+        Always target TP1, if one signal hit SL, we close the rest
+
+    "close" there is prose. Elsewhere it is a candle close -- "a close above
+    3.00" -- in a perfectly good entry.
+
+    DELIBERATELY NARROW, because the closure branch is also what stops a
+    results announcement being read as an entry. "GOLD Buy TP3 +170PIPS CLOSED
+    TP3" has a direction and a symbol, and without this branch it would reach
+    the open path and become a market BUY. So a close word is demoted to prose
+    only when the message carries a setup no announcement has: a stop loss AT A
+    PRICE, plus an entry or a target at a price. An announcement quotes profit
+    in pips and names no stop.
+
+    A message that OPENS with a close word stays a closure whatever follows --
+    that is someone typing an instruction, and the rest is its parameters.
+    """
+    first = re.match(r"\s*([A-Z]+)", upper)
+    if first and first.group(1) in _CLOSE_WORDS:
+        return True
+
+    has_sl_price = bool(_RE_SL.search(upper))
+    has_target = bool(_RE_ENTRY.search(upper) or _RE_TP.search(upper))
+    has_direction = bool(set(re.findall(r"[A-Z]+", upper))
+                         & (_BUY_WORDS | _SELL_WORDS))
+    if has_sl_price and has_target and has_direction:
+        return False          # a setup, not a closure -- let the open path read it
+
+    return True
 _ALL_WORDS = {"ALL", "EVERYTHING", "EVERY"}
 
 _NUM = r"\d+(?:[.,]\d+)?"
@@ -125,12 +168,31 @@ _RE_RANGE_TAIL = re.compile(r"\s*[-/]\s*\d")
 # second number, for quoting the zone back to the user.
 _RE_RANGE_TAIL_FULL = re.compile(rf"\s*[-/]\s*{_NUM}")
 
-_RE_SL = re.compile(rf"\b{_SL_LABEL}([0-9]?)\s*{_SEP}\s*({_NUM})", re.I)
+# The index must be FOLLOWED by a separator or whitespace. Without this the
+# regex happily backtracks, gives up the index, and reads it as the price:
+#
+#     "Always target TP1, if one signal hit SL"  ->  take profit = 1.0
+#
+# A comma is not in _SEP, so no price follows and the whole match should fail.
+# Instead TP1 became a target of 1, which on a SELL sits below entry and looks
+# perfectly valid -- the live refusal "BUY with take profit 1.0 at or below
+# entry 4167.65" is this bug caught only because that one was a BUY.
+_AFTER_LABEL = r"(?=[\s:=@.\-\)])"
+
+_RE_SL = re.compile(
+    rf"\b{_SL_LABEL}([0-9]?){_AFTER_LABEL}\s*{_SEP}\s*({_NUM})", re.I)
 # [ \t,/]* not [\s,/]* -- \s includes the newline, so the run of numbers would
 # cross into the next line and swallow "1.5%" from a risk note.
 _RE_TP = re.compile(
-    rf"\b{_TP_LABEL}([0-9]?)\s*{_SEP}\s*((?:{_NUM}[ \t,/]*)+)", re.I)
-_RE_ENTRY = re.compile(rf"\b{_ENTRY_LABEL}([0-9]?)\s*{_SEP}\s*({_NUM})", re.I)
+    rf"\b{_TP_LABEL}([0-9]?){_AFTER_LABEL}\s*{_SEP}\s*((?:{_NUM}[ \t,/]*)+)",
+    re.I)
+_RE_ENTRY = re.compile(rf"\b{_ENTRY_LABEL}([0-9]?){_AFTER_LABEL}\s*{_SEP}\s*({_NUM})", re.I)
+
+# "Symbol: XAUUSD" on its own line. Only ever consulted when the head-line scan
+# found no instrument, and the captured text must still pass the instrument
+# test, so a label followed by prose does not invent a symbol.
+_RE_SYMBOL_LABEL = re.compile(
+    r"\b(?:SYMBOL|PAIR|INSTRUMENT|ASSET)\s*[:=\-]+\s*([A-Z0-9()]{2,20})", re.I)
 
 _RE_SL_MENTION = re.compile(rf"\b{_SL_LABEL}\b", re.I)
 _RE_TP_MENTION = re.compile(rf"\b{_TP_LABEL}\b", re.I)
@@ -185,6 +247,70 @@ _KNOWN_INSTRUMENTS = {
     "NIKKEI", "CAC", "STOXX", "HSI", "ASX",
     "STEPINDEX", "STEP", "MULTISTEPINDEX", "MULTISTEP",
 }
+
+
+# ---- synthetic indices, written the way a human writes them -----------------
+#
+# The token scan takes a symbol from ONE token, which is fine for XAUUSD and
+# fine for V75, and silently wrong for every Deriv synthetic spelled out:
+#
+#     BUY Volatility 75 Index NOW   ->  no_symbol: No instrument named.
+#
+# The scan stops at VOLATILITY -- no digit, not a known word, not 6-8 letters --
+# calls it commentary, and never reaches the 75. Meanwhile 78 ENABLED rows in
+# client_symbol_settings are spelled "VOLATILITY 75 INDEX", so the copier below
+# understands the name perfectly well. Only this file could not read it.
+#
+# So the full names are matched here, before tokenising, and replaced with a
+# single placeholder token the scan already accepts. The placeholder is mapped
+# back afterwards, which is what keeps symbol_raw spelled the way the client's
+# own settings row is spelled rather than the way we happened to normalise it.
+#
+# Written against the real catalogue: Volatility (plain and 1s), Boom, Crash,
+# Jump, Step and Range Break.
+_SYNTHETIC_PATTERNS = (
+    # VOLATILITY 75 (1S) INDEX -- the 1s variants are a DIFFERENT instrument
+    # from the plain one, so the (1S) has to survive into the name.
+    (re.compile(r"\bVOLATILITY\s*(\d{1,3})\s*\(\s*1\s*S\s*\)\s*INDEX\b", re.I),
+     lambda m: "VOLATILITY %s(1S)INDEX" % m.group(1)),
+    (re.compile(r"\bVOLATILITY\s*(\d{1,3})\s*INDEX\b", re.I),
+     lambda m: "VOLATILITY %s INDEX" % m.group(1)),
+    (re.compile(r"\bBOOM\s*(\d{3,4})\s*INDEX\b", re.I),
+     lambda m: "BOOM %s INDEX" % m.group(1)),
+    (re.compile(r"\bCRASH\s*(\d{3,4})\s*INDEX\b", re.I),
+     lambda m: "CRASH %s INDEX" % m.group(1)),
+    (re.compile(r"\bJUMP\s*(\d{2,3})\s*INDEX\b", re.I),
+     lambda m: "JUMP %s INDEX" % m.group(1)),
+    (re.compile(r"\bRANGE\s*BREAK\s*(\d{2,3})\s*INDEX\b", re.I),
+     lambda m: "RANGE BREAK %s INDEX" % m.group(1)),
+    (re.compile(r"\bSTEP\s*INDEX\b", re.I),
+     lambda m: "STEP INDEX"),
+)
+
+# Digits so _looks_like_instrument accepts it, short so it stays inside the
+# scan's 20-character token limit, and a shape no signal channel would ever
+# type: SYNTH0, SYNTH1, ...
+_SYNTH_TOKEN = "SYNTH%d"
+
+
+def _mask_synthetics(upper):
+    """Replace spelled-out synthetic names with single tokens.
+
+    Returns (text, {placeholder: real name}). Longest patterns run first, so
+    "VOLATILITY 75(1S)INDEX" is never half-eaten by the plain-volatility rule.
+    """
+    names = {}
+    for pattern, render in _SYNTHETIC_PATTERNS:
+        def swap(m, render=render):
+            real = render(m)
+            for token, existing in names.items():
+                if existing == real:
+                    return token
+            token = _SYNTH_TOKEN % len(names)
+            names[token] = real
+            return token
+        upper = pattern.sub(swap, upper)
+    return upper, names
 
 
 def _looks_like_instrument(tok, extra):
@@ -276,11 +402,21 @@ def parse_signal(text, extra_symbols=None):
 
     upper = cleaned.upper()
 
+    # Spelled-out synthetics become one token each, before anything counts
+    # words or tokens. Done here so BOTH paths below see them: a closure on
+    # "Volatility 75 Index" has to name the instrument too.
+    upper, _synthetics = _mask_synthetics(upper)
+
+    def _unmask(name):
+        return _synthetics.get(name, name) if name else name
+
     # ---- closures first ---------------------------------------------------
     # Checked before the open path so "CLOSE XAUUSD BUY" is not read as a BUY.
     words = set(re.findall(r"[A-Z@]+", upper))
-    if words & _CLOSE_WORDS:
-        return _parse_close(upper, words)
+    if words & _CLOSE_WORDS and _is_closure(upper, words):
+        closed = _parse_close(upper, words)
+        closed["symbol_raw"] = _unmask(closed.get("symbol_raw"))
+        return closed
 
     # ---- is this even an instruction? -------------------------------------
     # Checked BEFORE the SL/TP scan. Most of what a signal channel posts is
@@ -438,8 +574,12 @@ def parse_signal(text, extra_symbols=None):
     #
     # Only LEADING and TRAILING punctuation goes. "2648-2652" keeps its dash,
     # stays unrecognised, and is still refused as a range.
-    tokens = [t.strip(".-|/") for t in re.split(r"[\s,;:]+", head_line)
-              if t.strip(".-|/")]
+    # "!" and "?" belong here as much as "." does. Without them "BUY XAUUSD!!!!"
+    # -- which is how half these channels type -- left the token as XAUUSD!!!!,
+    # matched nothing, and the signal was refused with no_symbol.
+    _EDGE = ".-|/!?*\"'"
+    tokens = [t.strip(_EDGE) for t in re.split(r"[\s,;:]+", head_line)
+              if t.strip(_EDGE)]
 
     dir_idx = [i for i, t in enumerate(tokens)
                if t in _BUY_WORDS or t in _SELL_WORDS]
@@ -517,7 +657,22 @@ def parse_signal(text, extra_symbols=None):
     if direction is None:
         raise Refusal("not_a_signal", "No BUY or SELL found.")
     if symbol_raw is None:
-        raise Refusal("no_symbol", "No instrument named.")
+        # The head-line scan only sees the line the direction word is on, and
+        # plenty of channels put the instrument on its own labelled line:
+        #
+        #     WACIEKO SELL SIGNAL
+        #     Symbol: XAUUSD
+        #     Entry: 4182
+        #
+        # Nothing on the head line is an instrument there, so the scan found
+        # none and a complete setup was refused. An explicit SYMBOL/PAIR label
+        # is as clear a statement as naming it inline, so it counts -- but only
+        # a LABELLED one, never a loose token from the commentary.
+        labelled = _RE_SYMBOL_LABEL.search(upper)
+        if labelled and _looks_like_instrument(labelled.group(1), extra):
+            symbol_raw = labelled.group(1)
+        else:
+            raise Refusal("no_symbol", "No instrument named.")
 
     if entry_price is None:
         entry_price = entry_price_labelled
@@ -531,7 +686,10 @@ def parse_signal(text, extra_symbols=None):
 
     return {
         "kind": "OPEN",
-        "symbol_raw": symbol_raw,
+        # Back to the spelling the client's own settings row uses, so
+        # "VOLATILITY 75 INDEX" reaches the risk gate as written rather than as
+        # the placeholder the token scan needed.
+        "symbol_raw": _unmask(symbol_raw),
         "direction": direction,
         "entry_type": entry_type,
         "entry_price": entry_price,
@@ -579,11 +737,6 @@ def _parse_close(upper, words):
         # Unknown words in a closure are not fatal the way they are in an open:
         # "close XAUUSD now please" is unambiguous. Only the instrument matters.
 
-    if symbol_raw is None:
-        raise Refusal("close_without_symbol",
-                      "A close instruction with no instrument named.")
-
-    return {"kind": "CLOSE", "symbol_raw": symbol_raw, "direction": direction}
     if symbol_raw is None:
         raise Refusal("close_without_symbol",
                       "A close instruction with no instrument named.")
