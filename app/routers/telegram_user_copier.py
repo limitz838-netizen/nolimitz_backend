@@ -123,6 +123,16 @@ LISTENER_STALE_SEC = int(os.getenv("TELEGRAM_LISTENER_STALE_SEC", "300"))
 # fresh to the executor's MAX_OPEN_EVENT_AGE_SEC.
 MAX_SIGNAL_AGE_SEC = int(os.getenv("TELEGRAM_MAX_SIGNAL_AGE_SEC", "180"))
 
+# Backlog guard, NOT a position limit. How many Telegram opens may be waiting
+# for a lane at once, and how far back "waiting" counts. The real ceiling on
+# concurrent positions is the executor's per-symbol risk cap (RISK_CAPS below)
+# and the source's own max_open_positions -- this only stops a channel that
+# posts a burst of signals from filling the queue faster than a lane drains it.
+# Both are env-tunable so a flooding channel can be clamped without a deploy.
+TELEGRAM_MAX_QUEUED = int(os.getenv("TELEGRAM_MAX_QUEUED", "5"))
+TELEGRAM_BACKLOG_WINDOW_SEC = int(
+    os.getenv("TELEGRAM_BACKLOG_WINDOW_SEC", "300"))
+
 # Shared secret for the listener intake. Same variable the copier worker routes
 # use, so the VPS has it already.
 WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
@@ -1055,18 +1065,32 @@ def incoming_signal(data: IncomingSignal,
         return finish("REFUSED_RISK",
                       f"daily limit reached ({used} of {src.max_trades_per_day})")
 
-    open_now = db.query(TradeExecution).filter(
+    # WHAT THIS GUARD IS FOR: a channel that posts twenty signals in a minute
+    # should not put twenty orders into the queue before the lane has worked
+    # through the first one. It is about the BACKLOG, nothing else.
+    #
+    # It used to count 'executed' rows over SEVEN DAYS, which is not a backlog
+    # -- it is history. With max_open_positions at the default 2 that capped a
+    # licence at eight Telegram trades a WEEK and then went quiet, and the
+    # refusal still said "queued", so it read like a stuck queue rather than a
+    # limit being hit. It cost licence 155 a complete AMIIN FX signal (entry,
+    # stop and three targets) and 25 others besides.
+    #
+    # So: only work that has not been done yet, and only within a window where
+    # "still pending" means something is wrong. A row older than this is not
+    # backlog, it is a stale event the lane's own reaper will resolve.
+    backlog_window = timedelta(seconds=TELEGRAM_BACKLOG_WINDOW_SEC)
+    queued_now = db.query(TradeExecution).filter(
         TradeExecution.license_id == lic.id,
         TradeExecution.master_ticket.like("TGU-%"),
-        TradeExecution.status.in_(("pending", "processing", "executed")),
+        TradeExecution.status.in_(("pending", "processing")),
         TradeExecution.event_type == "open",
-        TradeExecution.created_at >= datetime.now(timezone.utc) - timedelta(days=7),
+        TradeExecution.created_at >= datetime.now(timezone.utc) - backlog_window,
     ).count()
-    if open_now >= (src.max_open_positions or 2) * 4:
-        # A coarse backstop only. The executor's own per-symbol position count is
-        # the real ceiling; this stops a runaway channel flooding the queue.
+    if queued_now >= TELEGRAM_MAX_QUEUED:
         return finish("REFUSED_RISK",
-                      f"too many recent Telegram trades queued ({open_now})")
+                      f"{queued_now} Telegram trades are still waiting to be "
+                      f"placed -- try again once they clear")
 
     if src.max_lot is not None and lot > float(src.max_lot):
         return finish("REFUSED_RISK",
