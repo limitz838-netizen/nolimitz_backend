@@ -143,6 +143,124 @@ _ACTION = {"BUY": "buy", "SELL": "sell"}
 _VALID_MODES = ("SHADOW", "LIVE")
 
 
+# ==============================================================================
+# PLANS  --  what each package includes
+# ==============================================================================
+# Four packages, told apart by duration: 15 days, 30 days, 1 year, lifetime.
+#
+#   15days    master copy trading + scanner. NO Telegram copier.
+#   30days    + Telegram copier, up to 3 channels
+#   1year     + up to 10 channels, more scans, AI Trader when it ships
+#   lifetime  same as 1year
+#
+# GRANDFATHERING. Every licence created before PLAN_GATING_FROM keeps what it
+# had when it was bought: Telegram on, the old source cap, the old scan limit.
+# PLAN_GATING_FROM is an ISO UTC timestamp set in Render. While it is EMPTY the
+# rules are switched off and every licence is "legacy" -- so this file deploys
+# with zero change in behaviour, and the rules arm only when the env is set,
+# after the pricing page says the same thing.
+#
+# Which package a licence is: the Bachs webhook records bachs_plan_id in
+# branding_snapshot, and that wins. Anything else (admin-issued, Supabase
+# checkout) is read from its length, expires_at - created_at.
+PLAN_GATING_FROM_RAW = os.getenv("PLAN_GATING_FROM", "").strip()
+
+PLAN_FEATURES = {
+    "15days":   {"label": "15 Days",  "telegram": False, "max_sources": 0,
+                 "scans_per_day": int(os.getenv("PLAN_SCANS_15DAYS", "3")),
+                 "ai_trader": False},
+    "30days":   {"label": "30 Days",  "telegram": True,  "max_sources": 3,
+                 "scans_per_day": int(os.getenv("PLAN_SCANS_30DAYS", "6")),
+                 "ai_trader": False},
+    "1year":    {"label": "1 Year",   "telegram": True,  "max_sources": 10,
+                 "scans_per_day": int(os.getenv("PLAN_SCANS_1YEAR", "10")),
+                 "ai_trader": True},
+    "lifetime": {"label": "Lifetime", "telegram": True,  "max_sources": 10,
+                 "scans_per_day": int(os.getenv("PLAN_SCANS_LIFETIME", "10")),
+                 "ai_trader": True},
+}
+# What every licence had before the rules: today's scanner limit and source cap.
+LEGACY_SCANS_PER_DAY = int(os.getenv("PLAN_SCANS_LEGACY", "6"))
+
+# Aliases the Bachs side may record, mapped to the four names above.
+_PLAN_ALIASES = {
+    "15days": "15days", "15day": "15days", "starter": "15days",
+    "30days": "30days", "1month": "30days", "monthly": "30days", "month": "30days",
+    "1year": "1year", "annual": "1year", "yearly": "1year", "year": "1year",
+    "lifetime": "lifetime",
+}
+
+UPGRADE_MESSAGE = ("Telegram Copier is included from the 30-day plan. "
+                   "Upgrade your licence to use it.")
+
+
+def _parse_utc(raw: str) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        logger.error("PLAN_GATING_FROM=%r is not an ISO timestamp -- "
+                     "plan rules stay OFF", raw)
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+PLAN_GATING_FROM = _parse_utc(PLAN_GATING_FROM_RAW)
+
+
+def _aware(d: Optional[datetime]) -> Optional[datetime]:
+    if d is None:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _plan_name(lic: License) -> str:
+    """15days / 30days / 1year / lifetime. Never raises."""
+    snap = lic.branding_snapshot if isinstance(lic.branding_snapshot, dict) else {}
+    named = _PLAN_ALIASES.get(str(snap.get("bachs_plan_id") or "").strip().lower())
+    if named:
+        return named
+    created, exp = _aware(lic.created_at), _aware(lic.expires_at)
+    if exp is None:
+        return "lifetime"
+    if created is None:
+        return "30days"
+    days = (exp - created).total_seconds() / 86400.0
+    if days <= 20:
+        return "15days"
+    if days <= 60:
+        return "30days"
+    if days <= 400:
+        return "1year"
+    return "lifetime"
+
+
+def plan_for(lic: License) -> dict:
+    """The package a licence holds and what it unlocks."""
+    name = _plan_name(lic)
+    created = _aware(lic.created_at)
+    legacy = (PLAN_GATING_FROM is None
+              or created is None
+              or created < PLAN_GATING_FROM)
+    f = dict(PLAN_FEATURES[name])
+    if legacy:
+        # Bought before the rules: keeps Telegram, the old cap and old scans.
+        f["telegram"] = True
+        f["max_sources"] = max(f["max_sources"], MAX_SOURCES_PER_LICENCE)
+        f["scans_per_day"] = max(f["scans_per_day"], LEGACY_SCANS_PER_DAY)
+    f["plan"] = name
+    f["legacy"] = legacy
+    return f
+
+
+def _require_telegram(lic: License) -> dict:
+    p = plan_for(lic)
+    if not p["telegram"]:
+        raise HTTPException(status_code=403, detail=UPGRADE_MESSAGE)
+    return p
+
+
 def require_worker_token(x_worker_token: str = Header(None)):
     if not WORKER_TOKEN:
         raise HTTPException(status_code=503, detail="WORKER_TOKEN is not configured")
@@ -422,6 +540,7 @@ def link_telegram(data: LinkRequest, db: Session = Depends(get_db)):
     encrypted at rest and never returned by any endpoint.
     """
     lic = _licence(db, data.license_key)
+    _require_telegram(lic)
 
     if not data.session_string or len(data.session_string) < 20:
         raise HTTPException(status_code=400, detail="No Telegram session supplied")
@@ -451,16 +570,43 @@ def link_telegram(data: LinkRequest, db: Session = Depends(get_db)):
             "message": "Telegram connected. Add a signal source to begin."}
 
 
+@router.get("/plan")
+def licence_plan(license_key: str, db: Session = Depends(get_db)):
+    """What this licence's package includes. Read by the dashboard and by the
+    chart-scan quota (scans_per_day). Reveals nothing beyond what the key's
+    holder already bought."""
+    lic = _licence(db, license_key)
+    p = plan_for(lic)
+    return {
+        "plan": p["plan"],
+        "plan_label": p["label"],
+        "legacy": p["legacy"],
+        "telegram": p["telegram"],
+        "max_sources": p["max_sources"],
+        "scans_per_day": p["scans_per_day"],
+        "ai_trader": p["ai_trader"],
+        "rules_active": PLAN_GATING_FROM is not None,
+    }
+
+
 @router.get("/status")
 def telegram_status(license_key: str, db: Session = Depends(get_db)):
     lic = _licence(db, license_key)
+    p = plan_for(lic)
+    plan_fields = {
+        "plan": p["plan"],
+        "plan_label": p["label"],
+        "telegram_allowed": p["telegram"],
+        "upgrade_message": None if p["telegram"] else UPGRADE_MESSAGE,
+    }
     acc = db.query(TelegramAccount).filter(
         TelegramAccount.license_id == lic.id
     ).first()
 
     if not acc:
         return {"connected": False, "status": "NOT_CONNECTED",
-                "enabled_globally": TELEGRAM_ENABLED, "sources": 0}
+                "enabled_globally": TELEGRAM_ENABLED, "sources": 0,
+                "max_sources": p["max_sources"], **plan_fields}
 
     last = acc.last_seen_at
     if last is not None and last.tzinfo is None:
@@ -489,8 +635,9 @@ def telegram_status(license_key: str, db: Session = Depends(get_db)):
             "Telegram Copier offline - signals are not being monitored"),
         "enabled_globally": TELEGRAM_ENABLED,
         "sources": n_sources,
-        "max_sources": MAX_SOURCES_PER_LICENCE,
+        "max_sources": p["max_sources"],
         "consent_version": acc.consent_version,
+        **plan_fields,
     }
     # No session_encrypted. Not masked, not truncated -- absent.
 
@@ -525,6 +672,7 @@ def disconnect_telegram(data: dict, db: Session = Depends(get_db)):
 @router.post("/source")
 def add_source(data: SourceRequest, db: Session = Depends(get_db)):
     lic = _licence(db, data.license_key)
+    _require_telegram(lic)
 
     acc = db.query(TelegramAccount).filter(
         TelegramAccount.license_id == lic.id,
@@ -534,12 +682,15 @@ def add_source(data: SourceRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400,
                             detail="Connect your Telegram account first")
 
+    cap = plan_for(lic)["max_sources"]
     n = db.query(TelegramSource).filter(TelegramSource.license_id == lic.id).count()
-    if n >= MAX_SOURCES_PER_LICENCE:
+    if n >= cap:
+        more = ("" if cap >= 10 else
+                " The 1-year and Lifetime plans allow up to 10.")
         raise HTTPException(
             status_code=400,
-            detail=f"You can follow {MAX_SOURCES_PER_LICENCE} sources. "
-                   f"Remove one to add another.")
+            detail=f"Your plan can follow {cap} sources. "
+                   f"Remove one to add another.{more}")
 
     chat_id = (data.chat_id or "").strip()
     if not chat_id:
@@ -611,7 +762,7 @@ def list_sources(license_key: str, db: Session = Depends(get_db)):
             "last_reason": last.reason if last else None,
         })
     return {"success": True, "sources": out,
-            "max_sources": MAX_SOURCES_PER_LICENCE}
+            "max_sources": plan_for(lic)["max_sources"]}
 
 
 @router.patch("/source/{source_id}")
@@ -1050,6 +1201,9 @@ def incoming_signal(data: IncomingSignal,
         exp = exp.replace(tzinfo=timezone.utc)
     if not lic.is_active or (exp and exp < datetime.now(timezone.utc)):
         return finish("REFUSED_RISK", "licence expired")
+
+    if not plan_for(lic)["telegram"]:
+        return finish("REFUSED_RISK", "plan does not include Telegram Copier")
 
     account = db.query(ClientMT5Account).filter(
         ClientMT5Account.license_id == lic.id,
