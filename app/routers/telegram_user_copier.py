@@ -148,10 +148,10 @@ _VALID_MODES = ("SHADOW", "LIVE")
 # ==============================================================================
 # Four packages, told apart by duration: 15 days, 30 days, 1 year, lifetime.
 #
-#   15days    master copy trading + scanner. NO Telegram copier.
-#   30days    + Telegram copier, up to 3 channels
-#   1year     + up to 10 channels, more scans, AI Trader when it ships
-#   lifetime  same as 1year
+#   15days    1 MT5 account, AI Trader, 5 scans/day. NO Telegram copier.
+#   30days    up to 5 MT5 accounts, 10 scans/day, Telegram copier (3 channels)
+#   1year     unlimited accounts, 50 scans/day, 6 channels, faster execution
+#   lifetime  as 1year, 10 channels, unlimited scans (fair-use ceiling)
 #
 # GRANDFATHERING. Every licence created before PLAN_GATING_FROM keeps what it
 # had when it was bought: Telegram on, the old source cap, the old scan limit.
@@ -165,19 +165,31 @@ _VALID_MODES = ("SHADOW", "LIVE")
 # checkout) is read from its length, expires_at - created_at.
 PLAN_GATING_FROM_RAW = os.getenv("PLAN_GATING_FROM", "").strip()
 
+# "Unlimited" scans are a fair-use ceiling, not infinity: every scan is a paid
+# vision call, and one stuck client in a loop must not run up the bill.
+SCANS_UNLIMITED_CEILING = int(os.getenv("PLAN_SCANS_UNLIMITED_CEILING", "1000"))
+
 PLAN_FEATURES = {
     "15days":   {"label": "15 Days",  "telegram": False, "max_sources": 0,
-                 "scans_per_day": int(os.getenv("PLAN_SCANS_15DAYS", "3")),
-                 "ai_trader": False},
+                 "scans_per_day": int(os.getenv("PLAN_SCANS_15DAYS", "5")),
+                 "scans_unlimited": False,
+                 "max_mt5_accounts": 1,
+                 "ai_trader": True, "priority_execution": False},
     "30days":   {"label": "30 Days",  "telegram": True,  "max_sources": 3,
-                 "scans_per_day": int(os.getenv("PLAN_SCANS_30DAYS", "6")),
-                 "ai_trader": False},
-    "1year":    {"label": "1 Year",   "telegram": True,  "max_sources": 10,
-                 "scans_per_day": int(os.getenv("PLAN_SCANS_1YEAR", "10")),
-                 "ai_trader": True},
+                 "scans_per_day": int(os.getenv("PLAN_SCANS_30DAYS", "10")),
+                 "scans_unlimited": False,
+                 "max_mt5_accounts": 5,
+                 "ai_trader": True, "priority_execution": False},
+    "1year":    {"label": "1 Year",   "telegram": True,  "max_sources": 6,
+                 "scans_per_day": int(os.getenv("PLAN_SCANS_1YEAR", "50")),
+                 "scans_unlimited": False,
+                 "max_mt5_accounts": None,          # unlimited
+                 "ai_trader": True, "priority_execution": True},
     "lifetime": {"label": "Lifetime", "telegram": True,  "max_sources": 10,
-                 "scans_per_day": int(os.getenv("PLAN_SCANS_LIFETIME", "10")),
-                 "ai_trader": True},
+                 "scans_per_day": SCANS_UNLIMITED_CEILING,
+                 "scans_unlimited": True,
+                 "max_mt5_accounts": None,
+                 "ai_trader": True, "priority_execution": True},
 }
 # What every licence had before the rules: today's scanner limit and source cap.
 LEGACY_SCANS_PER_DAY = int(os.getenv("PLAN_SCANS_LEGACY", "6"))
@@ -584,7 +596,10 @@ def licence_plan(license_key: str, db: Session = Depends(get_db)):
         "telegram": p["telegram"],
         "max_sources": p["max_sources"],
         "scans_per_day": p["scans_per_day"],
+        "scans_unlimited": p["scans_unlimited"],
+        "max_mt5_accounts": p["max_mt5_accounts"],
         "ai_trader": p["ai_trader"],
+        "priority_execution": p["priority_execution"],
         "rules_active": PLAN_GATING_FROM is not None,
     }
 
@@ -686,7 +701,8 @@ def add_source(data: SourceRequest, db: Session = Depends(get_db)):
     n = db.query(TelegramSource).filter(TelegramSource.license_id == lic.id).count()
     if n >= cap:
         more = ("" if cap >= 10 else
-                " The 1-year and Lifetime plans allow up to 10.")
+                " Lifetime allows 10." if cap >= 6 else
+                " The 1-Year plan allows 6 and Lifetime 10.")
         raise HTTPException(
             status_code=400,
             detail=f"Your plan can follow {cap} sources. "
