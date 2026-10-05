@@ -829,6 +829,15 @@ def delete_source(source_id: int, license_key: str,
                   db: Session = Depends(get_db)):
     lic = _licence(db, license_key)
     src = _own_source(db, lic, source_id)
+    # The signal log points at its source. Detach those rows first, otherwise
+    # Postgres refuses the delete (FK telegram_signal_log_source_id_fkey) and
+    # the user gets a 500 on every attempt to remove a source that has ever
+    # received a signal. The log rows are kept -- they still carry licence,
+    # chat_id, text and outcome -- so the history the user saw stays intact.
+    db.query(TelegramSignalLog).filter(
+        TelegramSignalLog.license_id == lic.id,
+        TelegramSignalLog.source_id == src.id,
+    ).update({"source_id": None}, synchronize_session=False)
     db.delete(src)
     db.commit()
     return {"success": True, "deleted": source_id}
