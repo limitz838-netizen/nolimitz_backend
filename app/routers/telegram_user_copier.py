@@ -67,7 +67,7 @@ from typing import List, Optional, Union
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -79,6 +79,7 @@ from app.models import (
     ExpertAdvisor,
     License,
     TradeExecution,
+    TradeTicketMap,
 )
 from app.models_telegram import (
     TelegramAccount,
@@ -87,6 +88,7 @@ from app.models_telegram import (
 )
 
 from app.telegram_signal_parser import Refusal, parse_signal
+from app.telegram_close_orders import classify_close
 
 try:
     from app.security_utils import encrypt_secret
@@ -139,6 +141,11 @@ WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
 
 # Lowercase, because the executor compares against lowercase. See note 1.
 _ACTION = {"BUY": "buy", "SELL": "sell"}
+
+# A channel's close order reaches back this far for the trades it closes. A
+# "close all" today must not reach a position from last week that the user is
+# still holding on purpose.
+CLOSE_LOOKBACK_HOURS = float(os.getenv("TELEGRAM_CLOSE_LOOKBACK_HOURS", "24"))
 
 _VALID_MODES = ("SHADOW", "LIVE")
 
@@ -996,6 +1003,9 @@ def _trades_today(db: Session, src: TelegramSource) -> int:
         TelegramSignalLog.source_id == src.id,
         TelegramSignalLog.outcome.in_(("QUEUED", "PLACED")),
         TelegramSignalLog.received_at >= since,
+        # A queued CLOSE is not a trade and must not use up the daily cap.
+        or_(TelegramSignalLog.parsed_json.is_(None),
+            ~TelegramSignalLog.parsed_json.like('{"kind": "CLOSE"%')),
     ).count()
 
 
@@ -1113,6 +1123,151 @@ def _create_executions(db: Session, lic: License, src: TelegramSource,
 
 
 # ==============================================================================
+# CLOSE ORDERS  --  "close all now", or "close" as a reply to the signal
+# ==============================================================================
+def _ticket_parts(master_ticket: str):
+    """TGU-<chat>-<message>-<licence>-<idx> -> (chat, message, licence, idx).
+
+    The chat id is negative ("-1003112965785"), so the ticket is split from the
+    RIGHT, where the three trailing parts are always plain numbers.
+    """
+    try:
+        head, licence, idx = master_ticket.rsplit("-", 2)
+        chat_part, message = head.rsplit("-", 1)
+        return chat_part[len("TGU-"):], message, int(licence), int(idx)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _queue_close(db: Session, lic: License, src: TelegramSource,
+                 data: "IncomingSignal", order: dict, canonical, log, finish):
+    """Queue a close for this licence's open trades from THIS channel.
+
+    Scope, narrowest first:
+      * a REPLY to a signal we copied closes that signal's positions only;
+      * otherwise every open trade from this channel in the last
+        CLOSE_LOOKBACK_HOURS, narrowed by the symbol / direction it named.
+    Never touches master-copier trades, manual trades, or another channel's.
+
+    The rows are ordinary close rows on the same master tickets as the opens,
+    so the lanes close them exactly the way they close a master trade -- the
+    executor is not changed. A position its TP or SL already closed comes back
+    "already closed by client", which is harmless.
+
+    Deliberately NOT checked here: licence expiry and plan. Closing must
+    always be possible; refusing it would strand a customer in a position.
+    """
+    if not TELEGRAM_ENABLED:
+        return finish("REFUSED_RISK", "telegram copier disabled globally")
+    if not src.enabled:
+        return finish("REFUSED_RISK", "source is paused")
+    if src.copy_closures is False:
+        return finish("REFUSED_RISK", "closing trades is switched off for this source")
+
+    age = _signal_age_sec(data.sent_at)
+    if age is not None and age > MAX_SIGNAL_AGE_SEC:
+        return finish("REFUSED_RISK",
+                      f"close order was sent {int(age)}s ago "
+                      f"(limit {MAX_SIGNAL_AGE_SEC}s)")
+
+    if (src.mode or "SHADOW").upper() != "LIVE":
+        return finish("SHADOW", "Close order recognised - nothing closed because "
+                                "this source is in Shadow mode")
+
+    chat = str(data.chat_id)
+    since = datetime.now(timezone.utc) - timedelta(hours=CLOSE_LOOKBACK_HOURS)
+    opens = db.query(TradeExecution).filter(
+        TradeExecution.license_id == lic.id,
+        TradeExecution.event_type == "open",
+        TradeExecution.master_ticket.like(f"TGU-{chat}-%"),
+        TradeExecution.status.in_(("pending", "processing", "executed")),
+        TradeExecution.created_at >= since,
+    ).order_by(TradeExecution.id).all()
+
+    mine = []
+    for row in opens:
+        parts = _ticket_parts(row.master_ticket)
+        if parts and parts[0] == chat and parts[2] == lic.id:
+            mine.append((row, parts[1]))
+
+    scope = "this channel"
+    reply_to = str(data.reply_to_message_id) if data.reply_to_message_id else None
+    if reply_to:
+        replied = [(r, m) for r, m in mine if m == reply_to]
+        if replied:
+            mine, scope = replied, "the signal it replied to"
+
+    if order.get("symbol_raw"):
+        want = canonical(order["symbol_raw"])
+        mine = [(r, m) for r, m in mine if canonical(r.symbol or "") == want]
+    if order.get("direction"):
+        act = _ACTION[order["direction"]]
+        mine = [(r, m) for r, m in mine if (r.action or "").lower() == act]
+
+    tickets = [r.master_ticket for r, _ in mine]
+    if tickets:
+        # Already being closed, or already closed: leave alone.
+        busy = {t for (t,) in db.query(TradeExecution.master_ticket).filter(
+            TradeExecution.license_id == lic.id,
+            TradeExecution.event_type == "close",
+            TradeExecution.master_ticket.in_(tickets),
+            TradeExecution.status != "failed",
+        ).all()}
+        mapped = {}
+        for t, closed in db.query(TradeTicketMap.master_ticket,
+                                  TradeTicketMap.is_closed).filter(
+                TradeTicketMap.license_id == lic.id,
+                TradeTicketMap.master_ticket.in_(tickets)).all():
+            mapped.setdefault(t, []).append(bool(closed))
+        mine = [(r, m) for r, m in mine
+                if r.master_ticket not in busy
+                and not (r.master_ticket in mapped and all(mapped[r.master_ticket]))]
+
+    if not mine:
+        return finish("REFUSED_RISK",
+                      "close order recognised - no open trades from "
+                      f"{scope} to close")
+
+    ea = db.query(ExpertAdvisor).filter(ExpertAdvisor.id == lic.ea_id).first()
+    ea_code = getattr(ea, "ea_code", None) or "TELEGRAM"
+    rows = []
+    try:
+        for row, _ in mine:
+            event = CopierTradeEvent(
+                source_admin_id=lic.admin_id, ea_id=lic.ea_id, ea_code=ea_code,
+                event_type="close", master_ticket=row.master_ticket,
+                symbol=row.symbol, action=None, lot_size=None, sl=None, tp=None,
+                price=None, comment=row.comment, status="pending",
+            )
+            db.add(event)
+            db.flush()
+            ex = TradeExecution(
+                copier_event_id=event.id, license_id=lic.id, ea_id=lic.ea_id,
+                master_ticket=row.master_ticket, client_ticket=None,
+                symbol=row.symbol, action=None, lot_size=row.lot_size,
+                sl=None, tp=None, price=None, comment=row.comment,
+                event_type="close", status="pending",
+            )
+            db.add(ex)
+            db.flush()
+            rows.append(ex)
+        log.validated_at = _now(db)
+        log.execution_id = rows[0].id
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error("could not queue telegram close for licence %s: %s", lic.id, e)
+        return finish("REFUSED_RISK", f"could not queue close: {e}")
+
+    signals = len({m for _, m in mine})
+    logger.info("telegram CLOSE licence=%s chat=%s rows=%s", lic.id, chat,
+                [r.id for r in rows])
+    return finish("QUEUED",
+                  f"closing your trades from {signals} signal"
+                  f"{'' if signals == 1 else 's'} ({scope})")
+
+
+# ==============================================================================
 # THE INTAKE  --  the listener posts here
 # ==============================================================================
 @worker_router.post("/signal")
@@ -1178,10 +1333,22 @@ def incoming_signal(data: IncomingSignal,
     # the platform already understands and there is no second list to drift.
     synonyms, canonical, find_setting = _matcher()
 
+    def close_order():
+        return classify_close(data.text or "",
+                              is_reply=bool(data.reply_to_message_id),
+                              symbols=synonyms.keys())
+
     try:
         parsed = parse_signal(data.text, extra_symbols=synonyms.keys())
     except Refusal as r:
         log.parsed_at = _now(db)
+        # "Close all now", "Take profit now" carry no instrument or direction,
+        # so the parser refuses them. Only an unmistakable close order is
+        # rescued here; everything else keeps its parse refusal.
+        order = close_order()
+        if order["close"]:
+            log.parsed_json = json.dumps({"kind": "CLOSE", **order})[:4000]
+            return _queue_close(db, lic, src, data, order, canonical, log, finish)
         return finish("REFUSED_PARSE", f"{r.code}: {r.detail}".strip(": "))
     except Exception as e:
         # A genuine parser bug on one message. Refuse THAT message, keep
@@ -1195,11 +1362,14 @@ def incoming_signal(data: IncomingSignal,
     log.parsed_json = json.dumps(parsed)[:4000]
 
     if parsed["kind"] == "CLOSE":
-        # Closures need the ticket maps of the ORIGINAL open, which the executor
-        # finds by master_ticket. Implemented in the next step; refused rather
-        # than half-done, because a close that silently does nothing leaves a
-        # live position the user believes is shut.
-        return finish("REFUSED_RISK", "closures_not_enabled_yet")
+        # The parser says "this mentions closing". Most such messages are
+        # chatter -- questions, results posts, "close if satisfied" -- so the
+        # close-order rules decide whether it is actually an order.
+        order = close_order()
+        if not order["close"]:
+            return finish("REFUSED_PARSE", f"not_a_close_order: {order['why']}")
+        log.parsed_json = json.dumps({"kind": "CLOSE", **order})[:4000]
+        return _queue_close(db, lic, src, data, order, canonical, log, finish)
 
     direction = parsed["direction"]
     symbol_raw = parsed["symbol_raw"]
