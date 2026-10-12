@@ -89,6 +89,7 @@ from app.models_telegram import (
 
 from app.telegram_signal_parser import Refusal, parse_signal
 from app.telegram_close_orders import classify_close
+from app.telegram_be_orders import classify_breakeven
 
 try:
     from app.security_utils import encrypt_secret
@@ -1005,7 +1006,8 @@ def _trades_today(db: Session, src: TelegramSource) -> int:
         TelegramSignalLog.received_at >= since,
         # A queued CLOSE is not a trade and must not use up the daily cap.
         or_(TelegramSignalLog.parsed_json.is_(None),
-            ~TelegramSignalLog.parsed_json.like('{"kind": "CLOSE"%')),
+            ~(TelegramSignalLog.parsed_json.like('{"kind": "CLOSE"%')
+              | TelegramSignalLog.parsed_json.like('{"kind": "BE"%'))),
     ).count()
 
 
@@ -1267,6 +1269,109 @@ def _queue_close(db: Session, lic: License, src: TelegramSource,
                   f"{'' if signals == 1 else 's'} ({scope})")
 
 
+def _queue_breakeven(db: Session, lic: License, src: TelegramSource,
+                     data: "IncomingSignal", order: dict, canonical, log, finish):
+    """Record a MOVE-STOP-TO-BREAK-EVEN order for this licence's open trades
+    from THIS channel.
+
+    Same scope rules as a close: a REPLY narrows it to that signal, otherwise
+    every trade from this channel in the last CLOSE_LOOKBACK_HOURS, narrowed by
+    the symbol / direction it named. Never touches master-copier, manual or
+    another channel's trades.
+
+    Nothing is queued for the lanes. The order is written to this log row
+    ({"kind": "BE", "tickets": [...]}) and the trade guard on the VPS -- which
+    already logs into accounts to manage stops -- moves each position's stop to
+    THAT position's own entry price (plus a hair), only ever tightening it, and
+    only once the broker will accept it (price past entry by the stops level).
+
+    Deliberately NOT checked: licence expiry, plan, robot on/off. Protecting an
+    open position must always be possible.
+    """
+    if not TELEGRAM_ENABLED:
+        return finish("REFUSED_RISK", "telegram copier disabled globally")
+    if not src.enabled:
+        return finish("REFUSED_RISK", "source is paused")
+    if src.copy_sl is False:
+        return finish("REFUSED_RISK", "stop-loss updates are switched off for this source")
+
+    age = _signal_age_sec(data.sent_at)
+    if age is not None and age > MAX_SIGNAL_AGE_SEC:
+        return finish("REFUSED_RISK",
+                      f"break-even order was sent {int(age)}s ago "
+                      f"(limit {MAX_SIGNAL_AGE_SEC}s)")
+
+    if (src.mode or "SHADOW").upper() != "LIVE":
+        return finish("SHADOW", "Break-even order recognised - no stop moved because "
+                                "this source is in Shadow mode")
+
+    chat = str(data.chat_id)
+    since = datetime.now(timezone.utc) - timedelta(hours=CLOSE_LOOKBACK_HOURS)
+    opens = db.query(TradeExecution).filter(
+        TradeExecution.license_id == lic.id,
+        TradeExecution.event_type == "open",
+        TradeExecution.master_ticket.like(f"TGU-{chat}-%"),
+        TradeExecution.status.in_(("pending", "processing", "executed")),
+        TradeExecution.created_at >= since,
+    ).order_by(TradeExecution.id).all()
+
+    mine = []
+    for row in opens:
+        parts = _ticket_parts(row.master_ticket)
+        if parts and parts[0] == chat and parts[2] == lic.id:
+            mine.append((row, parts[1]))
+
+    scope = "this channel"
+    reply_to = str(data.reply_to_message_id) if data.reply_to_message_id else None
+    if reply_to:
+        replied = [(r, m) for r, m in mine if m == reply_to]
+        if replied:
+            mine, scope = replied, "the signal it replied to"
+
+    if order.get("symbol_raw"):
+        want = canonical(order["symbol_raw"])
+        mine = [(r, m) for r, m in mine if canonical(r.symbol or "") == want]
+    if order.get("direction"):
+        act = _ACTION[order["direction"]]
+        mine = [(r, m) for r, m in mine if (r.action or "").lower() == act]
+
+    tickets = [r.master_ticket for r, _ in mine]
+    if tickets:
+        closing = {t for (t,) in db.query(TradeExecution.master_ticket).filter(
+            TradeExecution.license_id == lic.id,
+            TradeExecution.event_type == "close",
+            TradeExecution.master_ticket.in_(tickets),
+            TradeExecution.status != "failed",
+        ).all()}
+        mapped = {}
+        for t, closed in db.query(TradeTicketMap.master_ticket,
+                                  TradeTicketMap.is_closed).filter(
+                TradeTicketMap.license_id == lic.id,
+                TradeTicketMap.master_ticket.in_(tickets)).all():
+            mapped.setdefault(t, []).append(bool(closed))
+        mine = [(r, m) for r, m in mine
+                if r.master_ticket not in closing
+                and not (r.master_ticket in mapped and all(mapped[r.master_ticket]))]
+
+    if not mine:
+        return finish("REFUSED_RISK",
+                      "break-even order recognised - no open trades from "
+                      f"{scope} to protect")
+
+    log.parsed_json = json.dumps({
+        "kind": "BE",
+        "symbol_raw": order.get("symbol_raw"),
+        "direction": order.get("direction"),
+        "tickets": sorted({r.master_ticket for r, _ in mine}),
+    })[:4000]
+    log.validated_at = _now(db)
+    n = len({r.master_ticket for r, _ in mine})
+    logger.info("telegram BREAKEVEN licence=%s chat=%s tickets=%s", lic.id, chat, n)
+    return finish("QUEUED",
+                  f"moving the stop to break-even on {n} trade"
+                  f"{'' if n == 1 else 's'} ({scope})")
+
+
 # ==============================================================================
 # THE INTAKE  --  the listener posts here
 # ==============================================================================
@@ -1338,6 +1443,11 @@ def incoming_signal(data: IncomingSignal,
                               is_reply=bool(data.reply_to_message_id),
                               symbols=synonyms.keys())
 
+    def be_order():
+        return classify_breakeven(data.text or "",
+                                  is_reply=bool(data.reply_to_message_id),
+                                  symbols=synonyms.keys())
+
     try:
         parsed = parse_signal(data.text, extra_symbols=synonyms.keys())
     except Refusal as r:
@@ -1349,6 +1459,11 @@ def incoming_signal(data: IncomingSignal,
         if order["close"]:
             log.parsed_json = json.dumps({"kind": "CLOSE", **order})[:4000]
             return _queue_close(db, lic, src, data, order, canonical, log, finish)
+        # "MOVE YOUR SL TO B.E" carries no BUY/SELL either.
+        be = be_order()
+        if be["be"]:
+            log.parsed_json = json.dumps({"kind": "BE", **be})[:4000]
+            return _queue_breakeven(db, lic, src, data, be, canonical, log, finish)
         return finish("REFUSED_PARSE", f"{r.code}: {r.detail}".strip(": "))
     except Exception as e:
         # A genuine parser bug on one message. Refuse THAT message, keep
@@ -1367,6 +1482,10 @@ def incoming_signal(data: IncomingSignal,
         # close-order rules decide whether it is actually an order.
         order = close_order()
         if not order["close"]:
+            be = be_order()
+            if be["be"]:
+                log.parsed_json = json.dumps({"kind": "BE", **be})[:4000]
+                return _queue_breakeven(db, lic, src, data, be, canonical, log, finish)
             return finish("REFUSED_PARSE", f"not_a_close_order: {order['why']}")
         log.parsed_json = json.dumps({"kind": "CLOSE", **order})[:4000]
         return _queue_close(db, lic, src, data, order, canonical, log, finish)
