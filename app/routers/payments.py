@@ -79,8 +79,8 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Admin, ExpertAdvisor, License
-from app.routers.license import deliver_license, generate_license_key
-from app.routers.bachs_plans import resolve_plan, config_summary
+from app.routers.license import deliver_license, generate_license_key, send_email
+from app.routers.bachs_plans import resolve_plan, config_summary, TELEGRAM_PLANS
 
 router = APIRouter(prefix="/payments", tags=["Payments"])
 logger = logging.getLogger("payments")
@@ -88,6 +88,16 @@ logger = logging.getLogger("payments")
 BACHS_WEBHOOK_SECRET = os.getenv("BACHS_WEBHOOK_SECRET", "")
 BACHS_EA_ID = int(os.getenv("BACHS_EA_ID", "1"))
 BACHS_ADMIN_ID = int(os.getenv("BACHS_ADMIN_ID", "2"))
+
+# ---- Telegram Copier subscription ($11.99 / month) ---------------------------
+# Each payment adds 30 days to the subscriber's ONE Telegram licence (found by
+# email), plus a grace period so a late monthly payment does not cut copying
+# mid-trade. The customer never sees a key: the app finds the licence by the
+# email they are signed in with (GET /payments/telegram-subscription).
+TELEGRAM_GRACE_DAYS = int(os.getenv("TELEGRAM_SUB_GRACE_DAYS", "2"))
+TELEGRAM_SUB_PRICE = float(os.getenv("TELEGRAM_SUB_PRICE", "11.99"))
+APP_URL = os.getenv("APP_URL", "https://app.nolimitzbots.co.ke")
+WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
 
 # NOTE: the PLAN_DAYS dict that used to live here has been REMOVED, not moved.
 # bachs_plans.PLAN_DAYS is the single authority for duration now. Two copies of
@@ -334,6 +344,8 @@ async def bachs_webhook(
         existing = db.execute(text(
             "select id, license_key from licenses "
             "where branding_snapshot::jsonb ->> 'bachs_charge_id' = :cid "
+            "   or coalesce(branding_snapshot::jsonb -> 'bachs_charge_ids', '[]'::jsonb) "
+            "      @> to_jsonb(cast(:cid as text)) "
             "limit 1"
         ), {"cid": str(charge_id)}).first()
 
@@ -357,6 +369,11 @@ async def bachs_webhook(
 
     logger.info("charge %s resolved to plan %s (%s days) via %s",
                 charge_id, plan_id, days, how)
+
+    if plan_id in TELEGRAM_PLANS:
+        return _telegram_subscription_paid(
+            db, email=email, name=name, charge_id=charge_id, event_id=event_id,
+            plan_id=plan_id, days=days, settlement=settlement, how=how)
 
     # Price sanity check — logged, never acted on.
     try:
@@ -429,6 +446,160 @@ async def bachs_webhook(
         "resolved_by": how,
         "emailed": sent,
     }
+
+
+# ==============================================================================
+# TELEGRAM COPIER SUBSCRIPTION
+# ==============================================================================
+def _naive_utc(d):
+    if d is None:
+        return None
+    if d.tzinfo is not None:
+        d = d.astimezone(timezone.utc).replace(tzinfo=None)
+    return d
+
+
+def _telegram_licence_for(db: Session, email: str):
+    row = db.execute(text("""
+        select id from licenses
+         where lower(client_email) = lower(:e)
+           and branding_snapshot::jsonb ->> 'product' = 'telegram_copier'
+         order by id desc limit 1"""), {"e": email}).first()
+    return db.query(License).filter(License.id == row.id).first() if row else None
+
+
+def _telegram_subscription_paid(db: Session, *, email, name, charge_id, event_id,
+                                plan_id, days, settlement, how):
+    """A Telegram Copier payment: extend the subscriber's licence, or create it.
+
+    Renewal arithmetic: the new period starts at the end of the PAID period
+    (expiry minus grace) or now, whichever is later, so paying early never
+    loses days and paying late never back-dates. Grace is added on top.
+    """
+    try:
+        if settlement and abs(float(settlement) - TELEGRAM_SUB_PRICE) > 0.5:
+            logger.warning("telegram charge %s settled at %s, expected ~%s",
+                           charge_id, settlement, TELEGRAM_SUB_PRICE)
+    except Exception:
+        pass
+
+    now = datetime.utcnow()
+    grace = timedelta(days=TELEGRAM_GRACE_DAYS)
+    cid = str(charge_id) if charge_id else None
+    lic = _telegram_licence_for(db, email)
+
+    if lic:
+        exp = _naive_utc(lic.expires_at)
+        base = max(now, exp - grace) if exp else now
+        lic.expires_at = (base + timedelta(days=days) + grace).replace(tzinfo=timezone.utc)
+        lic.is_active = True
+        snap = dict(lic.branding_snapshot or {})
+        ids = list(snap.get("bachs_charge_ids") or [])
+        if cid and cid not in ids:
+            ids.append(cid)
+        snap.update({"bachs_charge_ids": ids[-60:], "last_charge_id": cid,
+                     "last_event_id": event_id, "bachs_settlement": str(settlement) if settlement else None,
+                     "renewed_at": now.isoformat(), "bachs_resolved_by": how})
+        lic.branding_snapshot = snap
+        db.commit()
+        db.refresh(lic)
+        renewed = True
+    else:
+        ea = db.query(ExpertAdvisor).filter(ExpertAdvisor.id == BACHS_EA_ID).first()
+        if not ea:
+            logger.error("BACHS_EA_ID %s not found — cannot issue telegram licence", BACHS_EA_ID)
+            raise HTTPException(status_code=500, detail="Configured EA not found")
+        admin = db.query(Admin).filter(Admin.id == BACHS_ADMIN_ID).first()
+        lic = License(
+            admin_id=BACHS_ADMIN_ID,
+            ea_id=ea.id,
+            license_key=generate_license_key(db),
+            client_name=name,
+            client_email=email,
+            mode_type="both",
+            expires_at=(now + timedelta(days=days) + grace).replace(tzinfo=timezone.utc),
+            is_active=True,
+            branding_snapshot={
+                "admin_code": getattr(admin, "admin_code", None),
+                "display_name": "NolimitzBots",
+                "product": "telegram_copier",
+                "bachs_plan_id": "telegram",
+                "bachs_charge_id": cid,
+                "bachs_charge_ids": [cid] if cid else [],
+                "bachs_event_id": event_id,
+                "bachs_settlement": str(settlement) if settlement else None,
+                "bachs_resolved_by": how,
+                "source": "bachs",
+            },
+            ai_enabled=False,
+            mt5_enabled=True,
+            auto_trade_enabled=True,
+            # On, so channel trades flow from the first signal. The app's Stop
+            # button still turns it off, and the lanes respect that.
+            execution_enabled=True,
+        )
+        db.add(lic)
+        db.commit()
+        db.refresh(lic)
+        renewed = False
+
+    until = _naive_utc(lic.expires_at)
+    logger.info("telegram subscription %s for %s — licence %s, active until %s, charge %s",
+                "RENEWED" if renewed else "STARTED", email, lic.id, until, charge_id)
+
+    # No key in the email: the app finds the subscription by this address.
+    try:
+        sent, detail = send_email(
+            to=email,
+            subject="Your Telegram Copier is active" if not renewed
+                    else "Your Telegram Copier subscription is renewed",
+            html=(
+                "<p>Hi%s,</p>"
+                "<p>Thank you — your <b>NolimitzBots Telegram Copier</b> is active until "
+                "<b>%s UTC</b>.</p>"
+                "<p>Open the app and sign in with <b>%s</b> (the same email you paid with). "
+                "Your Telegram Copier unlocks automatically — connect your Telegram, add your "
+                "channels and connect your MT5 account.</p>"
+                "<p><a href=\"%s\">Open NolimitzBots</a></p>"
+            ) % ((" " + name) if name else "", until.strftime("%d %b %Y %H:%M"),
+                 email, APP_URL),
+        )
+        if not sent:
+            logger.error("telegram subscription email failed for %s: %s", email, detail)
+    except Exception as e:
+        sent = False
+        logger.error("telegram subscription email error for %s: %s", email, e)
+
+    return {"received": True, "product": "telegram_copier", "license_id": lic.id,
+            "renewed": renewed, "active_until": until.isoformat() if until else None,
+            "plan": plan_id, "resolved_by": how, "emailed": sent}
+
+
+@router.get("/telegram-subscription")
+def telegram_subscription_lookup(
+    email: str,
+    x_worker_token: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    """For the app's server function ONLY (worker token): does this email hold
+    a Telegram Copier subscription, and is it active? Returns the licence key so
+    the app can bind it to the signed-in account -- the customer never types it.
+    """
+    if not WORKER_TOKEN:
+        raise HTTPException(status_code=503, detail="WORKER_TOKEN is not configured")
+    if not x_worker_token or not hmac.compare_digest(x_worker_token, WORKER_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid worker token")
+    email = (email or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="email required")
+    lic = _telegram_licence_for(db, email)
+    if not lic:
+        return {"found": False}
+    until = _naive_utc(lic.expires_at)
+    active = bool(lic.is_active) and until is not None and until > datetime.utcnow()
+    return {"found": True, "active": active, "license_key": lic.license_key,
+            "expires_at": until.isoformat() + "Z" if until else None,
+            "plan": "telegram", "max_sources": 3, "max_mt5_accounts": 1}
 
 
 @router.get("/bachs-webhook")
