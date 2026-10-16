@@ -313,6 +313,91 @@ def _mask_synthetics(upper):
     return upper, names
 
 
+# ---- "LONG/BUY", "BTC/USDT", "84,000" -----------------------------------------
+#
+# A real XM Trading Academy signal, refused as not_a_signal:
+#
+#     LONG/BUY
+#     BTC/USDT
+#     MARKET PRICE
+#     TP: 84,000
+#     SL: 80,388
+#
+# Three separate things stopped it, and the third would have been dangerous had
+# the first two not:
+#
+#   * LONG/BUY is one token, and not a direction word.
+#   * BTC/USDT is one token, on its own line, and not an instrument.
+#   * 84,000 was read as 84.000. A comma is a decimal point in plenty of
+#     channels ("1,0850"), so _NUM accepts it as one -- and a BUY on bitcoin at
+#     82,000 with a stop of 80.388 has, in effect, no stop at all.
+
+# Two words that say the same direction, written together. A pair that
+# DISAGREES ("BUY/SELL") is left alone and refused as two directions.
+_RE_DIR_PAIR = re.compile(
+    r"\b(BUY|LONG)\s*[/|]\s*(BUY|LONG)\b|\b(SELL|SHORT)\s*[/|]\s*(SELL|SHORT)\b")
+
+_PAIR_QUOTES = {"USD", "USDT", "USDC", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD",
+                "CHF", "BTC", "ETH", "ZAR", "SGD", "HKD", "TRY", "MXN", "NOK",
+                "SEK", "PLN"}
+# "BTC/USDT", "XAU/USD", "EUR/USD". Joined ONLY when the left side is a known
+# currency, metal or coin and the right side a known quote currency, so
+# "LONG/BUY" or "TP1/TP2" can never be glued into a fake instrument.
+_RE_SLASH_PAIR = re.compile(r"\b([A-Z]{3,4})\s*/\s*([A-Z]{3,4})\b")
+
+# A number written with thousands separators: 84,000 / 4,150.50 / 1,234,567.
+# Not preceded by a digit, dot or comma, so "1.0850,1.0870" and "4160,4170"
+# are never touched.
+_RE_THOUSANDS = re.compile(r"(?<![\d.,])(\d{1,3})((?:,\d{3})+)(\.\d+)?(?![\d,])")
+
+_RE_NUM_LIST = re.compile(
+    r"(?<![\d.,])\d{4,}(?:\.\d+)?(?:,\d{3,}(?:\.\d+)?)+(?![\d,])")
+
+_FIAT = {"EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF", "SEK", "NOK",
+         "DKK", "PLN", "HUF", "CZK", "TRY", "ZAR", "MXN", "SGD", "HKD", "CNH"}
+
+
+def _join_slash_pairs(upper):
+    def join(m):
+        base, quote = m.group(1), m.group(2)
+        if base in _CCY_PREFIX or base in {"BTC", "ETH", "XAU", "XAG"}:
+            if quote in _PAIR_QUOTES:
+                return base + quote
+        return m.group(0)
+    return _RE_SLASH_PAIR.sub(join, upper)
+
+
+def _strip_thousands(upper):
+    """84,000 -> 84000. Returns (text, ambiguous).
+
+    ONE comma group with no decimal part -- "84,000", "4,150", "1,085" -- could
+    also be a decimal comma. That is settled once the instrument is known: on
+    gold, bitcoin or an index it is a thousands separator, on a plain currency
+    pair it is refused rather than guessed (EURUSD at 1,085 and USDJPY at
+    150,250 are both real ways of writing a decimal).
+    """
+    ambiguous = False
+
+    def fix(m):
+        nonlocal ambiguous
+        groups, decimals = m.group(2), m.group(3)
+        if groups.count(",") == 1 and not decimals:
+            ambiguous = True
+        return m.group(1) + groups.replace(",", "") + (decimals or "")
+    upper = _RE_THOUSANDS.sub(fix, upper)
+    # "TP 4160,4170" is two targets, not 4160.417. A decimal comma after a
+    # four-digit price carries one or two digits ("4150,50"), never three or
+    # more, so a comma between two long numbers is a list separator.
+    upper = _RE_NUM_LIST.sub(lambda m: m.group(0).replace(",", " "), upper)
+    return upper, ambiguous
+
+
+def _is_plain_fx(symbol):
+    s = (symbol or "").upper()
+    return (len(s) >= 6 and s[:6].isalpha()
+            and s[:3] in _FIAT and s[3:6] in _FIAT)
+
+
 def _looks_like_instrument(tok, extra):
     if any(ch.isdigit() for ch in tok):
         return True
@@ -401,6 +486,13 @@ def parse_signal(text, extra_symbols=None):
         raise Refusal("empty_message")
 
     upper = cleaned.upper()
+
+    # LONG/BUY -> BUY, BTC/USDT -> BTCUSDT, 84,000 -> 84000. Before anything
+    # counts words, so every path below sees the normalised text.
+    upper = _RE_DIR_PAIR.sub(lambda m: "BUY" if (m.group(1) or "") else "SELL",
+                             upper)
+    upper = _join_slash_pairs(upper)
+    upper, comma_ambiguous = _strip_thousands(upper)
 
     # Spelled-out synthetics become one token each, before anything counts
     # words or tokens. Done here so BOTH paths below see them: a closure on
@@ -669,10 +761,36 @@ def parse_signal(text, extra_symbols=None):
         # is as clear a statement as naming it inline, so it counts -- but only
         # a LABELLED one, never a loose token from the commentary.
         labelled = _RE_SYMBOL_LABEL.search(upper)
+        # A line that is NOTHING but an instrument counts the same way:
+        #
+        #     LONG/BUY
+        #     BTC/USDT
+        #
+        # The whole line must be the one token -- a symbol mentioned inside a
+        # sentence of commentary is never picked up.
+        alone = [ln.strip(".-|!?* ") for ln in upper.split("\n")]
+        alone = [ln for ln in alone
+                 if re.fullmatch(r"[A-Z0-9()]{2,20}", ln)
+                 and re.search(r"[A-Z]{2}", ln)          # not a bare price
+                 and not re.fullmatch(r"(?:TP|SL|T|TG)\d*", ln)
+                 and _looks_like_instrument(ln, extra)
+                 and ln not in _BUY_WORDS | _SELL_WORDS | _MARKET_WORDS]
         if labelled and _looks_like_instrument(labelled.group(1), extra):
             symbol_raw = labelled.group(1)
+        elif len(set(alone)) == 1:
+            symbol_raw = alone[0]
+        elif len(set(alone)) > 1:
+            raise Refusal("multiple_symbols",
+                          "More than one instrument named "
+                          f"({', '.join(sorted(set(alone)))}).")
         else:
             raise Refusal("no_symbol", "No instrument named.")
+
+    # "84,000" on a currency pair could be 84.000; refuse rather than guess.
+    if comma_ambiguous and _is_plain_fx(_unmask(symbol_raw)):
+        raise Refusal("number_ambiguous",
+                      "A price is written with a comma that could be a decimal "
+                      "point or a thousands separator.")
 
     if entry_price is None:
         entry_price = entry_price_labelled
