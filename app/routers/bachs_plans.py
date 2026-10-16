@@ -108,7 +108,18 @@ PLAN_DAYS = {
 
     # lifetime
     "lifetime": 36500,
+
+    # Telegram Copier subscription ($11.99 / month, recurring). 30 days per
+    # payment; payments.py EXTENDS the subscriber's one Telegram licence
+    # instead of minting a new key each month, and adds the grace days.
+    "telegram": 30,
+    "telegram_copier": 30,
+    "telegrammonthly": 30,
 }
+
+# Plans that are the Telegram Copier subscription rather than a NolimitzBots
+# licence. payments.py routes these to its subscription handler.
+TELEGRAM_PLANS = {"telegram", "telegram_copier", "telegrammonthly"}
 
 
 def _parse_pairs(raw: str) -> dict:
