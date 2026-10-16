@@ -198,6 +198,14 @@ PLAN_FEATURES = {
                  "scans_unlimited": True,
                  "max_mt5_accounts": None,
                  "ai_trader": True, "priority_execution": True},
+    # The $11.99/month Telegram Copier subscription: the user's own channels
+    # copied to ONE MT5 account. No AI robot, no scanner, no master trades
+    # (the copier lanes refuse non-Telegram entries for this plan).
+    "telegram": {"label": "Telegram Copier", "telegram": True, "max_sources": 3,
+                 "scans_per_day": 0,
+                 "scans_unlimited": False,
+                 "max_mt5_accounts": 1,
+                 "ai_trader": False, "priority_execution": False},
 }
 # What every licence had before the rules: today's scanner limit and source cap.
 LEGACY_SCANS_PER_DAY = int(os.getenv("PLAN_SCANS_LEGACY", "6"))
@@ -208,6 +216,8 @@ _PLAN_ALIASES = {
     "30days": "30days", "1month": "30days", "monthly": "30days", "month": "30days",
     "1year": "1year", "annual": "1year", "yearly": "1year", "year": "1year",
     "lifetime": "lifetime",
+    "telegram": "telegram", "telegram_copier": "telegram",
+    "telegrammonthly": "telegram",
 }
 
 UPGRADE_MESSAGE = ("Telegram Copier is included from the 30-day plan. "
@@ -260,9 +270,11 @@ def plan_for(lic: License) -> dict:
     """The package a licence holds and what it unlocks."""
     name = _plan_name(lic)
     created = _aware(lic.created_at)
-    legacy = (PLAN_GATING_FROM is None
-              or created is None
-              or created < PLAN_GATING_FROM)
+    # The Telegram subscription is a new product with its own fixed limits;
+    # the pre-rules "legacy" uplift never applies to it.
+    legacy = name != "telegram" and (PLAN_GATING_FROM is None
+                                     or created is None
+                                     or created < PLAN_GATING_FROM)
     f = dict(PLAN_FEATURES[name])
     if legacy:
         # Bought before the rules: keeps Telegram, the old cap and old scans.
