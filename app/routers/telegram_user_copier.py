@@ -281,6 +281,13 @@ def plan_for(lic: License) -> dict:
         f["telegram"] = True
         f["max_sources"] = max(f["max_sources"], MAX_SOURCES_PER_LICENCE)
         f["scans_per_day"] = max(f["scans_per_day"], LEGACY_SCANS_PER_DAY)
+    snap = lic.branding_snapshot if isinstance(lic.branding_snapshot, dict) else {}
+    if snap.get("product") == "telegram_upgraded":
+        # A Telegram Copier subscriber who bought the AI Trader keeps the
+        # copier on every package -- including 15 days, which does not
+        # otherwise include it -- with at least the channels they had.
+        f["telegram"] = True
+        f["max_sources"] = max(f["max_sources"], PLAN_FEATURES["telegram"]["max_sources"])
     f["plan"] = name
     f["legacy"] = legacy
     return f
