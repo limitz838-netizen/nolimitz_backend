@@ -264,6 +264,84 @@ def _find_signature_header(request: Request, declared: Optional[str]) -> tuple:
     return None, None
 
 
+# ---- payments ledger ---------------------------------------------------------
+# One row per successful charge, so sales can be totalled exactly. Licences are
+# not a ledger: a Telegram renewal extends the same licence row and overwrites
+# its last amount. Read by Jarvis for the daily sales target.
+_LEDGER_READY = False
+
+
+def _ledger(db: Session, *, charge_id, email, product, plan, amount, licence_id):
+    global _LEDGER_READY
+    try:
+        if not _LEDGER_READY:
+            db.execute(text("""
+                create table if not exists payment_ledger (
+                    id          serial primary key,
+                    charge_id   text unique,
+                    email       text,
+                    product     text,
+                    plan        text,
+                    amount_usd  numeric(10,2),
+                    license_id  integer,
+                    created_at  timestamptz not null default now())"""))
+            db.commit()
+            _LEDGER_READY = True
+        try:
+            amt = round(float(amount), 2) if amount not in (None, "") else None
+        except (TypeError, ValueError):
+            amt = None
+        db.execute(text("""
+            insert into payment_ledger (charge_id, email, product, plan, amount_usd, license_id)
+            values (:c, :e, :p, :pl, :a, :l)
+            on conflict (charge_id) do nothing"""),
+            {"c": str(charge_id) if charge_id else None, "e": email, "p": product,
+             "pl": plan, "a": amt, "l": licence_id})
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error("payment ledger write failed for charge %s: %s", charge_id, e)
+
+
+# ---- failed-signature rate limit (per IP, in memory) -------------------------
+WEBHOOK_FAIL_LIMIT = int(os.getenv("WEBHOOK_FAIL_LIMIT", "20"))
+WEBHOOK_FAIL_WINDOW_SEC = int(os.getenv("WEBHOOK_FAIL_WINDOW_SEC", "600"))
+WEBHOOK_BLOCK_SEC = int(os.getenv("WEBHOOK_BLOCK_SEC", "3600"))
+_webhook_fails = {}      # ip -> [timestamps of recent failures]
+_webhook_blocked = {}    # ip -> blocked-until timestamp
+
+
+def _client_ip(request: Request) -> str:
+    # Render sits behind a proxy: the caller is the first X-Forwarded-For entry.
+    fwd = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    return fwd or (request.client.host if request.client else "unknown")
+
+
+def _webhook_ip_blocked(ip: str) -> bool:
+    import time
+    until = _webhook_blocked.get(ip)
+    if until and until > time.time():
+        return True
+    if until:
+        _webhook_blocked.pop(ip, None)
+    return False
+
+
+def _webhook_ip_failed(ip: str):
+    import time
+    now = time.time()
+    recent = [t for t in _webhook_fails.get(ip, []) if now - t < WEBHOOK_FAIL_WINDOW_SEC]
+    recent.append(now)
+    _webhook_fails[ip] = recent
+    if len(recent) >= WEBHOOK_FAIL_LIMIT:
+        _webhook_blocked[ip] = now + WEBHOOK_BLOCK_SEC
+        _webhook_fails.pop(ip, None)
+        logger.warning("webhook: %s blocked for %ss after %s failed signatures",
+                       ip, WEBHOOK_BLOCK_SEC, len(recent))
+    if len(_webhook_fails) > 5000:          # never let the table grow unbounded
+        _webhook_fails.clear()
+
+
 @router.post("/bachs-webhook")
 async def bachs_webhook(
     request: Request,
@@ -277,6 +355,15 @@ async def bachs_webhook(
     reserved for cases where retrying could actually help: a bad signature, or
     a database failure mid-way.
     """
+    # A caller that keeps failing the signature check is guessing. On 16 Oct
+    # 2026 one IP sent >1,000 forged requests in 30 minutes. After enough
+    # failures in a short window it gets a cheap 429 without the body being
+    # read or any signature computed. Real Bachs requests always verify, so
+    # they never count towards this and are never blocked.
+    ip = _client_ip(request)
+    if _webhook_ip_blocked(ip):
+        raise HTTPException(status_code=429, detail="Too many invalid requests")
+
     raw = await request.body()
 
     if os.getenv("BACHS_DEBUG_SIG", "").lower() == "true":
@@ -296,6 +383,7 @@ async def bachs_webhook(
     if not verify_signature(raw, sig, ts):
         # 401, not 200. This endpoint mints licence keys — an unsigned caller
         # who found the URL must get nothing.
+        _webhook_ip_failed(ip)
         logger.warning("rejected webhook with bad or missing signature")
         raise HTTPException(status_code=401, detail="Invalid signature")
 
@@ -429,6 +517,9 @@ async def bachs_webhook(
     db.commit()
     db.refresh(lic)
 
+    _ledger(db, charge_id=charge_id, email=email, product="ai_licence", plan=plan_id,
+            amount=settlement if settlement else PLAN_EXPECTED_USD.get(days),
+            licence_id=lic.id)
     logger.info("licence %s (%s) created for %s — plan %s, %s days, charge %s",
                 lic.id, lic.license_key, email, plan_id, days, charge_id)
 
@@ -650,6 +741,8 @@ def _telegram_subscription_paid(db: Session, *, email, name, charge_id, event_id
         renewed = False
 
     until = _naive_utc(lic.expires_at)
+    _ledger(db, charge_id=charge_id, email=email, product="telegram_copier", plan="telegram",
+            amount=settlement if settlement else TELEGRAM_SUB_PRICE, licence_id=lic.id)
     logger.info("telegram subscription %s for %s — licence %s, active until %s, charge %s",
                 "RENEWED" if renewed else "STARTED", email, lic.id, until, charge_id)
 
