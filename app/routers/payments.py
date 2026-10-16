@@ -96,7 +96,10 @@ BACHS_ADMIN_ID = int(os.getenv("BACHS_ADMIN_ID", "2"))
 # email they are signed in with (GET /payments/telegram-subscription).
 TELEGRAM_GRACE_DAYS = int(os.getenv("TELEGRAM_SUB_GRACE_DAYS", "2"))
 TELEGRAM_SUB_PRICE = float(os.getenv("TELEGRAM_SUB_PRICE", "11.99"))
-APP_URL = os.getenv("APP_URL", "https://app.nolimitzbots.co.ke")
+# The MT5 / Telegram Copier app. NOT app.nolimitzbots.co.ke -- that host serves
+# only the Deriv bots, and the first subscription email sent customers there.
+# A separate variable so an old APP_URL value in Render cannot override it.
+APP_URL = os.getenv("TELEGRAM_APP_URL", "https://nolimitzbots.co.ke").rstrip("/")
 WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
 
 # NOTE: the PLAN_DAYS dict that used to live here has been REMOVED, not moved.
@@ -551,18 +554,10 @@ def _telegram_subscription_paid(db: Session, *, email, name, charge_id, event_id
     try:
         sent, detail = send_email(
             to=email,
-            subject="Your Telegram Copier is active" if not renewed
+            subject="Your Telegram Copier is active - how to start" if not renewed
                     else "Your Telegram Copier subscription is renewed",
-            html=(
-                "<p>Hi%s,</p>"
-                "<p>Thank you — your <b>NolimitzBots Telegram Copier</b> is active until "
-                "<b>%s UTC</b>.</p>"
-                "<p>Open the app and sign in with <b>%s</b> (the same email you paid with). "
-                "Your Telegram Copier unlocks automatically — connect your Telegram, add your "
-                "channels and connect your MT5 account.</p>"
-                "<p><a href=\"%s\">Open NolimitzBots</a></p>"
-            ) % ((" " + name) if name else "", until.strftime("%d %b %Y %H:%M"),
-                 email, APP_URL),
+            html=telegram_welcome_html(name=name, email=email, until=until,
+                                       renewed=renewed),
         )
         if not sent:
             logger.error("telegram subscription email failed for %s: %s", email, detail)
@@ -573,6 +568,58 @@ def _telegram_subscription_paid(db: Session, *, email, name, charge_id, event_id
     return {"received": True, "product": "telegram_copier", "license_id": lic.id,
             "renewed": renewed, "active_until": until.isoformat() if until else None,
             "plan": plan_id, "resolved_by": how, "emailed": sent}
+
+
+def telegram_welcome_html(*, name, email, until, renewed=False, intro=""):
+    """The how-to-get-in email for a Telegram Copier subscriber. No key: the
+    app finds the subscription by the email they log in with."""
+    from html import escape
+    hi = escape(" " + name) if name else ""
+    until_txt = until.strftime("%d %b %Y") if until else "-"
+    login = APP_URL + "/login"
+    signup = APP_URL + "/signup"
+    step = ('<tr><td style="vertical-align:top;padding:6px 10px 6px 0;'
+            'font-weight:bold;color:#b8860b">%d.</td>'
+            '<td style="padding:6px 0">%s</td></tr>')
+    steps = [
+        ("<b>Log in with this exact email: %s</b><br>"
+         "Go to <a href=\"%s\">%s</a>. No account yet? "
+         "<a href=\"%s\">Create a free account</a> with this same email. "
+         "If you signed up with email and password, open the confirmation "
+         "email we sent you first (check Spam / Promotions) - you cannot log in "
+         "until it is confirmed.") % (escape(email), login, login, signup),
+        "Your dashboard opens on the <b>Telegram Copier</b>. No licence key is "
+        "needed - your subscription is found from your email.",
+        "Tap <b>MetaTrader 5</b> at the bottom and connect your MT5 account "
+        "(login, password, server). One MT5 account is included.",
+        "Back on <b>Telegram</b>, connect your Telegram account and add up to "
+        "<b>3 channels</b> you already follow.",
+        "In <b>MetaTrader 5</b>, turn on each symbol you want copied (for "
+        "example XAUUSD) and give it a <b>lot size</b>. Symbols that are off or "
+        "have no lot size are skipped.",
+        "New channels start in <b>SHADOW</b> mode: signals show in your feed "
+        "but no trades are placed. When the feed looks right, switch the "
+        "channel to <b>LIVE</b>.",
+    ]
+    rows = "".join(step % (n, t) for n, t in enumerate(steps, 1))
+    head = ("Your NolimitzBots Telegram Copier subscription is renewed."
+            if renewed else
+            "Thank you - your NolimitzBots Telegram Copier is active.")
+    return (
+        '<div style="font-family:Arial,sans-serif;font-size:15px;line-height:1.5;'
+        'color:#222;max-width:560px">'
+        "<p>Hi%s,</p>%s<p>%s Active until <b>%s</b>.</p>"
+        "<p><b>How to start copying:</b></p>"
+        '<table style="border-collapse:collapse">%s</table>'
+        '<p style="margin:22px 0"><a href="%s" style="background:#c9a227;'
+        "color:#111;padding:12px 22px;border-radius:8px;text-decoration:none;"
+        'font-weight:bold">Log in to NolimitzBots</a></p>'
+        '<p style="font-size:13px;color:#666">Your plan copies your own Telegram '
+        "channels to one MT5 account. It does not include the AI robot or master "
+        "account trades. Trading carries risk - use lot sizes your account can "
+        "carry. Need help? Use the WhatsApp button on our website.</p>"
+        "</div>"
+    ) % (hi, intro, head, until_txt, rows, login)
 
 
 @router.get("/telegram-subscription")
