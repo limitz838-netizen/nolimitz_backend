@@ -996,6 +996,175 @@ def telegram_upgrade_sweep(
     return {"checked": len(ids), "switched_to_telegram": changed}
 
 
+# ==============================================================================
+# JARVIS  --  read-only business brief for the desktop assistant
+# ==============================================================================
+# The desktop Jarvis runs on the owner's PC, which must never reach the
+# database (the Postgres allowlist stays VPS-only). It asks these two
+# endpoints instead. Both are read-only, return no licence keys, and mask
+# every email. The VPS Jarvis posts its health findings here so the desktop
+# can speak them too.
+JARVIS_API_TOKEN = os.getenv("JARVIS_API_TOKEN", "")
+JARVIS_TZ = float(os.getenv("JARVIS_TZ_OFFSET_HOURS", "3"))
+JARVIS_TARGET = float(os.getenv("JARVIS_DAILY_TARGET", "160"))
+_jarvis_vps = {"at": None, "problems": []}
+
+
+def _require_jarvis(token):
+    if not JARVIS_API_TOKEN:
+        raise HTTPException(status_code=503, detail="JARVIS_API_TOKEN is not configured")
+    if not token or not hmac.compare_digest(token, JARVIS_API_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def _mask_email(e):
+    e = str(e or "")
+    if "@" not in e:
+        return "a customer"
+    n, d = e.split("@", 1)
+    return n[:2] + "***@" + d
+
+
+def _plan_label(product, plan):
+    if product == "telegram_copier":
+        return "Telegram Copier"
+    return {"15days": "15-day licence", "30days": "30-day licence", "1year": "1-year licence",
+            "lifetime": "lifetime licence"}.get(plan or "", "AI Trader licence")
+
+
+def _local_day_bounds(day):
+    start = datetime(day.year, day.month, day.day) - timedelta(hours=JARVIS_TZ)
+    return start, start + timedelta(days=1)
+
+
+def _sales_between(db, start, end):
+    rows, seen = [], set()
+    has_ledger = db.execute(text("select to_regclass('public.payment_ledger') is not null")).scalar()
+    if has_ledger:
+        for r in db.execute(text("""
+                select created_at, product, plan, coalesce(amount_usd, 0) as amt, email, charge_id
+                  from payment_ledger where created_at >= :a and created_at < :b"""),
+                {"a": start, "b": end}).fetchall():
+            rows.append((r.created_at, r.product, r.plan, float(r.amt), r.email))
+            if r.charge_id:
+                seen.add(r.charge_id)
+    for r in db.execute(text("""
+            select created_at,
+                   coalesce(branding_snapshot::jsonb ->> 'product', 'ai_licence') as product,
+                   coalesce(branding_snapshot::jsonb ->> 'bachs_plan_id', '') as plan,
+                   coalesce(nullif(branding_snapshot::jsonb ->> 'bachs_settlement', ''), '0') as amt,
+                   client_email,
+                   coalesce(branding_snapshot::jsonb ->> 'bachs_charge_id', '') as cid
+              from licenses
+             where branding_snapshot::jsonb ->> 'source' = 'bachs'
+               and created_at >= :a and created_at < :b"""), {"a": start, "b": end}).fetchall():
+        if r.cid and r.cid in seen:
+            continue
+        try:
+            amt = float(r.amt)
+        except ValueError:
+            amt = 0.0
+        rows.append((r.created_at, r.product, r.plan, amt, r.client_email))
+    rows.sort(key=lambda x: x[0])
+    return rows
+
+
+def _sales_payload(db, day):
+    rows = _sales_between(db, *_local_day_bounds(day))
+    total = round(sum(r[3] for r in rows), 2)
+    return {
+        "date": day.isoformat(), "total_usd": total, "count": len(rows),
+        "target_usd": JARVIS_TARGET, "target_reached": total >= JARVIS_TARGET,
+        "payments": [{"time": (_naive_utc(t) + timedelta(hours=JARVIS_TZ)).strftime("%H:%M"),
+                      "what": _plan_label(p, pl), "usd": a, "customer": _mask_email(e)}
+                     for t, p, pl, a, e in rows],
+    }
+
+
+@router.post("/jarvis/vps-status")
+def jarvis_vps_status(payload: dict, x_worker_token: Optional[str] = Header(None)):
+    _require_worker(x_worker_token)
+    _jarvis_vps["at"] = datetime.utcnow()
+    _jarvis_vps["problems"] = [str(p)[:300] for p in (payload or {}).get("problems", [])][:50]
+    return {"ok": True}
+
+
+@router.get("/jarvis/sales")
+def jarvis_sales(date: str, x_jarvis_token: Optional[str] = Header(None),
+                 db: Session = Depends(get_db)):
+    _require_jarvis(x_jarvis_token)
+    try:
+        day = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    return _sales_payload(db, day)
+
+
+@router.get("/jarvis/brief")
+def jarvis_brief(x_jarvis_token: Optional[str] = Header(None), db: Session = Depends(get_db)):
+    _require_jarvis(x_jarvis_token)
+    local_now = datetime.utcnow() + timedelta(hours=JARVIS_TZ)
+    today = local_now.date()
+    out = {"now_local": local_now.strftime("%A %d %B %Y, %H:%M"), "timezone": "Nairobi"}
+    out["sales_today"] = _sales_payload(db, today)
+    y = _sales_payload(db, today - timedelta(days=1))
+    out["sales_yesterday"] = {k: y[k] for k in ("date", "total_usd", "count", "target_reached")}
+    week = []
+    for i in range(6, -1, -1):
+        d = today - timedelta(days=i)
+        rows = _sales_between(db, *_local_day_bounds(d))
+        week.append({"date": d.isoformat(), "total_usd": round(sum(r[3] for r in rows), 2),
+                     "count": len(rows)})
+    out["sales_last_7_days"] = week
+
+    def one(sql):
+        try:
+            return db.execute(text(sql)).scalar()
+        except Exception:
+            db.rollback()
+            return None
+
+    out["customers"] = {
+        "telegram_copier_active": one("""select count(*) from licenses where is_active and expires_at > now()
+            and branding_snapshot::jsonb ->> 'product' in ('telegram_copier','telegram_upgraded')"""),
+        "ai_licences_active": one("""select count(*) from licenses where is_active
+            and (expires_at is null or expires_at > now())
+            and coalesce(branding_snapshot::jsonb ->> 'product','') <> 'telegram_copier'"""),
+        "expiring_in_3_days": one("""select count(*) from licenses where is_active
+            and expires_at between now() and now() + interval '3 days'"""),
+        "expiring_in_7_days": one("""select count(*) from licenses where is_active
+            and expires_at between now() and now() + interval '7 days'"""),
+    }
+    out["mt5_accounts"] = {
+        "active": one("select count(*) from client_mt5_accounts where is_active"),
+        "active_not_verified": one("select count(*) from client_mt5_accounts where is_active and not is_verified"),
+    }
+    try:
+        by = {r.status: r.n for r in db.execute(text("""
+            select status, count(*) as n from trade_executions
+             where event_type = 'open' and created_at > now() - interval '24 hours'
+             group by 1""")).fetchall()}
+        top = db.execute(text("""
+            select left(error_message, 80) as w, count(*) as n from trade_executions
+             where event_type = 'open' and status = 'failed'
+               and created_at > now() - interval '24 hours'
+             group by 1 order by 2 desc limit 3""")).fetchall()
+        out["copied_trades_24h"] = {"opened": by.get("executed", 0), "failed": by.get("failed", 0),
+                                    "skipped": by.get("skipped", 0), "pending": by.get("pending", 0),
+                                    "top_failures": [{"reason": r.w, "count": r.n} for r in top]}
+    except Exception:
+        db.rollback()
+    at = _jarvis_vps["at"]
+    out["vps"] = {
+        "last_report_seconds_ago": int((datetime.utcnow() - at).total_seconds()) if at else None,
+        "problems": _jarvis_vps["problems"] if at else [],
+        "note": ("VPS Jarvis has not reported since the backend restarted" if not at else
+                 "VPS Jarvis is silent - the VPS or Jarvis may be down"
+                 if (datetime.utcnow() - at).total_seconds() > 300 else "reporting"),
+    }
+    return out
+
+
 @router.get("/bachs-webhook")
 def bachs_webhook_health():
     """So a browser hit tells you the route exists — and what it is configured
