@@ -466,9 +466,85 @@ def _telegram_licence_for(db: Session, email: str):
     row = db.execute(text("""
         select id from licenses
          where lower(client_email) = lower(:e)
-           and branding_snapshot::jsonb ->> 'product' = 'telegram_copier'
+           and branding_snapshot::jsonb ->> 'product' in ('telegram_copier', 'telegram_upgraded')
          order by id desc limit 1"""), {"e": email}).first()
     return db.query(License).filter(License.id == row.id).first() if row else None
+
+
+# ------------------------------------------------------------------------------
+# UPGRADE: a Telegram Copier subscriber enters an AI Trader licence key.
+#
+# The subscriber's OWN licence is upgraded in place rather than switching them
+# to the new key. Their MT5 account, Telegram session, channels, symbol
+# settings and any open Telegram trades all hang off this licence's id, so
+# moving to another licence would strand them (and open Telegram trades would
+# lose their closes). The purchased key is retired so it cannot be used twice.
+#
+#   product          telegram_copier  ->  telegram_upgraded
+#                    (the copier lanes only fence off 'telegram_copier', so an
+#                     upgraded licence gets master and AI trades again)
+#   bachs_plan_id    telegram         ->  the purchased plan (30days, 1year...)
+#   expires_at       the later of the two -- AI Trader and Telegram Copier now
+#                    end on the same day
+#
+# Telegram payments made while upgraded are banked as tg_credit_days and turn
+# into Telegram-only time when the upgraded period ends (_settle_upgrade).
+# ------------------------------------------------------------------------------
+def _product(lic) -> str:
+    snap = lic.branding_snapshot if isinstance(lic.branding_snapshot, dict) else {}
+    return str(snap.get("product") or "")
+
+
+def _to_telegram_only(lic, now):
+    snap = dict(lic.branding_snapshot or {})
+    snap.update({"product": "telegram_copier", "bachs_plan_id": "telegram",
+                 "downgraded_at": now.isoformat()})
+    lic.branding_snapshot = snap
+    lic.ai_enabled = False
+
+
+def _settle_upgrade(db: Session, lic) -> bool:
+    """An upgraded licence whose period has ended: if Telegram payments were
+    banked during it, it carries on as Telegram-only for that many days.
+    Returns True if it changed anything."""
+    if lic is None or _product(lic) != "telegram_upgraded":
+        return False
+    now = datetime.utcnow()
+    exp = _naive_utc(lic.expires_at)
+    if exp is None or exp > now:
+        return False
+    snap = dict(lic.branding_snapshot or {})
+    credit = int(snap.get("tg_credit_days") or 0)
+    if credit <= 0:
+        return False
+    _to_telegram_only(lic, now)
+    snap = dict(lic.branding_snapshot)
+    snap["tg_credit_days"] = 0
+    lic.branding_snapshot = snap
+    lic.expires_at = (now + timedelta(days=credit)
+                      + timedelta(days=TELEGRAM_GRACE_DAYS)).replace(tzinfo=timezone.utc)
+    lic.is_active = True
+    db.commit()
+    db.refresh(lic)
+    logger.info("upgraded licence %s ended — %s banked Telegram day(s) now running",
+                lic.id, credit)
+    return True
+
+
+def _confirm_app_account(email: str):
+    """Ask the app to confirm this email's account, so a subscriber who never
+    clicked the sign-up confirmation can still log in straight away. Best
+    effort: a failure here never affects the payment."""
+    url = os.getenv("APP_CONFIRM_URL",
+                    "https://mtbdwsarjwlshogszohb.supabase.co/functions/v1/telegram-paid-confirm")
+    if not url or not WORKER_TOKEN:
+        return
+    try:
+        import requests
+        requests.post(url, json={"email": email},
+                      headers={"X-Worker-Token": WORKER_TOKEN}, timeout=6)
+    except Exception as e:
+        logger.warning("app account confirm call failed for %s: %s", email, e)
 
 
 def _telegram_subscription_paid(db: Session, *, email, name, charge_id, event_id,
@@ -490,8 +566,35 @@ def _telegram_subscription_paid(db: Session, *, email, name, charge_id, event_id
     grace = timedelta(days=TELEGRAM_GRACE_DAYS)
     cid = str(charge_id) if charge_id else None
     lic = _telegram_licence_for(db, email)
+    banked = False
+    _settle_upgrade(db, lic)
 
-    if lic:
+    if lic and _product(lic) == "telegram_upgraded":
+        exp = _naive_utc(lic.expires_at)
+        snap = dict(lic.branding_snapshot or {})
+        ids = list(snap.get("bachs_charge_ids") or [])
+        if cid and cid not in ids:
+            ids.append(cid)
+        snap.update({"bachs_charge_ids": ids[-60:], "last_charge_id": cid,
+                     "last_event_id": event_id, "bachs_resolved_by": how})
+        if exp and exp > now:
+            # Already covered by the AI Trader licence: bank the days, they
+            # become Telegram-only time when that licence period ends.
+            snap["tg_credit_days"] = int(snap.get("tg_credit_days") or 0) + int(days)
+            lic.branding_snapshot = snap
+            db.commit()
+            db.refresh(lic)
+            banked = True
+        else:
+            # Upgrade period over and nothing banked: back to Telegram-only.
+            lic.branding_snapshot = snap
+            _to_telegram_only(lic, now)
+            db.commit()
+            db.refresh(lic)
+
+    if banked:
+        renewed = True
+    elif lic:
         exp = _naive_utc(lic.expires_at)
         base = max(now, exp - grace) if exp else now
         lic.expires_at = (base + timedelta(days=days) + grace).replace(tzinfo=timezone.utc)
@@ -550,15 +653,30 @@ def _telegram_subscription_paid(db: Session, *, email, name, charge_id, event_id
     logger.info("telegram subscription %s for %s — licence %s, active until %s, charge %s",
                 "RENEWED" if renewed else "STARTED", email, lic.id, until, charge_id)
 
+    _confirm_app_account(email)
+
     # No key in the email: the app finds the subscription by this address.
     try:
-        sent, detail = send_email(
-            to=email,
-            subject="Your Telegram Copier is active - how to start" if not renewed
-                    else "Your Telegram Copier subscription is renewed",
-            html=telegram_welcome_html(name=name, email=email, until=until,
-                                       renewed=renewed),
-        )
+        if banked:
+            credit = int((lic.branding_snapshot or {}).get("tg_credit_days") or 0)
+            sent, detail = send_email(
+                to=email,
+                subject="Telegram Copier payment received",
+                html=("<p>Thank you%s. Your AI Trader licence already includes the "
+                      "Telegram Copier until <b>%s UTC</b>, so this payment has been "
+                      "saved: you have <b>%s day(s)</b> of Telegram Copier waiting after "
+                      "that date.</p><p>If you plan to keep the AI Trader licence, you can "
+                      "cancel the monthly Telegram Copier subscription.</p>")
+                     % ((" " + name) if name else "", until.strftime("%d %b %Y"), credit),
+            )
+        else:
+            sent, detail = send_email(
+                to=email,
+                subject="Your Telegram Copier is active - how to start" if not renewed
+                        else "Your Telegram Copier subscription is renewed",
+                html=telegram_welcome_html(name=name, email=email, until=until,
+                                           renewed=renewed),
+            )
         if not sent:
             logger.error("telegram subscription email failed for %s: %s", email, detail)
     except Exception as e:
@@ -642,11 +760,147 @@ def telegram_subscription_lookup(
     lic = _telegram_licence_for(db, email)
     if not lic:
         return {"found": False}
+    _settle_upgrade(db, lic)
     until = _naive_utc(lic.expires_at)
+    if until is None and _product(lic) == "telegram_upgraded":
+        until = datetime(2126, 1, 1)          # lifetime key: no end date
     active = bool(lic.is_active) and until is not None and until > datetime.utcnow()
+    upgraded = _product(lic) == "telegram_upgraded"
+    snap = lic.branding_snapshot if isinstance(lic.branding_snapshot, dict) else {}
     return {"found": True, "active": active, "license_key": lic.license_key,
             "expires_at": until.isoformat() + "Z" if until else None,
-            "plan": "telegram", "max_sources": 3, "max_mt5_accounts": 1}
+            # True while this subscriber has also bought the AI Trader: the app
+            # then shows the full dashboard on this same licence.
+            "upgraded": upgraded,
+            "plan": str(snap.get("bachs_plan_id") or "telegram") if upgraded else "telegram",
+            "tg_credit_days": int(snap.get("tg_credit_days") or 0),
+            "max_sources": 3, "max_mt5_accounts": 1}
+
+
+def _require_worker(x_worker_token):
+    if not WORKER_TOKEN:
+        raise HTTPException(status_code=503, detail="WORKER_TOKEN is not configured")
+    if not x_worker_token or not hmac.compare_digest(x_worker_token, WORKER_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid worker token")
+
+
+@router.post("/telegram-upgrade")
+def telegram_upgrade(
+    payload: dict,
+    x_worker_token: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    """For the app's server function ONLY (worker token). A Telegram Copier
+    subscriber enters a purchased AI Trader key: upgrade THEIR licence in place
+    and retire the key. The app has already checked the user is signed in as
+    `email` and that no other account holds the key."""
+    _require_worker(x_worker_token)
+    email = str((payload or {}).get("email") or "").strip()
+    key = str((payload or {}).get("license_key") or "").strip().upper()
+    if not email or "@" not in email or not key:
+        raise HTTPException(status_code=400, detail="email and license_key required")
+
+    tg = _telegram_licence_for(db, email)
+    if not tg:
+        raise HTTPException(status_code=404,
+                            detail="No Telegram Copier subscription found for this email.")
+    _settle_upgrade(db, tg)
+
+    bought = (db.query(License)
+                .filter(text("upper(trim(license_key)) = :k")).params(k=key).first())
+    if not bought:
+        raise HTTPException(status_code=404,
+                            detail="Licence key not found. Check the key and try again.")
+    if bought.id == tg.id:
+        raise HTTPException(status_code=400,
+                            detail="That is your Telegram Copier key, not an AI Trader key.")
+    bsnap = bought.branding_snapshot if isinstance(bought.branding_snapshot, dict) else {}
+    if bsnap.get("product") in ("telegram_copier", "telegram_upgraded") \
+            or bsnap.get("merged_into_license_id"):
+        raise HTTPException(status_code=400,
+                            detail="This key cannot be used for an upgrade.")
+    now = datetime.utcnow()
+    bexp = _naive_utc(bought.expires_at)
+    if not bought.is_active:
+        raise HTTPException(status_code=403, detail="This licence key is inactive.")
+    if bexp is not None and bexp <= now:
+        raise HTTPException(status_code=403, detail="This licence key has expired.")
+    in_use = db.execute(text(
+        "select count(*) from client_mt5_accounts where license_id = :i"),
+        {"i": bought.id}).scalar() or 0
+    if in_use or bought.activated_device_id:
+        raise HTTPException(status_code=409,
+                            detail="This key is already in use on another account. "
+                                   "Contact support if this is your key.")
+
+    # Which package was bought -- the copier's own reading of a licence, so
+    # scanner limits, MT5 accounts and channels follow the purchased plan.
+    from app.routers.telegram_user_copier import _plan_name
+    plan = _plan_name(bought)
+
+    texp = _naive_utc(tg.expires_at)
+    snap = dict(tg.branding_snapshot or {})
+    credit = int(snap.get("tg_credit_days") or 0)
+    if bexp is None:                       # lifetime key
+        new_exp = None
+    elif _product(tg) == "telegram_upgraded":
+        # A second key on an already-upgraded licence extends it.
+        new_exp = max(d for d in (texp, bexp) if d is not None)
+    elif texp is not None and texp > bexp:
+        # Telegram has more time left than the key: the AI Trader ends with the
+        # key, and the remaining Telegram days carry on after it.
+        new_exp = bexp
+        credit += int(-(-(texp - bexp).total_seconds() // 86400))   # round up
+    else:
+        new_exp = bexp
+    snap["tg_credit_days"] = credit
+    history = list(snap.get("upgrades") or [])
+    history.append({"from_license_id": bought.id, "plan": plan,
+                    "at": now.isoformat(),
+                    "tg_expires_before": texp.isoformat() if texp else None})
+    snap.update({"product": "telegram_upgraded", "bachs_plan_id": plan,
+                 "upgraded_at": now.isoformat(), "upgrades": history[-20:]})
+    tg.branding_snapshot = snap
+    tg.expires_at = new_exp.replace(tzinfo=timezone.utc) if new_exp else None
+    tg.is_active = True
+    tg.ai_enabled = True
+    tg.mt5_enabled = True
+    if getattr(bought, "mode_type", None):
+        tg.mode_type = bought.mode_type
+
+    bsnap = dict(bsnap)
+    bsnap.update({"merged_into_license_id": tg.id, "merged_at": now.isoformat()})
+    bought.branding_snapshot = bsnap
+    bought.is_active = False
+    db.commit()
+    db.refresh(tg)
+    logger.info("telegram licence %s upgraded with key licence %s (%s) — now until %s",
+                tg.id, bought.id, plan, _naive_utc(tg.expires_at))
+    until = _naive_utc(tg.expires_at)
+    return {"upgraded": True, "license_key": tg.license_key, "plan": plan,
+            "expires_at": until.isoformat() + "Z" if until else None}
+
+
+@router.post("/telegram-upgrade-sweep")
+def telegram_upgrade_sweep(
+    x_worker_token: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    """Scheduler only (worker token): upgraded licences whose period has ended
+    and that have banked Telegram days switch to Telegram-only time."""
+    _require_worker(x_worker_token)
+    ids = [r.id for r in db.execute(text("""
+        select id from licenses
+         where branding_snapshot::jsonb ->> 'product' = 'telegram_upgraded'
+           and expires_at <= now()
+           and coalesce((branding_snapshot::jsonb ->> 'tg_credit_days')::int, 0) > 0
+    """)).fetchall()]
+    changed = 0
+    for lid in ids:
+        lic = db.query(License).filter(License.id == lid).first()
+        if _settle_upgrade(db, lic):
+            changed += 1
+    return {"checked": len(ids), "switched_to_telegram": changed}
 
 
 @router.get("/bachs-webhook")
