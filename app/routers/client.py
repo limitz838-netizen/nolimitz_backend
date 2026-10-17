@@ -569,49 +569,8 @@ def stop_client_robot(payload: ClientRobotControlRequest, db: Session = Depends(
     )
 
 
-# =========================
-# WORKER ENDPOINTS
-# =========================
-@router.get("/worker/pending-mt5")
-def worker_pending_mt5(db: Session = Depends(get_db)):
-    rows = db.query(ClientMT5Account).filter(ClientMT5Account.is_verified == False).all()
-    result = []
-    for row in rows:
-        license_row = db.get(License, row.license_id)
-        if license_row:
-            result.append({
-                "license_key": license_row.license_key,
-                "mt_login": row.mt_login,
-                "mt_password": decrypt_text(row.mt_password),
-                "mt_server": row.mt_server,
-            })
-    return result
 
-
-@router.post("/worker/update-mt5-status")
-def worker_update_mt5_status(payload: dict, db: Session = Depends(get_db)):
-    license_key = payload.get("license_key")
-    if not license_key:
-        raise HTTPException(status_code=400, detail="license_key is required")
-
-    license_row = db.query(License).filter(License.license_key == license_key).first()
-    if not license_row:
-        raise HTTPException(status_code=404, detail="License not found")
-
-    row = db.query(ClientMT5Account).filter(
-        ClientMT5Account.license_id == license_row.id
-    ).first()
-    if not row:
-        raise HTTPException(status_code=404, detail="MT5 account not found")
-
-    row.is_verified = payload.get("verified", False)
-    row.is_active = row.is_verified
-    row.account_name = payload.get("account_name")
-    row.broker_name = payload.get("broker_name")
-    row.balance = payload.get("balance")
-    row.equity = payload.get("equity")
-    row.verification_error = payload.get("error")
-    row.last_verified_at = utc_now()
-
-    db.commit()
-    return {"success": True}
+# The old unauthenticated worker routes (GET /client/worker/pending-mt5 and
+# POST /client/worker/update-mt5-status) were removed on 17 Oct 2026: one
+# handed out MT5 passwords and the other let anyone mark an account verified.
+# Nothing uses them - the verifier works on the database directly.
