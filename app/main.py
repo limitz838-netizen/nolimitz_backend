@@ -236,3 +236,10 @@ def custom_openapi():
 
 
 app.openapi = custom_openapi
+
+
+# ------------------------------------------------- Security guard ---
+# Blocks the 17 Oct intruder, closes admin signup, auto-blocks brute force
+# and probing. See app/security_guard.py.
+from app.security_guard import install_security_guard  # noqa: E402
+install_security_guard(app)
