@@ -1,45 +1,16 @@
+"""
+app/ai/routes/worker.py
+
+The old GET /api/worker/active-accounts route used to live here. It had NO
+authentication and returned every active MT5 login, password and server, so
+it has been removed (17 Oct 2026). Nothing in the platform calls it: the
+copier lanes, verifier and AI workers read the database directly.
+
+The empty router stays so app/main.py keeps importing it unchanged.
+"""
 from fastapi import APIRouter
-from app.database import SessionLocal
-from app.models import ClientMT5Account
 
 router = APIRouter(
     prefix="/api/worker",
     tags=["Worker"]
 )
-
-@router.get("/active-accounts")
-def get_active_accounts():
-
-    db = SessionLocal()
-
-    accounts = (
-        db.query(ClientMT5Account)
-        .filter(
-            ClientMT5Account.is_active == True,
-            ClientMT5Account.ai_auto_trade == True
-        )
-        .all()
-    )
-
-    result = []
-
-    for acc in accounts:
-
-        result.append({
-
-            "id": acc.id,
-
-            "login": acc.login,
-
-            "password": acc.password,
-
-            "server": acc.server,
-
-            "risk_percent": acc.risk_percent,
-
-            "max_ai_trades": acc.max_ai_trades
-        })
-
-    db.close()
-
-    return result
