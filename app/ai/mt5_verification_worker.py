@@ -63,7 +63,6 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
-<<<<<<< HEAD
 from app.models import ClientMT5Account, WorkerHeartbeat
 
 # ★ Credential decryption — passwords are encrypted at rest by the API when
@@ -75,10 +74,7 @@ try:
 except Exception:
     def decrypt_secret(v):
         return v
-=======
-from app.models import ClientMT5Account
 from app.ai.day_pnl import realised_pnl_today
->>>>>>> ac9644e2413587c8038b619890b78ab86cda69cc
 
 # The Windows worker is the ONLY thing that touches MT5, so it owns its own
 # terminal lock. The Render API no longer imports MetaTrader5 at all.
