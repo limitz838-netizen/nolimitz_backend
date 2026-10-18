@@ -200,7 +200,7 @@ class Desk:
         info = mt5.account_info()
         if info and info.login == self.cfg.LOGIN:
             return True
-        self.event("guard", "MT5 disconnected Â· reconnecting", level="warn")
+        self.event("guard", "MT5 disconnected \u00b7 reconnecting", level="warn")
         for attempt in range(3):
             if self.connect():
                 self.event("guard", "MT5 reconnected", level="ok")
@@ -315,7 +315,7 @@ class Desk:
             self.day = today
             self.day_start_balance = info.balance
             if self.day is not None:
-                self.event("chief", f"new UTC day {today} Â· start balance {fmt(info.balance)} {info.currency}")
+                self.event("chief", f"new UTC day {today} \u00b7 start balance {fmt(info.balance)} {info.currency}")
 
     def day_counts(self):
         start = datetime.combine(self.day, datetime.min.time(), tzinfo=timezone.utc)
@@ -327,12 +327,12 @@ class Desk:
 
     def guard_blocks(self, info, canon: str) -> Optional[str]:
         if not self.is_demo(info) and not self.cfg.ALLOW_REAL:
-            return "real account Â· Desk only trades demo until DESK_ALLOW_REAL=true"
+            return "real account \u00b7 Desk only trades demo until DESK_ALLOW_REAL=true"
         entries, losses = self.day_counts()
         if entries >= S.MAX_ENTRIES_PER_DAY:
-            return f"day limit Â· {entries}/{S.MAX_ENTRIES_PER_DAY} entries used"
+            return f"day limit \u00b7 {entries}/{S.MAX_ENTRIES_PER_DAY} entries used"
         if losses >= S.MAX_LOSSES_PER_DAY:
-            return f"day limit Â· {losses} losses, done for today"
+            return f"day limit \u00b7 {losses} losses, done for today"
         if self.day_start_balance:
             dd = (info.equity - self.day_start_balance) / self.day_start_balance * 100
             if dd <= -self.cfg.DAILY_LOSS_PCT:
@@ -350,19 +350,19 @@ class Desk:
         d = S.evaluate(h1, bias)
         self.decision[canon] = d
         bar_t = datetime.fromtimestamp(h1[-1]["t"] + 3600, timezone.utc).strftime("%H:%M")
-        self.event("scout", f"{canon} H1 {bar_t} UTC Â· {d.scout}", canon, "ok" if d.signal else "info",
+        self.event("scout", f"{canon} H1 {bar_t} UTC \u00b7 {d.scout}", canon, "ok" if d.signal else "info",
                    {"bias": bias, "atr": round(d.atr, 3), "atr_ratio": round(d.atr_ratio, 2),
                     "ema20": round(d.ema20, s["digits"]), "close": d.close, "checks": d.checks})
         if not d.signal:
             return
         side = "long" if d.signal > 0 else "short"
         if not act:
-            self.event("guard", f"{canon} {side} signal is from before startup Â· not traded", canon, "warn")
+            self.event("guard", f"{canon} {side} signal is from before startup \u00b7 not traded", canon, "warn")
             return
 
         blocked = self.guard_blocks(info, canon)
         if blocked:
-            self.event("guard", f"{canon} {side} blocked Â· {blocked}", canon, "warn")
+            self.event("guard", f"{canon} {side} blocked \u00b7 {blocked}", canon, "warn")
             return
 
         tick = mt5.symbol_info_tick(s["broker"])
@@ -374,7 +374,7 @@ class Desk:
             self.event("check", f"{canon} spread {fmt(spread, s['digits'])} too wide "
                                 f"({spread / d.atr:.0%} of ATR)", canon, "warn")
             return
-        self.event("check", f"{canon} spread {fmt(spread, s['digits'])} Â· {spread / d.atr:.0%} of ATR Â· ok", canon, "ok")
+        self.event("check", f"{canon} spread {fmt(spread, s['digits'])} \u00b7 {spread / d.atr:.0%} of ATR \u00b7 ok", canon, "ok")
 
         # ---- size: risk RISK_PCT of balance over the stop distance
         price = tick.ask if d.signal > 0 else tick.bid
@@ -382,7 +382,7 @@ class Desk:
         stop_px = price - d.signal * d.stop_distance
         loss1 = mt5.order_calc_profit(otype, s["broker"], 1.0, price, stop_px)
         if not loss1:
-            self.event("size", f"{canon} could not price the stop Â· skipped", canon, "error")
+            self.event("size", f"{canon} could not price the stop \u00b7 skipped", canon, "error")
             return
         risk_usd = info.balance * self.cfg.RISK_PCT / 100
         raw = risk_usd / abs(loss1)
@@ -392,23 +392,23 @@ class Desk:
             min_risk = abs(loss1) * s["vmin"]
             if min_risk > risk_usd * 1.5:
                 self.event("size", f"{canon} min lot {s['vmin']} risks ${fmt(min_risk)} > "
-                                   f"{self.cfg.RISK_PCT}% Â· skipped", canon, "warn")
+                                   f"{self.cfg.RISK_PCT}% \u00b7 skipped", canon, "warn")
                 return
             lot = s["vmin"]
         margin = mt5.order_calc_margin(otype, s["broker"], lot, price)
         if margin is not None and margin > info.margin_free * 0.5:
-            self.event("size", f"{canon} {lot} lots needs ${fmt(margin)} margin Â· too much Â· skipped", canon, "warn")
+            self.event("size", f"{canon} {lot} lots needs ${fmt(margin)} margin \u00b7 too much \u00b7 skipped", canon, "warn")
             return
         real_risk = abs(loss1) * lot
-        self.event("size", f"{canon} {lot} lots Â· risk ${fmt(real_risk)} "
-                           f"({real_risk / info.balance:.1%}) Â· stop {fmt(d.stop_distance, s['digits'])}",
+        self.event("size", f"{canon} {lot} lots \u00b7 risk ${fmt(real_risk)} "
+                           f"({real_risk / info.balance:.1%}) \u00b7 stop {fmt(d.stop_distance, s['digits'])}",
                    canon, "ok", {"lot": lot, "risk_usd": round(real_risk, 2), "loss_per_lot": loss1})
 
         sl = round(stop_px, s["digits"])
         tp = round(price + d.signal * d.target_distance, s["digits"])
         if not self.cfg.TRADING_ENABLED:
-            self.event("entry", f"SHADOW Â· would {'buy' if d.signal > 0 else 'sell'} {canon} {lot} @ "
-                                f"{fmt(price, s['digits'])} Â· SL {fmt(sl, s['digits'])} Â· TP {fmt(tp, s['digits'])}",
+            self.event("entry", f"SHADOW \u00b7 would {'buy' if d.signal > 0 else 'sell'} {canon} {lot} @ "
+                                f"{fmt(price, s['digits'])} \u00b7 SL {fmt(sl, s['digits'])} \u00b7 TP {fmt(tp, s['digits'])}",
                        canon, "warn", {"shadow": True, "price": price, "sl": sl, "tp": tp, "lot": lot})
             return
 
@@ -417,7 +417,7 @@ class Desk:
                "comment": f"desk {side}", "type_time": mt5.ORDER_TIME_GTC}
         res = self._send(req)
         if res is None or res.retcode != getattr(mt5, "TRADE_RETCODE_DONE", 10009):
-            self.event("entry", f"{canon} order rejected Â· {getattr(res, 'retcode', '?')} "
+            self.event("entry", f"{canon} order rejected \u00b7 {getattr(res, 'retcode', '?')} "
                                 f"{getattr(res, 'comment', mt5.last_error())}", canon, "error")
             return
         pos = None
@@ -435,8 +435,8 @@ class Desk:
                               target=pos.tp if pos and pos.tp else tp, atr_at_entry=d.atr, risk_usd=real_risk,
                               opened_at=now_utc(), is_demo=self.is_demo(info)))
         self._commit()
-        self.event("entry", f"{side.upper()} {canon} {lot} @ {fmt(fill, s['digits'])} Â· "
-                            f"SL {fmt(sl, s['digits'])} Â· TP {fmt(tp, s['digits'])}",
+        self.event("entry", f"{side.upper()} {canon} {lot} @ {fmt(fill, s['digits'])} \u00b7 "
+                            f"SL {fmt(sl, s['digits'])} \u00b7 TP {fmt(tp, s['digits'])}",
                    canon, "ok", {"ticket": ticket, "lot": lot, "price": fill, "sl": sl, "tp": tp})
 
     # ---------------------------------------------------------- management ---
@@ -453,7 +453,7 @@ class Desk:
             # H4 bias flip against us -> close
             if self.bias.get(canon, 0) == -row.direction:
                 if self.close_position(pos, "bias flip"):
-                    self.event("exit", f"{canon} H4 trend flipped Â· closing", canon, "warn")
+                    self.event("exit", f"{canon} H4 trend flipped \u00b7 closing", canon, "warn")
                 continue
             # best price since entry -> breakeven / trail
             opened = row.opened_at if row.opened_at.tzinfo else row.opened_at.replace(tzinfo=timezone.utc)
@@ -483,7 +483,7 @@ class Desk:
                 row.current_stop = new
                 self._commit()
                 what = "breakeven" if abs(new - row.entry_price) < 1e-9 else "trailing stop"
-                self.event("exit", f"{canon} {what} â†’ {fmt(new, s['digits'])}", canon, "ok")
+                self.event("exit", f"{canon} {what} \u2192 {fmt(new, s['digits'])}", canon, "ok")
 
     def record_close(self, row: DeskTrade):
         deals = mt5.history_deals_get(position=int(row.ticket)) or []
@@ -519,7 +519,7 @@ class Desk:
         row.exit_reason = reason or "unknown"
         self._commit()
         digits = self.sym.get(row.symbol, {}).get("digits", 2)
-        self.event("exit", f"{row.symbol} closed Â· {row.exit_reason} Â· "
+        self.event("exit", f"{row.symbol} closed \u00b7 {row.exit_reason} \u00b7 "
                            f"{'+' if profit >= 0 else '-'}${fmt(abs(profit))}"
                            + (f" ({row.r_multiple:+.2f}R)" if row.r_multiple is not None else "")
                            + (f" @ {fmt(exit_px, digits)}" if exit_px else ""),
@@ -579,7 +579,7 @@ class Desk:
             "mode": {"trading_enabled": self.cfg.TRADING_ENABLED,
                      "shadow": not self.cfg.TRADING_ENABLED,
                      "risk_pct": self.cfg.RISK_PCT, "daily_loss_pct": self.cfg.DAILY_LOSS_PCT,
-                     "symbols": self.cfg.SYMBOLS, "rules": "H4 EMA50/200 bias Â· H1 EMA20 pullback Â· 1.5/2.5 ATR"},
+                     "symbols": self.cfg.SYMBOLS, "rules": "H4 EMA50/200 bias \u00b7 H1 EMA20 pullback \u00b7 1.5/2.5 ATR"},
             "day": {"date": str(self.day), "start_balance": self.day_start_balance,
                     "entries": entries, "losses": losses,
                     "max_entries": S.MAX_ENTRIES_PER_DAY, "max_losses": S.MAX_LOSSES_PER_DAY},
@@ -635,7 +635,7 @@ class Desk:
         info = mt5.account_info()
         self.roll_day(info)
         if not self.is_demo(info) and not self.cfg.ALLOW_REAL:
-            self.warn_once("real", "guard", "REAL account detected Â· no new trades (DESK_ALLOW_REAL is off)", level="error")
+            self.warn_once("real", "guard", "REAL account detected \u00b7 no new trades (DESK_ALLOW_REAL is off)", level="error")
 
         for canon in self.cfg.SYMBOLS:
             s = self.resolve(canon)
@@ -666,12 +666,12 @@ class Desk:
 
     def run(self):
         mode = "LIVE ORDERS" if self.cfg.TRADING_ENABLED else "SHADOW (no orders)"
-        log.info("Desk worker %s starting Â· symbols=%s Â· risk=%.2f%% Â· %s",
+        log.info("Desk worker %s starting \u00b7 symbols=%s \u00b7 risk=%.2f%% \u00b7 %s",
                  self.cfg.WORKER, ",".join(self.cfg.SYMBOLS), self.cfg.RISK_PCT, mode)
         while not self.connect():
             log.error("retrying MT5 connect in 30s")
             sleep(30)
-        self.event("chief", f"Desk online Â· {mode} Â· {', '.join(self.cfg.SYMBOLS)} Â· risk {self.cfg.RISK_PCT}%",
+        self.event("chief", f"Desk online \u00b7 {mode} \u00b7 {', '.join(self.cfg.SYMBOLS)} \u00b7 risk {self.cfg.RISK_PCT}%",
                    level="ok" if self.cfg.TRADING_ENABLED else "warn")
         first = True
         while True:
