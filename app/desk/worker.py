@@ -19,7 +19,9 @@ launcher .bat can set them per process):
   DESK_MT5_SERVER         required, e.g. Exness-MT5Trial10
   DESK_TERMINAL_PATH      required, e.g. C:\\MT5\\desk\\terminal64.exe
   DESK_PORTABLE           true
-  DESK_SYMBOLS            XAUUSD            (comma list; BTCUSD only after it passes its backtest)
+  DESK_SYMBOLS            XAUUSD            (comma list, e.g. XAUUSD,BTCUSD)
+  DESK_SHADOW_SYMBOLS     (empty)           (symbols that NEVER send orders, even when trading is
+                                             enabled - e.g. BTCUSD until it passes its own backtest)
   DESK_TRADING_ENABLED    false             (false = shadow mode: full pipeline, no orders)
   DESK_ALLOW_REAL         false             (refuses to trade a non-demo account unless true)
   DESK_RISK_PCT           1.0               (risk per trade, % of balance; capped at 2)
@@ -73,6 +75,7 @@ class Cfg:
     PORTABLE = _flag("DESK_PORTABLE", "true")
     SYMBOLS = [s.strip().upper() for s in _env("DESK_SYMBOLS", "XAUUSD").split(",") if s.strip()]
     TRADING_ENABLED = _flag("DESK_TRADING_ENABLED", "false")
+    SHADOW_SYMBOLS = {s.strip().upper() for s in _env("DESK_SHADOW_SYMBOLS", "").split(",") if s.strip()}
     ALLOW_REAL = _flag("DESK_ALLOW_REAL", "false")
     RISK_PCT = min(2.0, max(0.1, float(_env("DESK_RISK_PCT", "1.0"))))
     DAILY_LOSS_PCT = float(_env("DESK_DAILY_LOSS_PCT", "3.0"))
@@ -401,7 +404,7 @@ class Desk:
 
         sl = round(stop_px, s["digits"])
         tp = round(price + d.signal * d.target_distance, s["digits"])
-        if not self.cfg.TRADING_ENABLED:
+        if not self.cfg.TRADING_ENABLED or canon in self.cfg.SHADOW_SYMBOLS:
             self.event("entry", f"SHADOW \u00b7 would {'buy' if d.signal > 0 else 'sell'} {canon} {lot} @ "
                                 f"{fmt(price, s['digits'])} \u00b7 SL {fmt(sl, s['digits'])} \u00b7 TP {fmt(tp, s['digits'])}",
                        canon, "warn", {"shadow": True, "price": price, "sl": sl, "tp": tp, "lot": lot})
@@ -574,7 +577,7 @@ class Desk:
             "mode": {"trading_enabled": self.cfg.TRADING_ENABLED,
                      "shadow": not self.cfg.TRADING_ENABLED,
                      "risk_pct": self.cfg.RISK_PCT, "daily_loss_pct": self.cfg.DAILY_LOSS_PCT,
-                     "symbols": self.cfg.SYMBOLS, "rules": "H4 EMA50/200 bias \u00b7 H1 EMA20 pullback \u00b7 1.5/2.5 ATR"},
+                     "symbols": self.cfg.SYMBOLS, "shadow_symbols": sorted(self.cfg.SHADOW_SYMBOLS), "rules": "H4 EMA50/200 bias \u00b7 H1 EMA20 pullback \u00b7 1.5/2.5 ATR"},
             "day": {"date": str(self.day), "start_balance": self.day_start_balance,
                     "entries": entries, "losses": losses,
                     "daily_loss_limit_pct": self.cfg.DAILY_LOSS_PCT},
@@ -661,6 +664,8 @@ class Desk:
 
     def run(self):
         mode = "LIVE ORDERS" if self.cfg.TRADING_ENABLED else "SHADOW (no orders)"
+        if self.cfg.TRADING_ENABLED and self.cfg.SHADOW_SYMBOLS:
+            mode += " \u00b7 shadow only: " + ",".join(sorted(self.cfg.SHADOW_SYMBOLS))
         log.info("Desk worker %s starting \u00b7 symbols=%s \u00b7 risk=%.2f%% \u00b7 %s",
                  self.cfg.WORKER, ",".join(self.cfg.SYMBOLS), self.cfg.RISK_PCT, mode)
         while not self.connect():
