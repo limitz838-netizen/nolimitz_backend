@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Nolimitz Desk</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@600;700&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>
+/* Nolimitz Desk - live view of the Desk worker. Same layout as the replay demo; every number comes from /api/desk/state. */
+:root{
+  color-scheme: dark;
+  --bg:#06090f; --panel:#0b1019; --panel2:#0f1622; --line:#1a2433; --line2:#243246;
+  --ink:#d7dfea; --dim:#7a8699; --faint:#4a5568;
+  --gold:#f2c94c; --btc:#f7931a; --up:#34d399; --down:#f87171; --cyan:#5ad1e6; --amber:#fbbf24;
+  --mono:"JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --display:"Chakra Petch", "JetBrains Mono", ui-monospace, monospace;
+}
+html,body{background:var(--bg);color:var(--ink);margin:0}
+body{font-family:var(--mono);font-size:13px;padding-left:max(10px, env(safe-area-inset-left,0px));padding-right:max(10px, env(safe-area-inset-right,0px));padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+.app{max-width:620px;margin:0 auto;padding-block:10px 24px;display:flex;flex-direction:column;gap:8px}
+.top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:8px;font-weight:700;letter-spacing:.08em;font-size:13px}
+.badge{font-size:10px;letter-spacing:.1em;padding:2px 6px;border:1px solid var(--cyan);color:var(--cyan);border-radius:3px}
+.badge.live{border-color:var(--up);color:var(--up)}
+.badge.shadow{border-color:var(--amber);color:var(--amber)}
+.badge.off{border-color:var(--down);color:var(--down)}
+.port{font-size:11px;letter-spacing:.08em;padding:3px 8px;border:1px solid var(--gold);color:var(--gold);border-radius:3px;background:rgba(242,201,76,.06)}
+.port b{color:var(--btc);font-weight:500}
+.port b.off{color:var(--faint);text-decoration:line-through}
+.clock{margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:2px;min-width:0}
+.clock .row{display:flex;align-items:center;gap:8px}
+.prog{width:90px;height:4px;background:var(--line);border-radius:2px;overflow:hidden}
+.prog i{display:block;height:100%;background:var(--cyan);width:0}
+.hour{font-size:10px;color:var(--cyan);border:1px solid #1f4a5a;padding:1px 5px;border-radius:3px}
+.utc{font-size:13px;font-weight:700;font-variant-numeric:tabular-nums}
+.sub{font-size:10px;color:var(--dim)}
+.banner{border:1px solid var(--down);color:#fecaca;background:rgba(248,113,113,.08);border-radius:5px;padding:7px 10px;font-size:11px}
+.banner.warn{border-color:var(--amber);color:#fde68a;background:rgba(251,191,36,.07)}
+
+.agents{display:grid;grid-template-columns:repeat(6,1fr);gap:6px}
+.ag{border:1px solid var(--line);background:var(--panel);border-radius:5px;padding:7px 7px 8px;display:flex;flex-direction:column;gap:5px;min-width:0;transition:border-color .25s, box-shadow .25s}
+.ag.on{border-color:var(--c);box-shadow:0 0 0 1px color-mix(in srgb,var(--c) 35%,transparent), 0 0 14px color-mix(in srgb,var(--c) 22%,transparent)}
+.ag .h{display:flex;align-items:center;gap:6px}
+.ag .face{width:18px;height:14px;border:1.5px solid var(--c);border-radius:3px;position:relative;flex:none}
+.ag .face::before,.ag .face::after{content:"";position:absolute;top:4px;width:3px;height:3px;background:var(--c);border-radius:1px}
+.ag .face::before{left:3px}.ag .face::after{right:3px}
+.ag .n{font-size:10.5px;font-weight:700;color:var(--c);letter-spacing:.06em;line-height:1.1}
+.ag .r{font-size:9px;color:var(--dim)}
+.ag .s{font-size:9.5px;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:.85}
+.ag .bar{height:3px;background:var(--line);border-radius:2px;overflow:hidden}
+.ag .bar i{display:block;height:100%;background:var(--c);width:30%;transition:width .3s}
+
+.hero{position:relative;text-align:center;padding:14px 0 10px;min-height:196px}
+.hero .lbl{font-size:13px;letter-spacing:.12em;color:#b9c2d0}
+.hero .bal{font-family:var(--display);font-weight:700;font-size:clamp(46px,13vw,76px);color:var(--gold);line-height:1.05;margin-top:6px;font-variant-numeric:tabular-nums;text-shadow:0 0 28px rgba(242,201,76,.25)}
+.hero .pct{font-size:clamp(16px,4.4vw,22px);font-weight:700;color:var(--up);margin-top:4px;font-variant-numeric:tabular-nums}
+.hero .pct.neg{color:var(--down)}
+.hero .acct{font-size:10.5px;color:var(--dim);margin-top:6px}
+.pop{position:absolute;font-family:var(--display);font-weight:700;font-size:22px;pointer-events:none;animation:rise 2.4s ease-out forwards}
+@keyframes rise{0%{transform:translateY(12px);opacity:0}12%{opacity:1}100%{transform:translateY(-34px);opacity:0}}
+
+.panel{border:1px solid var(--line);background:var(--panel);border-radius:6px;min-width:0}
+.phead{display:flex;align-items:center;gap:8px;padding:7px 9px 4px;font-size:10px;letter-spacing:.08em;color:var(--dim)}
+.phead .r{margin-left:auto}
+.office canvas{display:block;width:100%;aspect-ratio:560/360;max-width:100%}
+.ohead{display:flex;justify-content:space-between;gap:8px;padding:6px 9px 0;font-size:9.5px;color:var(--dim);letter-spacing:.04em}
+.ohead span:last-child{text-align:right}
+
+.duo{display:grid;grid-template-columns:1.15fr 1fr;gap:8px}
+.duo .col{display:flex;flex-direction:column;gap:8px;min-width:0}
+.chartp canvas{display:block;width:100%;height:230px}
+.chpx{font-size:13px;color:var(--up);font-weight:700;font-variant-numeric:tabular-nums}
+.pos{padding-bottom:8px}
+.pos .eq{font-size:17px;font-weight:700;color:#fff;font-variant-numeric:tabular-nums}
+.pos .meta{display:flex;justify-content:space-between;padding:0 9px;font-size:10px;color:var(--dim);font-variant-numeric:tabular-nums}
+.pos .list{padding:6px 9px 0;font-size:10.5px;display:flex;flex-direction:column;gap:3px;min-height:38px}
+.pos .list .empty{color:var(--faint);text-align:center;padding-top:8px}
+.pos .list .p{display:flex;justify-content:space-between;gap:6px;font-variant-numeric:tabular-nums}
+.pos .foot{padding:6px 9px 0;font-size:9.5px;color:var(--dim)}
+.balp canvas{display:block;width:100%;height:118px}
+
+.log{border-color:#5a4a1c;background:linear-gradient(180deg,#0e1118,#0b0f16)}
+.log .lh{display:flex;justify-content:space-between;align-items:baseline;padding:9px 12px 6px;gap:8px}
+.log .lh .t{font-size:14px;font-weight:700;color:var(--gold);letter-spacing:.04em}
+.log .lh .d{font-size:14px;font-weight:700;color:var(--up)}
+.rows{padding:0 12px 8px;font-size:11.5px;display:flex;flex-direction:column;gap:3px;max-height:150px;overflow-y:auto;scrollbar-width:thin}
+.rows .row{display:grid;grid-template-columns:auto 1fr auto;gap:8px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.rows .row .mid{overflow:hidden;text-overflow:ellipsis}
+.rows .row.open{background:rgba(52,211,153,.06);outline:1px solid rgba(52,211,153,.25)}
+.rows .row.ghost{color:#a8b3c2;font-style:italic}
+.rows .empty{color:var(--faint);padding:4px 0}
+.L{color:var(--up)} .S{color:var(--down)} .x{color:var(--gold)} .b{color:var(--btc)} .w{color:var(--amber)}
+.feed{padding:0 12px 10px;display:flex;flex-direction:column;gap:2px;font-size:10.5px;max-height:120px;overflow-y:auto;color:var(--dim)}
+.feed .e{display:grid;grid-template-columns:auto auto 1fr;gap:8px;white-space:nowrap}
+.feed .e span:last-child{overflow:hidden;text-overflow:ellipsis;color:#b9c2d0}
+.disc{text-align:center;font-size:10.5px;color:#a9b3c2;background:#121821;border:1px solid var(--line);border-radius:0 0 6px 6px;padding:5px 8px;margin-top:-8px}
+
+@media (max-width:540px){
+  .agents{grid-template-columns:repeat(3,1fr)}
+  .duo{grid-template-columns:1fr}
+  .clock .prog{display:none}
+}
+@media (prefers-reduced-motion:reduce){.pop{animation-duration:.01s}}
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand">
+      <svg width="26" height="20" viewBox="0 0 26 20" aria-hidden="true"><rect x="3" y="3" width="20" height="14" rx="4" fill="none" stroke="#5ad1e6" stroke-width="1.6"/><rect x="8" y="8" width="3" height="3" fill="#5ad1e6"/><rect x="15" y="8" width="3" height="3" fill="#5ad1e6"/><path d="M1 8v4M25 8v4" stroke="#5ad1e6" stroke-width="1.6"/></svg>
+      NOLIMITZ DESK
+    </div>
+    <span class="badge" id="modeBadge">CONNECTING</span>
+    <span class="port">PORTFOLIO &middot; XAU <b id="btcTag" class="off">BTC</b></span>
+    <div class="clock">
+      <div class="row"><div class="prog"><i id="prog"></i></div><span class="hour" id="hour">HOUR -/24</span><span class="utc" id="utc">--:-- UTC</span></div>
+      <div class="sub" id="dayLbl">&nbsp;</div>
+    </div>
+  </header>
+
+  <div class="banner" id="banner" hidden></div>
+
+  <section class="agents" id="agents" aria-label="Agents"></section>
+
+  <section class="hero" id="hero">
+    <div class="lbl" id="balLbl">BALANCE</div>
+    <div class="bal" id="bal">$ --</div>
+    <div class="pct" id="pct">&nbsp;</div>
+    <div class="acct" id="acct">&nbsp;</div>
+  </section>
+
+  <section class="panel office">
+    <div class="ohead"><span id="officeL">BOT OFFICE</span><span id="officeR">&nbsp;</span></div>
+    <canvas id="office" width="560" height="360" aria-label="The six Desk agents at work"></canvas>
+  </section>
+
+  <section class="duo">
+    <div class="panel chartp">
+      <div class="phead"><span>CHART &middot; <span id="chSym">XAU (Gold)</span> 15m</span><span class="r chpx" id="chPx">&mdash;</span></div>
+      <canvas id="candles"></canvas>
+    </div>
+    <div class="col">
+      <div class="panel pos">
+        <div class="phead"><span style="color:var(--gold)">OPEN POSITIONS</span><span class="r eq" id="posEq">&mdash;</span></div>
+        <div class="meta"><span id="posMeta">0 open &middot; margin 0.00 $</span><span id="posChg">&nbsp;</span></div>
+        <div class="meta"><span id="posCash">&nbsp;</span><span id="posPct">&nbsp;</span></div>
+        <div class="list" id="posList"><div class="empty">no open positions &middot; all cash</div></div>
+        <div class="foot" id="posFoot">&nbsp;</div>
+      </div>
+      <div class="panel balp">
+        <div class="phead">BALANCE FROM DESK TRADES (USD)</div>
+        <canvas id="balc"></canvas>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel log">
+    <div class="lh"><span class="t" id="logT">TRADE LOG</span><span class="d" id="logD">&nbsp;</span></div>
+    <div class="rows" id="rows"></div>
+    <div class="phead" style="padding-top:2px">AGENT FEED</div>
+    <div class="feed" id="feed"></div>
+  </section>
+  <div class="disc" id="disc">Not financial advice</div>
+</div>
+
+<script>
+(()=>{
+const $=s=>document.querySelector(s);
+const WORKER=(new URLSearchParams(location.search).get('worker')||'desk-1').replace(/[^\w-]/g,'');
+const API='/api/desk/state?worker='+encodeURIComponent(WORKER);
+const POLL_MS=3000, PLAY_MS=900, ACTIVE_MS=7000;
+const AG=[
+  {id:'scout',n:'SCOUT',r:'signals',c:'#60a5fa'},
+  {id:'check',n:'CHECK',r:'market',  c:'#2dd4bf'},
+  {id:'size', n:'SIZE', r:'sizing', c:'#a78bfa'},
+  {id:'entry',n:'ENTRY',r:'entries',c:'#4ade80'},
+  {id:'exit', n:'EXIT', r:'exits',  c:'#fbbf24'},
+  {id:'guard',n:'GUARD',r:'risk',   c:'#f87171'}
+];
+const AGC=Object.fromEntries(AG.map(a=>[a.id,a.c]));
+const NAMES={XAUUSD:'XAU (Gold)',BTCUSD:'BTC (Bitcoin)'};
+const DOW=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+let R=null;                 // last API response
+let lastId=0, firstLoad=true, failures=0;
+const queue=[];             // new events waiting to be animated
+const feed=[];              // recent events for the feed list
+const say={}, activeUntil={};
+let prevAgent=null;
+const fx=[], parts=[];
+
+const fmt=(v,d=2)=>v==null||isNaN(v)?'--':Number(v).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
+const sgn$=v=>(v>=0?'+':'-')+'$'+fmt(Math.abs(v));
+function setText(el,v){if(el._v!==v){el._v=v;el.textContent=v}}
+function setHTML(el,v){if(el._h!==v){el._h=v;el.innerHTML=v}}
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function short(msg){ // "XAUUSD H1 14:00 UTC - pullback seen..." -> "pullback seen..."
+  return String(msg||'').replace(/^(XAUUSD|BTCUSD)\s+/,'').replace(/^H1 \d\d:\d\d UTC \u00b7 /,'');
+}
+const sym=()=>{const s=R&&R.state&&R.state.symbols;return s&&(s.XAUUSD?'XAUUSD':Object.keys(s)[0])||'XAUUSD'};
+const symState=()=>R&&R.state&&R.state.symbols?R.state.symbols[sym()]:null;
+const digits=()=>{const s=symState();return s&&s.digits!=null?Math.min(s.digits,2):2};
+
+/* ---------------------------------------------------------------- agents cards */
+$('#agents').innerHTML=AG.map(a=>`<div class="ag" id="ag-${a.id}" style="--c:${a.c}"><div class="h"><span class="face"></span><div><div class="n">${a.n}</div><div class="r">${a.r}</div></div></div><div class="s">&mdash;</div><div class="bar"><i></i></div></div>`).join('');
+const agS={},agB={},agBox={};
+AG.forEach(a=>{const e=$('#ag-'+a.id);agBox[a.id]=e;agS[a.id]=e.querySelector('.s');agB[a.id]=e.querySelector('.bar i')});
+
+/* ---------------------------------------------------------------- polling */
+async function poll(){
+  try{
+    const r=await fetch(API+(lastId?'&after_id='+lastId:''),{cache:'no-store'});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const j=await r.json();
+    failures=0;
+    const evs=j.events||[];
+    if(firstLoad){
+      evs.forEach(e=>{say[e.agent]=short(e.message);feed.push(e)});
+      firstLoad=false;
+    }else{
+      evs.forEach(e=>queue.push(e));
+    }
+    if(evs.length) lastId=Math.max(lastId,...evs.map(e=>e.id));
+    // keep previous events/trades view when polling incrementally
+    j.events=evs;
+    R=j;
+    if(j.state&&j.state.agents) for(const a of AG){ if(!say[a.id]&&j.state.agents[a.id]) say[a.id]=short(j.state.agents[a.id]); }
+  }catch(e){ failures++; }
+  setTimeout(poll,POLL_MS);
+}
+
+function play(){
+  const e=queue.shift();
+  if(e){
+    const now=performance.now();
+    say[e.agent]=short(e.message);
+    activeUntil[e.agent]=now+ACTIVE_MS;
+    feed.push(e); while(feed.length>80) feed.shift();
+    const chain=['scout','check','size','entry'];
+    if(prevAgent && prevAgent!==e.agent && LAY[prevAgent] && LAY[e.agent]) parts.push({a:prevAgent,b:e.agent,c:AGC[e.agent]||'#67e8f9',t0:now/1000});
+    prevAgent=e.agent;
+    if(e.agent==='exit' && e.data && typeof e.data.profit==='number'){ popup(e.data.profit); const p=P(LAY.exit.bot[0],LAY.exit.bot[1],0); fx.push({x:p[0]+40,y:p[1]-80,txt:sgn$(e.data.profit),col:e.data.profit>=0?'#34d399':'#f87171',t0:now/1000}); }
+    if(e.agent==='entry' && e.data && e.data.price){ const p=P(LAY.entry.bot[0],LAY.entry.bot[1],0); fx.push({x:p[0]+40,y:p[1]-80,txt:(e.data.shadow?'SHADOW ':'')+(e.data.lot||'')+' lots',col:e.data.shadow?'#fbbf24':'#4ade80',t0:now/1000}); }
+  }
+  setTimeout(play, queue.length>6?250:PLAY_MS);
+}
+function popup(v){
+  const hero=$('#hero'),el=document.createElement('div');el.className='pop';el.textContent=sgn$(v);
+  el.style.color=v>=0?'var(--up)':'var(--down)';el.style.left=(12+Math.random()*58)+'%';el.style.top=(150+Math.random()*14)+'px';
+  hero.appendChild(el);setTimeout(()=>el.remove(),2500);
+}
+
+/* ---------------------------------------------------------------- canvases */
+function fit(cv){const r=cv.getBoundingClientRect(),d=window.devicePixelRatio||1;const w=Math.max(1,Math.round(r.width*d)),h=Math.max(1,Math.round(r.height*d));if(cv.width!==w||cv.height!==h){cv.width=w;cv.height=h}return{w:r.width,h:r.height,d}}
+const OF=$('#office'),OC=OF.getContext('2d'),CV=$('#candles'),CC=CV.getContext('2d'),BV=$('#balc'),BC=BV.getContext('2d');
+
+/* ---------------------------------------------------------------- office (isometric) */
+const OW=560,OH=360,OX=256,OY=126,TW=24,TH=12,WALL=118;
+const P=(x,y,z=0)=>[OX+(x-y)*TW,OY+(x+y)*TH-z];
+function poly(c,pts,fill,stroke,lw=1){c.beginPath();pts.forEach((p,i)=>i?c.lineTo(p[0],p[1]):c.moveTo(p[0],p[1]));c.closePath();if(fill){c.fillStyle=fill;c.fill()}if(stroke){c.lineWidth=lw;c.strokeStyle=stroke;c.stroke()}}
+function box(c,x,y,w,d,h,top,left,right,edge){
+  poly(c,[P(x,y+d,0),P(x+w,y+d,0),P(x+w,y+d,h),P(x,y+d,h)],left,edge);
+  poly(c,[P(x+w,y,0),P(x+w,y+d,0),P(x+w,y+d,h),P(x+w,y,h)],right,edge);
+  poly(c,[P(x,y,h),P(x+w,y,h),P(x+w,y+d,h),P(x,y+d,h)],top,edge);
+}
+const LAY={
+  scout:{desk:[1.3,1.1],bot:[2.7,2.1],lab:[-70,-58]},
+  check:{desk:[4.4,1.0],bot:[5.8,1.9],lab:[-6,-64]},
+  guard:{desk:[7.7,1.4],bot:[8.9,2.6],lab:[72,-52]},
+  entry:{desk:[1.1,4.3],bot:[2.4,5.3],lab:[-84,-28]},
+  size: {desk:[7.2,4.1],bot:[8.4,5.2],lab:[30,96]},
+  exit: {desk:[3.9,5.6],bot:[5.2,6.6],lab:[-100,14]}
+};
+const chief={x:5,y:4,tx:5,ty:4};
+function rr(c,x,y,w,h,r){c.beginPath();c.moveTo(x+r,y);c.arcTo(x+w,y,x+w,y+h,r);c.arcTo(x+w,y+h,x,y+h,r);c.arcTo(x,y+h,x,y,r);c.arcTo(x,y,x+w,y,r);c.closePath()}
+function drawBot(c,x,y,col,t,active,ph,asleep){
+  const [px,py0]=P(x,y), bob=asleep?0:Math.sin(t*2.4+ph)*1.6, py=py0+bob;
+  c.fillStyle='rgba(0,0,0,.45)';c.beginPath();c.ellipse(px,py0,14,5,0,0,7);c.fill();
+  if(active){c.save();c.shadowColor=col;c.shadowBlur=18}
+  rr(c,px-11,py-30,22,22,6);c.fillStyle=asleep?'#3a4558':col;c.fill();
+  c.fillStyle='rgba(0,0,0,.18)';c.fillRect(px-11,py-17,22,9);
+  rr(c,px-15,py-55,30,23,5);c.fillStyle='#121a26';c.fill();c.lineWidth=2;c.strokeStyle=asleep?'#4a5568':col;c.stroke();
+  if(active)c.restore();
+  if(asleep){c.strokeStyle='#4a5568';c.lineWidth=1.5;c.beginPath();c.moveTo(px-9,py-44);c.lineTo(px-4,py-44);c.moveTo(px+4,py-44);c.lineTo(px+9,py-44);c.stroke()}
+  else{const blink=(Math.sin(t*1.3+ph*3)>0.985)?1:4;c.fillStyle=col;c.fillRect(px-8,py-46,4,blink);c.fillRect(px+4,py-46,4,blink);}
+  if(active){c.strokeStyle=col;c.lineWidth=1.5;c.beginPath();c.arc(px,py-39,4,0.15*Math.PI,0.85*Math.PI);c.stroke()}
+  c.strokeStyle=asleep?'#4a5568':col;c.lineWidth=1.5;c.beginPath();c.moveTo(px,py-55);c.lineTo(px,py-63);c.stroke();
+  c.beginPath();c.arc(px,py-65,2.6,0,7);c.fillStyle=active?'#fff':(asleep?'#4a5568':col);c.fill();
+  return[px,py-66];
+}
+function drawChief(c,t){
+  const [px,py0]=P(chief.x,chief.y), py=py0+Math.sin(t*3)*1.2, col='#67e8f9';
+  c.fillStyle='rgba(103,232,249,.10)';c.beginPath();c.ellipse(px,py0,16,6,0,0,7);c.fill();
+  c.save();c.shadowColor=col;c.shadowBlur=12;c.strokeStyle=col;c.lineWidth=1.6;
+  rr(c,px-12,py-34,24,26,7);c.fillStyle='rgba(103,232,249,.08)';c.fill();c.stroke();
+  rr(c,px-16,py-62,32,25,7);c.fill();c.stroke();
+  c.beginPath();c.moveTo(px-12,py-62);c.lineTo(px-12,py-72);c.lineTo(px-6,py-66);c.lineTo(px,py-74);c.lineTo(px+6,py-66);c.lineTo(px+12,py-72);c.lineTo(px+12,py-62);c.stroke();
+  c.restore();
+  c.fillStyle=col;c.beginPath();c.arc(px-6,py-50,2.4,0,7);c.arc(px+6,py-50,2.4,0,7);c.fill();
+  for(let i=0;i<5;i++){const a=t*1.6+i*1.25,r=22+Math.sin(t*2+i)*4;c.globalAlpha=.4+.4*Math.sin(t*3+i);c.fillStyle=col;c.fillRect(px+Math.cos(a)*r,py-36+Math.sin(a)*r*.5,2,2)}
+  c.globalAlpha=1;
+  return[px,py-75];
+}
+function clip(c,s,max){if(c.measureText(s).width<=max)return s;while(s.length>3&&c.measureText(s+'\u2026').width>max)s=s.slice(0,-1);return s+'\u2026'}
+function label(c,ax,ay,lx,ly,role,txt,col,active){
+  c.font='700 10px "JetBrains Mono", monospace';const w1=c.measureText(role).width;
+  c.font='10.5px "JetBrains Mono", monospace';txt=clip(c,txt,190);const w2=c.measureText(txt).width;
+  const w=Math.max(w1,w2)+14,h=31;let x=Math.round(lx-w/2),y=Math.round(ly-h/2);
+  x=Math.max(3,Math.min(OW-w-3,x));y=Math.max(3,Math.min(OH-h-3,y));
+  c.strokeStyle=col;c.globalAlpha=active?.9:.45;c.lineWidth=1;c.beginPath();c.moveTo(ax,ay);c.lineTo(Math.max(x,Math.min(x+w,ax)),ay<y?y:Math.min(y+h,Math.max(y,ay)));c.stroke();c.globalAlpha=1;
+  rr(c,x,y,w,h,3);c.fillStyle='rgba(8,12,19,.92)';c.fill();c.strokeStyle=col;c.globalAlpha=active?1:.55;c.stroke();c.globalAlpha=1;
+  c.fillStyle=col;c.font='700 10px "JetBrains Mono", monospace';c.fillText(role,x+7,y+12);
+  c.fillStyle='#e5ebf3';c.font='10.5px "JetBrains Mono", monospace';c.fillText(txt,x+7,y+25);
+}
+function drawScreen(c){
+  const [sx,sy]=P(3.3,0,112), ss=symState();
+  c.save();c.translate(sx,sy);c.transform(1,0.5,0,1,0,0);
+  const W=6.4*TW,H=70;
+  c.fillStyle='rgba(10,26,40,.92)';c.fillRect(0,0,W,H);
+  c.strokeStyle='rgba(90,209,230,.7)';c.lineWidth=1.2;c.strokeRect(0,0,W,H);
+  c.fillStyle='#cfe8f0';c.font='700 8.5px "JetBrains Mono", monospace';
+  const open=ss&&ss.open;
+  c.fillText(`${sym().replace('USD','/USD')} 15m \u00b7 ${open?'live':'closed'}`,6,11);
+  const cs=(ss&&ss.candles||[]).slice(-28);
+  if(cs.length){
+    let hi=-Infinity,lo=Infinity;cs.forEach(b=>{hi=Math.max(hi,b[2]);lo=Math.min(lo,b[3])});
+    const y=v=>18+(hi-v)/((hi-lo)||1)*32, bw=(W-58)/28;
+    cs.forEach((b,j)=>{const x=6+j*bw;c.strokeStyle=c.fillStyle=b[4]>=b[1]?'#34d399':'#f87171';c.beginPath();c.moveTo(x+bw/2,y(b[2]));c.lineTo(x+bw/2,y(b[3]));c.lineWidth=.8;c.stroke();c.fillRect(x+.6,Math.min(y(b[1]),y(b[4])),bw-1.2,Math.max(1,Math.abs(y(b[1])-y(b[4]))))});
+  }
+  const px=ss&&(ss.bid||(cs.length?cs[cs.length-1][4]:null));
+  c.fillStyle=open?'#34d399':'#7a8699';c.font='700 10px "JetBrains Mono", monospace';c.fillText(px?fmt(px,digits()):'--',W-54,34);
+  c.fillStyle='#5ad1e6';c.font='700 8.5px "JetBrains Mono", monospace';
+  const d=new Date();
+  c.fillText(open?`HOUR ${d.getUTCHours()+1}/24 \u00b7 ${String(d.getUTCHours()).padStart(2,'0')}:${String(d.getUTCMinutes()).padStart(2,'0')} UTC`:'MARKET CLOSED',6,H-6);
+  c.restore();
+}
+function drawOffice(t){
+  const s=OF.width/OW; fit(OF); OC.setTransform(OF.width/OW,0,0,OF.width/OW,0,0); const c=OC;
+  c.clearRect(0,0,OW,OH);
+  const g=c.createLinearGradient(0,0,0,OH);g.addColorStop(0,'#0a0f18');g.addColorStop(1,'#070a10');c.fillStyle=g;c.fillRect(0,0,OW,OH);
+  poly(c,[P(0,0),P(0,8),P(0,8,WALL),P(0,0,WALL)],'#0d1420','rgba(90,209,230,.25)');
+  poly(c,[P(0,0),P(10,0),P(10,0,WALL),P(0,0,WALL)],'#0f1724','rgba(90,209,230,.25)');
+  for(const [a,b] of [[1.2,2.5],[3.0,4.3],[4.8,6.1]]){
+    poly(c,[P(0,a,34),P(0,b,34),P(0,b,96),P(0,a,96)],'#15304d','rgba(96,165,250,.35)');
+    c.strokeStyle='rgba(120,170,230,.18)';for(let z=40;z<96;z+=6){c.beginPath();const p1=P(0,a,z),p2=P(0,b,z);c.moveTo(p1[0],p1[1]);c.lineTo(p2[0],p2[1]);c.stroke()}
+  }
+  poly(c,[P(0,0),P(10,0),P(10,8),P(0,8)],'#0b111b','rgba(90,209,230,.3)');
+  c.strokeStyle='rgba(90,209,230,.05)';c.lineWidth=1;
+  for(let i=1;i<10;i++){const a=P(i,0),b=P(i,8);c.beginPath();c.moveTo(a[0],a[1]);c.lineTo(b[0],b[1]);c.stroke()}
+  for(let j=1;j<8;j++){const a=P(0,j),b=P(10,j);c.beginPath();c.moveTo(a[0],a[1]);c.lineTo(b[0],b[1]);c.stroke()}
+  drawScreen(c);
+  box(c,0.3,0.3,0.9,0.9,82,'#1a2433','#111a27','#152030','rgba(90,209,230,.2)');
+  const online=R&&R.online;
+  for(let r=0;r<8;r++){const p=P(1.2,0.55,12+r*8.5);c.fillStyle=online&&(Math.sin(t*4+r*1.7)>0.2)?'#34d399':'#1d4d3a';c.fillRect(p[0]+2,p[1]-2,2,2);c.fillStyle=online&&(Math.sin(t*3+r)>0.6)?'#5ad1e6':'#163a44';c.fillRect(p[0]+7,p[1]+1,2,2)}
+  { const p=P(0.75,0.75,82);c.strokeStyle='#8aa0b8';c.lineWidth=1.2;c.beginPath();c.moveTo(p[0],p[1]);c.lineTo(p[0],p[1]-10);c.stroke();c.beginPath();c.ellipse(p[0]+3,p[1]-13,7,3.5,-0.5,0,7);c.stroke();
+    if(online){c.strokeStyle='rgba(90,209,230,'+(0.3+0.3*Math.sin(t*3))+')';c.beginPath();c.arc(p[0]+6,p[1]-18,5,-2.2,-0.9);c.stroke();c.beginPath();c.arc(p[0]+6,p[1]-18,9,-2.2,-0.9);c.stroke()} }
+  const now=performance.now(), asleep=!online;
+  const items=[];
+  for(const a of AG){const L=LAY[a.id];
+    items.push({d:L.desk[0]+L.desk[1]+1.2,f:()=>{const[x,y]=L.desk;box(c,x,y,1.7,0.9,17,'#1b2534','#121a27','#16202e','rgba(90,209,230,.12)');
+      const m1=P(x+0.35,y+0.25,19),m2=P(x+1.25,y+0.25,19);poly(c,[m1,m2,[m2[0],m2[1]-17],[m1[0],m1[1]-17]],'#0a121c',a.c+'66');
+      if(!asleep)for(let q=0;q<4;q++){const hh=3+((Math.sin(t*2+q*2+x)+1)*3);c.fillStyle=q%2?'#f87171':'#34d399';c.fillRect(m1[0]+4+q*5,m1[1]-4-hh+q*2.6,3,hh)}
+      const lp=P(x+1.5,y+0.2,17);c.strokeStyle='#5b6b80';c.beginPath();c.moveTo(lp[0],lp[1]);c.lineTo(lp[0],lp[1]-14);c.stroke();c.fillStyle='#9fb2c8';c.beginPath();c.ellipse(lp[0],lp[1]-15,4,2,0,0,7);c.fill()}});
+    items.push({d:L.bot[0]+L.bot[1],f:()=>{a._head=drawBot(c,L.bot[0],L.bot[1],a.c,t,(activeUntil[a.id]||0)>now,AG.indexOf(a),asleep)}});
+  }
+  for(const [x,y] of [[0.5,7.1],[9.2,7.3],[9.3,0.5]]) items.push({d:x+y,f:()=>{box(c,x,y,0.5,0.5,10,'#3a2a1c','#2a1e14','#33251a');const p=P(x+.25,y+.25,10);c.fillStyle='#2f8f5b';for(let q=0;q<6;q++){c.beginPath();c.ellipse(p[0]+Math.cos(q)*6,p[1]-8-Math.sin(q*2)*4,5,3,q,0,7);c.fill()}}});
+  items.push({d:chief.x+chief.y,f:()=>{chief._head=drawChief(c,t)}});
+  items.sort((a,b)=>a.d-b.d).forEach(i=>i.f());
+  for(let i=parts.length-1;i>=0;i--){const p=parts[i];const age=t-p.t0;if(age>1){parts.splice(i,1);continue}
+    const A=LAY[p.a].bot,B=LAY[p.b].bot;const a=P(A[0],A[1],70),b=P(B[0],B[1],70);const cx=(a[0]+b[0])/2,cy=Math.min(a[1],b[1])-40;
+    for(let j=0;j<7;j++){const u=Math.min(1,age*1.4-j*0.06);if(u<0)continue;const x=(1-u)*(1-u)*a[0]+2*(1-u)*u*cx+u*u*b[0],y=(1-u)*(1-u)*a[1]+2*(1-u)*u*cy+u*u*b[1];c.globalAlpha=(1-age)*(1-j/8);c.fillStyle=p.c;c.beginPath();c.arc(x,y,2.6-j*.25,0,7);c.fill()}
+    c.globalAlpha=1}
+  for(const a of AG){const L=LAY[a.id],h=a._head;label(c,h[0],h[1],h[0]+L.lab[0],h[1]+L.lab[1],a.n,say[a.id]||'waiting',a.c,(activeUntil[a.id]||0)>now)}
+  const ch=chief._head, ss=symState();
+  const chiefTxt=!R?'connecting\u2026':!R.online?'Desk offline':(ss&&!ss.open)?'market closed \u00b7 resting':(R.state&&R.state.mode&&R.state.mode.shadow)?'shadow mode \u00b7 no orders':'watching '+sym();
+  label(c,ch[0],ch[1]+60,92,338,'CHIEF',chiefTxt,'#67e8f9',false);
+  for(let i=fx.length-1;i>=0;i--){const f=fx[i],age=t-f.t0;if(age>2){fx.splice(i,1);continue}
+    const y=f.y-age*22;c.globalAlpha=Math.min(1,(2-age)*1.5);c.font='700 13px "JetBrains Mono", monospace';const w=c.measureText(f.txt).width+14;
+    rr(c,f.x-w/2,y-12,w,20,3);c.fillStyle='rgba(8,12,19,.9)';c.fill();c.strokeStyle=f.col;c.stroke();c.fillStyle=f.col;c.fillText(f.txt,f.x-w/2+7,y+3);c.globalAlpha=1}
+}
+
+/* ---------------------------------------------------------------- candle chart */
+function drawCandles(){
+  const {w,h,d}=fit(CV);const c=CC;c.setTransform(d,0,0,d,0,0);c.clearRect(0,0,w,h);
+  const ss=symState(); const all=(ss&&ss.candles)||[];
+  if(!all.length){c.fillStyle='#4a5568';c.font='11px "JetBrains Mono", monospace';c.fillText('waiting for candles\u2026',12,24);return}
+  const n=Math.max(18,Math.min(48,Math.floor(w/9)));
+  const bars=all.slice(-n), dg=digits();
+  const last=bars[bars.length-1];
+  const live=ss.open&&ss.bid?ss.bid:last[4];
+  let hi=-Infinity,lo=Infinity;bars.forEach(b=>{hi=Math.max(hi,b[2]);lo=Math.min(lo,b[3])});hi=Math.max(hi,live);lo=Math.min(lo,live);
+  const tr=(R.trades||[]).filter(t=>t.is_open||t.exit);
+  const pad=(hi-lo)*0.18||1;hi+=pad;lo-=pad;
+  const RW=62,top=8,bot=h-10,cw=(w-RW-6)/n,Y=v=>top+(hi-v)/(hi-lo)*(bot-top),X=i=>6+i*cw+cw/2;
+  const t0=bars[0][0], step=900;
+  const idxOf=ts=>Math.floor((ts-t0)/step);
+  bars.forEach((b,i)=>{const hr=new Date(b[0]*1000).getUTCHours()+new Date(b[0]*1000).getUTCMinutes()/60;const ld=hr>=7&&hr<16,ny=hr>=13.5&&hr<22;
+    if(ld||ny){c.fillStyle=ld&&ny?'rgba(242,201,76,.06)':ld?'rgba(96,165,250,.05)':'rgba(242,201,76,.04)';c.fillRect(X(i)-cw/2,top,cw,bot-top)}
+    if(hr===7||hr===13.5){c.fillStyle='#4a5568';c.font='8.5px "JetBrains Mono", monospace';c.fillText(hr===7?'LDN':'NY',X(i)-cw/2+2,bot-2)}});
+  c.strokeStyle='rgba(255,255,255,.05)';c.fillStyle='#7a8699';c.font='10px "JetBrains Mono", monospace';
+  for(let q=0;q<=4;q++){const v=lo+(hi-lo)*(q+0.5)/5,yy=Y(v);c.beginPath();c.moveTo(0,yy);c.lineTo(w-RW,yy);c.stroke();c.fillText(fmt(v,dg),w-RW+4,yy+3)}
+  bars.forEach((b,i)=>{const up=b[4]>=b[1],x=X(i);c.strokeStyle=c.fillStyle=up?'#34d399':'#f87171';c.lineWidth=1;c.beginPath();c.moveTo(x,Y(b[2]));c.lineTo(x,Y(b[3]));c.stroke();
+    c.fillRect(x-cw*0.34,Math.min(Y(b[1]),Y(b[4])),cw*0.68,Math.max(1,Math.abs(Y(b[1])-Y(b[4]))))});
+  const cy=Y(live);c.setLineDash([3,3]);c.strokeStyle=ss.open?'rgba(52,211,153,.6)':'rgba(122,134,153,.5)';c.beginPath();c.moveTo(0,cy);c.lineTo(w-RW,cy);c.stroke();c.setLineDash([]);
+  c.fillStyle=ss.open?'#0f2a22':'#1a2230';c.fillRect(w-RW+1,cy-8,RW-2,16);c.fillStyle=ss.open?'#34d399':'#9aa5b5';c.font='700 10px "JetBrains Mono", monospace';c.fillText(fmt(live,dg),w-RW+4,cy+4);
+  c.font='9.5px "JetBrains Mono", monospace';
+  function txt(s,x,yy,col){const tw=c.measureText(s).width;const tx=Math.max(2,Math.min(w-RW-tw-2,x-tw/2));c.fillStyle=col;c.fillText(s,tx,Math.max(10,Math.min(h-3,yy)))}
+  for(const t of tr){ if(t.symbol!==sym())continue;
+    const oi=idxOf(Date.parse(t.opened_at)/1000);
+    if(oi>=0&&oi<bars.length){const x=X(oi),col=t.direction>0?'#34d399':'#f87171';c.fillStyle=col;c.beginPath();const yy=Y(t.entry);
+      if(t.direction>0){c.moveTo(x,yy+4);c.lineTo(x-4,yy+11);c.lineTo(x+4,yy+11)}else{c.moveTo(x,yy-4);c.lineTo(x-4,yy-11);c.lineTo(x+4,yy-11)}
+      c.closePath();c.fill();txt(`${t.direction>0?'LONG':'SHORT'} ${t.lot} ${fmt(t.entry,dg)}`,x,t.direction>0?yy+22:yy-15,col)}
+    if(!t.is_open&&t.closed_at&&t.exit){const xi=idxOf(Date.parse(t.closed_at)/1000);
+      if(xi>=0&&xi<bars.length){const x=X(xi),yy=Y(t.exit);c.fillStyle='#fff';c.beginPath();c.arc(x,yy,3,0,7);c.fill();
+        const p=t.profit||0;txt(`exit ${fmt(t.exit,dg)} ${p>=0?'+':'-'}${fmt(Math.abs(p),0)}$`,x,t.direction>0?yy-8:yy+14,p>=0?'#34d399':'#f87171')}}
+    if(t.is_open&&t.stop){c.setLineDash([2,4]);c.strokeStyle='rgba(248,113,113,.5)';const ys=Y(t.stop);c.beginPath();c.moveTo(0,ys);c.lineTo(w-RW,ys);c.stroke();
+      if(t.target){c.strokeStyle='rgba(52,211,153,.5)';const yt=Y(t.target);if(yt>top&&yt<bot){c.beginPath();c.moveTo(0,yt);c.lineTo(w-RW,yt);c.stroke()}}c.setLineDash([])}
+  }
+}
+
+/* ---------------------------------------------------------------- balance chart */
+function drawBal(){
+  const {w,h,d}=fit(BV);const c=BC;c.setTransform(d,0,0,d,0,0);c.clearRect(0,0,w,h);
+  const st=R&&R.state; if(!st){return}
+  const closed=(R.trades||[]).filter(t=>!t.is_open&&t.closed_at&&t.profit!=null).sort((a,b)=>Date.parse(a.closed_at)-Date.parse(b.closed_at));
+  const eq=st.account.equity, bal=st.account.balance;
+  const sumP=closed.reduce((a,t)=>a+t.profit,0);
+  let run=bal-sumP; const pts=[[0, run]];
+  closed.forEach((t,i)=>{run+=t.profit;pts.push([i+1,run])});
+  pts.push([closed.length+1,eq]);
+  const R0=48,top=8,bot=h-16;
+  let lo=Infinity,hi=-Infinity;pts.forEach(p=>{lo=Math.min(lo,p[1]);hi=Math.max(hi,p[1])});const pad=(hi-lo)*0.15||Math.max(5,hi*0.002);lo-=pad;hi+=pad;
+  const tmin=pts[0][0],tmax=pts[pts.length-1][0]||tmin+1;
+  const X=t=>6+(t-tmin)/((tmax-tmin)||1)*(w-R0-12),Yb=v=>top+(hi-v)/(hi-lo)*(bot-top);
+  c.strokeStyle='rgba(255,255,255,.05)';c.fillStyle='#7a8699';c.font='9.5px "JetBrains Mono", monospace';
+  for(let q=0;q<4;q++){const v=lo+(hi-lo)*(q+0.5)/4,yy=Yb(v);c.beginPath();c.moveTo(0,yy);c.lineTo(w-R0,yy);c.stroke();c.fillText(fmt(v,0),w-R0+3,yy+3)}
+  c.fillText(closed.length?`start \u2192 ${closed.length} closed trade${closed.length>1?'s':''} \u2192 now`:'no closed trades yet \u00b7 start \u2192 now',6,h-4);
+  const up=eq>=pts[0][1], col=up?'#34d399':'#f87171';
+  const g=c.createLinearGradient(0,top,0,bot);g.addColorStop(0,up?'rgba(52,211,153,.25)':'rgba(248,113,113,.25)');g.addColorStop(1,'rgba(0,0,0,0)');
+  c.beginPath();pts.forEach((p,i)=>i?c.lineTo(X(p[0]),Yb(p[1])):c.moveTo(X(p[0]),Yb(p[1])));c.lineTo(X(tmax),bot);c.lineTo(X(tmin),bot);c.closePath();c.fillStyle=g;c.fill();
+  c.beginPath();pts.forEach((p,i)=>i?c.lineTo(X(p[0]),Yb(p[1])):c.moveTo(X(p[0]),Yb(p[1])));c.strokeStyle=col;c.lineWidth=1.6;c.stroke();
+  c.fillStyle=col;pts.slice(1,-1).forEach(p=>{c.beginPath();c.arc(X(p[0]),Yb(p[1]),2,0,7);c.fill()});
+  const l=pts[pts.length-1];c.beginPath();c.arc(X(l[0]),Yb(l[1]),3.5,0,7);c.fill();c.strokeStyle='#fff';c.lineWidth=1;c.stroke();
+}
+
+/* ---------------------------------------------------------------- DOM */
+function render(t){
+  const now=performance.now(), d=new Date();
+  setText($('#hour'),`HOUR ${d.getUTCHours()+1}/24`);
+  setText($('#utc'),`${String(d.getUTCHours()).padStart(2,'0')}:${String(d.getUTCMinutes()).padStart(2,'0')} UTC`);
+  $('#prog').style.width=((d.getUTCHours()*60+d.getUTCMinutes())/1440*100)+'%';
+  const dn=`${DOW[d.getUTCDay()]} ${d.getUTCDate()} ${MON[d.getUTCMonth()]}`;
+  setText($('#dayLbl'),dn+' \u00b7 LIVE');
+
+  AG.forEach((a,i)=>{const on=(activeUntil[a.id]||0)>now;setText(agS[a.id],say[a.id]||'waiting');agBox[a.id].classList.toggle('on',on);
+    agB[a.id].style.width=(on?100:(R&&R.online?28+22*(1+Math.sin(t*0.9+i*1.3)):8))+'%'});
+
+  const st=R&&R.state, banner=$('#banner'), badge=$('#modeBadge');
+  if(!R){ if(failures>2){banner.hidden=false;banner.className='banner';setText(banner,'Cannot reach the Desk API. Retrying\u2026')} return; }
+  const ss=symState();
+  if(!R.online){banner.hidden=false;banner.className='banner';setText(banner,st?`Desk worker offline \u00b7 last update ${Math.round((R.age_sec||0)/60)} min ago`:'Desk worker has not started yet');}
+  else if(ss&&!ss.open){banner.hidden=false;banner.className='banner warn';setText(banner,'Gold market closed \u00b7 the Desk resumes when trading reopens (Sunday 22:00 UTC)');}
+  else banner.hidden=true;
+  const shadow=st&&st.mode&&st.mode.shadow;
+  badge.className='badge '+(!R.online?'off':shadow?'shadow':'live');
+  setText(badge,!R.online?'OFFLINE':shadow?'SHADOW':'LIVE');
+  $('#btcTag').classList.toggle('off',!(st&&st.mode&&(st.mode.symbols||[]).includes('BTCUSD')));
+  if(!st) return;
+
+  const acc=st.account, day=st.day||{}, eq=acc.equity, start=day.start_balance||acc.balance;
+  const pct=(eq/start-1)*100;
+  setText($('#balLbl'),'BALANCE \u00b7 '+dn);
+  setText($('#bal'),'$ '+fmt(eq));
+  const pe=$('#pct');setText(pe,(pct>=0?'+':'')+fmt(pct)+' % today');pe.classList.toggle('neg',pct<0);
+  setText($('#acct'),`${acc.demo?'DEMO':'REAL'} \u00b7 ${acc.server} \u00b7 ${acc.login} \u00b7 risk ${st.mode.risk_pct}% per trade`);
+
+  const pos=st.positions||[], margin=acc.margin||0;
+  setText($('#posEq'),fmt(eq)+' $');
+  setText($('#posMeta'),`${pos.length} open \u00b7 margin ${fmt(margin)} $`);
+  const chg=eq-start;const pc=$('#posChg');setText(pc,(chg>=0?'+':'-')+fmt(Math.abs(chg))+' $');pc.style.color=chg>=0?'var(--up)':'var(--down)';
+  setText($('#posCash'),`balance ${fmt(acc.balance)} $`);
+  const pp=$('#posPct');setText(pp,(pct>=0?'+':'')+fmt(pct)+' % today');pp.style.color=pct>=0?'var(--up)':'var(--down)';
+  const dg=digits();
+  setHTML($('#posList'),pos.length?pos.map(p=>`<div class="p"><span><span class="x">${esc(p.symbol.replace('USD',''))}</span> <span class="${p.direction>0?'L':'S'}">${p.direction>0?'LONG':'SHORT'} ${p.lot}</span> ${fmt(p.entry,dg)}</span><span class="${p.profit>=0?'L':'S'}">${p.profit>=0?'+':'-'}${fmt(Math.abs(p.profit))}$</span></div>`).join(''):'<div class="empty">no open positions \u00b7 all cash</div>');
+  const sm=R.summary||{};
+  setText($('#posFoot'),`${sm.closed_trades||0} trades closed \u00b7 win rate ${sm.win_rate==null?'--':sm.win_rate+'%'} \u00b7 ${sm.total_r>=0?'+':''}${fmt(sm.total_r||0,1)}R \u00b7 today ${day.entries||0} entries`);
+
+  setText($('#chSym'),NAMES[sym()]||sym());
+  const ce=$('#chPx');const live=ss&&(ss.bid||(ss.candles&&ss.candles.length?ss.candles[ss.candles.length-1][4]:null));
+  setText(ce,live?fmt(live,dg):'--');ce.style.color=ss&&ss.open?'var(--up)':'var(--dim)';
+
+  setText($('#officeL'),`BOT OFFICE \u00b7 ${dn} \u00b7 ${shadow?'shadow mode':'live trading'}`);
+  setText($('#officeR'),`${sym()} \u00b7 ${ss?ss.broker_symbol:''} \u00b7 real candles`);
+  setText($('#logT'),'TRADE LOG \u00b7 '+dn);
+  const dl=$('#logD');setText(dl,`day ${pct>=0?'+':''}${fmt(pct,1)} %`);dl.style.color=pct>=0?'var(--up)':'var(--down)';
+
+  const trades=(R.trades||[]).slice().sort((a,b)=>a.id-b.id).slice(-30);
+  const ghost=feed.filter(e=>e.agent==='entry'&&e.data&&e.data.shadow).slice(-10);
+  const rowsHtml=[];
+  ghost.forEach(e=>{const g=e.data;rowsHtml.push({k:Date.parse(e.at)||0,h:`<div class="row ghost"><span>shadow</span><span class="mid">${esc(short(e.message).replace(/^SHADOW \u00b7 /,''))}</span><span class="w">no order</span></div>`})});
+  trades.forEach(t=>{
+    const side=`<span class="${t.direction>0?'L':'S'}">${t.direction>0?'LONG':'SHORT'} ${t.lot}</span>`, nm=`<span class="x">${esc(NAMES[t.symbol]||t.symbol)}</span>`;
+    if(t.is_open){const p=pos.find(q=>q.ticket===t.ticket);const u=p?p.profit:0;
+      rowsHtml.push({k:Date.parse(t.opened_at)||0,h:`<div class="row open"><span>#${t.id}</span><span class="mid">${nm} ${side} ${fmt(t.entry,dg)}\u2192${p?fmt(p.price,dg):'--'}</span><span class="${u>=0?'L':'S'}">${u>=0?'+':'-'}$${fmt(Math.abs(u))} open</span></div>`})}
+    else{const p=t.profit||0;rowsHtml.push({k:Date.parse(t.opened_at)||0,h:`<div class="row"><span>#${t.id}</span><span class="mid">${nm} ${side} ${fmt(t.entry,dg)}\u2192${t.exit?fmt(t.exit,dg):'--'} <span style="color:var(--dim)">${esc(t.reason||'')}</span></span><span class="${p>=0?'L':'S'}">${t.r!=null?(t.r>=0?'+':'')+fmt(t.r,2)+'R ':''}${sgn$(p)}</span></div>`})}
+  });
+  rowsHtml.sort((a,b)=>a.k-b.k);
+  const re=$('#rows');const html=rowsHtml.length?rowsHtml.map(r=>r.h).join(''):'<div class="empty">no trades yet \u00b7 the Desk takes 0 to 3 setups a day</div>';
+  if(re._h!==html){const atEnd=re.scrollTop+re.clientHeight>=re.scrollHeight-30;re.innerHTML=html;re._h=html;if(atEnd)re.scrollTop=re.scrollHeight}
+
+  const fe=$('#feed');const fh=feed.slice(-40).map(e=>{const tm=e.at?new Date(e.at):null;return `<div class="e"><span>${tm?String(tm.getUTCHours()).padStart(2,'0')+':'+String(tm.getUTCMinutes()).padStart(2,'0'):''}</span><span style="color:${AGC[e.agent]||'#67e8f9'}">${esc(e.agent.toUpperCase())}</span><span>${esc(e.message)}</span></div>`}).join('')||'<div class="e"><span></span><span></span><span>no events yet</span></div>';
+  if(fe._h!==fh){const atEnd=fe.scrollTop+fe.clientHeight>=fe.scrollHeight-30;fe.innerHTML=fh;fe._h=fh;if(atEnd)fe.scrollTop=fe.scrollHeight}
+
+  setText($('#disc'),`${acc.demo?'Exness demo account':'Live account'} \u00b7 real prices${shadow?' \u00b7 shadow mode: no orders are sent':' and fills'} \u00b7 Not financial advice`);
+}
+
+function frame(ms){
+  const t=ms/1000, now=performance.now();
+  let act=null,best=0;for(const a of AG){const u=activeUntil[a.id]||0;if(u>now&&u>best){best=u;act=a}}
+  if(act){const b=LAY[act.id].bot;chief.tx=b[0]-1.1;chief.ty=b[1]+0.9}else{chief.tx=5+Math.sin(t*.3)*1.2;chief.ty=4+Math.cos(t*.23)*0.8}
+  chief.tx=Math.max(1,Math.min(9.2,chief.tx));chief.ty=Math.max(1.2,Math.min(7.3,chief.ty));
+  const dx=chief.tx-chief.x,dy=chief.ty-chief.y,dd=Math.hypot(dx,dy),sp=Math.min(dd,0.045);if(dd>0.01){chief.x+=dx/dd*sp;chief.y+=dy/dd*sp}
+  render(t);
+  drawOffice(t);
+  if(R&&R.state){drawCandles();drawBal()}
+  requestAnimationFrame(frame);
+}
+poll(); play(); requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

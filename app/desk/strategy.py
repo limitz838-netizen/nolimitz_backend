@@ -13,7 +13,10 @@ Rules (the September gold rules, unchanged):
   REGIME  H1 ATR14 / median of the last 100 ATR values between 0.6 and 2.0.
   RISK    Stop 1.5 x ATR, target 2.5 x ATR. Breakeven at +1R, then trail
           1 x ATR behind the best price once +1.5R is reached.
-  LIMITS  1 open position per symbol, 3 entries and 2 losses per UTC day.
+  LIMITS  1 open position per symbol. Fixed risk per trade, never increased after
+          losses (tested 18 Oct 2026: doubling after losses wiped the account; the
+          old 3-entry / 2-loss daily stop blocked only 5 of 520 setups and cost
+          3R, so it was removed). The worker keeps a 3% daily-loss circuit breaker.
   EXIT    Close if the H4 bias flips against the position.
 
 Bars are dicts: {"t": <bar open, unix seconds UTC>, "o", "h", "l", "c"}.
@@ -31,7 +34,6 @@ SESSION_START_UTC, SESSION_END_UTC = 7, 20
 ATR_RATIO_MIN, ATR_RATIO_MAX = 0.6, 2.0
 STOP_ATR, TARGET_ATR = 1.5, 2.5
 BREAKEVEN_R, TRAIL_START_R, TRAIL_ATR = 1.0, 1.5, 1.0
-MAX_ENTRIES_PER_DAY, MAX_LOSSES_PER_DAY = 3, 2
 MIN_H4_BARS = H4_SLOW + 20
 MIN_H1_BARS = ATR_MEDIAN_LEN + ATR_LEN + 10
 

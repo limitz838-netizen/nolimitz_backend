@@ -2,6 +2,7 @@
 app/routers/desk.py -- read-only API for the Desk page (Oct 2026)
 
   GET /api/desk/state?worker=desk-1&after_id=<last event id seen>
+  GET /api/desk/live      the Desk page itself (bot office, chart, log)
 
 Returns everything the Desk page draws in one call, so the page can poll it
 every few seconds: the worker's latest snapshot (balance, equity, positions,
@@ -13,8 +14,10 @@ never credentials. The worker masks the MT5 login before writing the snapshot.
 Nothing in this router can place, change or close a trade.
 """
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -23,6 +26,13 @@ from app.desk.models import DeskEvent, DeskState, DeskTrade
 router = APIRouter(prefix="/api/desk", tags=["desk"])
 
 STALE_AFTER_SEC = 60
+PAGE = Path(__file__).resolve().parent.parent / "desk" / "static" / "desk.html"
+
+
+@router.get("/live", response_class=HTMLResponse, include_in_schema=False)
+def desk_page():
+    """The live Desk page. It polls /api/desk/state on the same domain."""
+    return HTMLResponse(PAGE.read_text(encoding="utf-8"), headers={"Cache-Control": "no-cache"})
 
 
 def _trade_json(t: DeskTrade) -> dict:

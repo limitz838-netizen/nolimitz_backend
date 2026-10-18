@@ -328,11 +328,6 @@ class Desk:
     def guard_blocks(self, info, canon: str) -> Optional[str]:
         if not self.is_demo(info) and not self.cfg.ALLOW_REAL:
             return "real account \u00b7 Desk only trades demo until DESK_ALLOW_REAL=true"
-        entries, losses = self.day_counts()
-        if entries >= S.MAX_ENTRIES_PER_DAY:
-            return f"day limit \u00b7 {entries}/{S.MAX_ENTRIES_PER_DAY} entries used"
-        if losses >= S.MAX_LOSSES_PER_DAY:
-            return f"day limit \u00b7 {losses} losses, done for today"
         if self.day_start_balance:
             dd = (info.equity - self.day_start_balance) / self.day_start_balance * 100
             if dd <= -self.cfg.DAILY_LOSS_PCT:
@@ -350,7 +345,7 @@ class Desk:
         d = S.evaluate(h1, bias)
         self.decision[canon] = d
         bar_t = datetime.fromtimestamp(h1[-1]["t"] + 3600, timezone.utc).strftime("%H:%M")
-        self.event("scout", f"{canon} H1 {bar_t} UTC \u00b7 {d.scout}", canon, "ok" if d.signal else "info",
+        self.event("scout", f"H1 {bar_t} UTC \u00b7 {d.scout}", canon, "ok" if d.signal else "info",
                    {"bias": bias, "atr": round(d.atr, 3), "atr_ratio": round(d.atr_ratio, 2),
                     "ema20": round(d.ema20, s["digits"]), "close": d.close, "checks": d.checks})
         if not d.signal:
@@ -582,7 +577,7 @@ class Desk:
                      "symbols": self.cfg.SYMBOLS, "rules": "H4 EMA50/200 bias \u00b7 H1 EMA20 pullback \u00b7 1.5/2.5 ATR"},
             "day": {"date": str(self.day), "start_balance": self.day_start_balance,
                     "entries": entries, "losses": losses,
-                    "max_entries": S.MAX_ENTRIES_PER_DAY, "max_losses": S.MAX_LOSSES_PER_DAY},
+                    "daily_loss_limit_pct": self.cfg.DAILY_LOSS_PCT},
             "agents": self.agents, "positions": positions, "symbols": symbols,
             "broker_utc_offset_h": self.offset_sec // 3600,
         }
