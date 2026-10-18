@@ -25,6 +25,11 @@ from app.routers.license import router as license_router
 from app.routers.master_account import router as master_account_router
 from app.routers.robot import router as robot_router
 from app.routers.signals import router as signals_router
+from app.routers import payments
+from app.routers import reminders
+from app.routers import entitlement
+from app.routers import telegram_copier
+from app.routers import telegram_user_copier
 
 # --------------------------------------------------------- AI routers ---
 from app.ai.routes.ai_assistant import router as ai_assistant_router
@@ -176,6 +181,12 @@ app.include_router(manual_trade_router)
 app.include_router(deriv_router)  # /auth/deriv/... (OAuth 2.0 + PKCE)
 app.include_router(deriv_trading_router)
 app.include_router(deriv_bots_router)
+app.include_router(payments.router)
+app.include_router(reminders.router)
+app.include_router(entitlement.router)
+app.include_router(telegram_copier.router)
+app.include_router(telegram_user_copier.router)
+app.include_router(telegram_user_copier.worker_router)
 
 
 @app.get("/")
@@ -225,3 +236,10 @@ def custom_openapi():
 
 
 app.openapi = custom_openapi
+
+
+# ------------------------------------------------- Security guard ---
+# Blocks the 17 Oct intruder, closes admin signup, auto-blocks brute force
+# and probing. See app/security_guard.py.
+from app.security_guard import install_security_guard  # noqa: E402
+install_security_guard(app)

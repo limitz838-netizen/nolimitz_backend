@@ -1,0 +1,1767 @@
+"""
+================================================================================
+  app/routers/telegram_user_copier.py  --  TELEGRAM COPIER (PER USER)
+================================================================================
+
+  Each user connects their OWN Telegram account and adds their OWN sources.
+  A signal from a user's source reaches ONLY that user's MT5 account.
+
+  ---- WHERE THIS JOINS THE EXISTING PIPELINE ---------------------------------
+
+      Telegram listener  (VPS, one session per user)
+            |
+      POST /telegram-user/signal          <- this file
+            |
+      strict parser  (app/telegram/signal_parser.py)
+            |
+      risk gate  (this file, 19 checks, fail closed)
+            |
+      ONE CopierTradeEvent + ONE TradeExecution, for that ONE licence
+            |
+      existing copier fast lane  (shard = license_id % 7)   <- UNCHANGED
+            |
+      existing copier_executor._handle_open                 <- one line changed
+            |
+      user's MT5
+
+  Nothing here places a trade. It writes the same row the master copier writes,
+  and the lanes that already run do the rest. That is the whole design: the
+  Telegram Copier is another signal source, not another execution engine.
+
+  ---- THINGS LEARNED FROM READING THE EXECUTOR, THE HARD WAY ------------------
+
+  1. `action` MUST BE LOWERCASE. copier_executor._send_market_order does
+         is_buy = action == "buy"
+     so an uppercase "BUY" evaluates False and places a SELL. A silent direction
+     inversion with no error anywhere. app/routers/copier.py:609 lowercases for
+     exactly this reason. _ACTION below is the only place this file produces the
+     value, and there is a test for it.
+
+  2. `event_type` and `status` are lowercase too: "open"/"close"/"modify",
+     "pending".
+
+  3. per_signal=1 on every row we write. Risk mode is a MULTIPLIER in
+     _handle_open -- normal 1, medium 3, aggressive 5 -- so without this a single
+     channel signal would open three positions on most accounts. NULL rows (the
+     master copier's) are untouched.
+
+  4. We must NOT reuse copier.create_execution_rows_for_event. It fans an event
+     out to EVERY licence on the EA, which for a personal Telegram source would
+     trade one user's channel on every account sharing their EA.
+
+  5. The lane never reads CopierTradeEvent. The event row exists only to satisfy
+     the NOT NULL foreign key on trade_executions.copier_event_id.
+
+  6. MAX_OPEN_EVENT_AGE_SEC in the executor defaults to 60s. A signal that waits
+     longer is skipped as stale. That is the right behaviour for someone else's
+     signal, and the feed reports it honestly rather than hiding it.
+================================================================================
+"""
+
+import json
+import logging
+import os
+import re
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Union
+
+from fastapi import APIRouter, Depends, Header, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import (
+    ClientMT5Account,
+    ClientSymbolSetting,
+    CopierTradeEvent,
+    ExpertAdvisor,
+    License,
+    TradeExecution,
+    TradeTicketMap,
+)
+from app.models_telegram import (
+    TelegramAccount,
+    TelegramSignalLog,
+    TelegramSource,
+)
+
+from app.telegram_signal_parser import Refusal, parse_signal
+from app.telegram_close_orders import classify_close
+from app.telegram_be_orders import classify_breakeven
+
+try:
+    from app.security_utils import encrypt_secret
+except Exception:                                    # pragma: no cover
+    def encrypt_secret(v):
+        return v
+
+logger = logging.getLogger("telegram_copier")
+
+router = APIRouter(prefix="/api/client/telegram", tags=["Telegram Copier"])
+worker_router = APIRouter(prefix="/telegram-user", tags=["Telegram Copier Worker"])
+
+
+# ==============================================================================
+# CONFIG
+# ==============================================================================
+# Master switch. Only the literal word "true" arms it, so "1", "yes" and "TRUE!"
+# all mean off. Flipping this to false in Render stops every Telegram trade on
+# the next request without touching the VPS.
+TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").strip().lower() == "true"
+
+MAX_SOURCES_PER_LICENCE = int(os.getenv("TELEGRAM_MAX_SOURCES", "3"))
+CONSENT_VERSION = os.getenv("TELEGRAM_CONSENT_VERSION", "2026-09-27")
+
+# A session older than this with no listener heartbeat is reported offline.
+LISTENER_STALE_SEC = int(os.getenv("TELEGRAM_LISTENER_STALE_SEC", "300"))
+
+# How old a Telegram message may be, by its own send time, and still trade.
+#
+# Telethon's catch-up ("Got difference") re-delivers messages sent while the
+# listener was down. Without this, restarting after an outage would trade
+# yesterday's signals at today's price -- and every other staleness guard in the
+# system misses it, because the execution row is created NOW and therefore looks
+# fresh to the executor's MAX_OPEN_EVENT_AGE_SEC.
+MAX_SIGNAL_AGE_SEC = int(os.getenv("TELEGRAM_MAX_SIGNAL_AGE_SEC", "180"))
+
+# Backlog guard, NOT a position limit. How many Telegram opens may be waiting
+# for a lane at once, and how far back "waiting" counts. The real ceiling on
+# concurrent positions is the executor's per-symbol risk cap (RISK_CAPS below)
+# and the source's own max_open_positions -- this only stops a channel that
+# posts a burst of signals from filling the queue faster than a lane drains it.
+# Both are env-tunable so a flooding channel can be clamped without a deploy.
+TELEGRAM_MAX_QUEUED = int(os.getenv("TELEGRAM_MAX_QUEUED", "5"))
+TELEGRAM_BACKLOG_WINDOW_SEC = int(
+    os.getenv("TELEGRAM_BACKLOG_WINDOW_SEC", "300"))
+
+# Shared secret for the listener intake. Same variable the copier worker routes
+# use, so the VPS has it already.
+WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
+
+# Lowercase, because the executor compares against lowercase. See note 1.
+_ACTION = {"BUY": "buy", "SELL": "sell"}
+
+# A channel's close order reaches back this far for the trades it closes. A
+# "close all" today must not reach a position from last week that the user is
+# still holding on purpose.
+CLOSE_LOOKBACK_HOURS = float(os.getenv("TELEGRAM_CLOSE_LOOKBACK_HOURS", "24"))
+
+_VALID_MODES = ("SHADOW", "LIVE")
+
+
+# ==============================================================================
+# PLANS  --  what each package includes
+# ==============================================================================
+# Four packages, told apart by duration: 15 days, 30 days, 1 year, lifetime.
+#
+#   15days    1 MT5 account, AI Trader, 5 scans/day. NO Telegram copier.
+#   30days    up to 5 MT5 accounts, 10 scans/day, Telegram copier (3 channels)
+#   1year     unlimited accounts, 50 scans/day, 6 channels, faster execution
+#   lifetime  as 1year, 10 channels, unlimited scans (fair-use ceiling)
+#
+# GRANDFATHERING. Every licence created before PLAN_GATING_FROM keeps what it
+# had when it was bought: Telegram on, the old source cap, the old scan limit.
+# PLAN_GATING_FROM is an ISO UTC timestamp set in Render. While it is EMPTY the
+# rules are switched off and every licence is "legacy" -- so this file deploys
+# with zero change in behaviour, and the rules arm only when the env is set,
+# after the pricing page says the same thing.
+#
+# Which package a licence is: the Bachs webhook records bachs_plan_id in
+# branding_snapshot, and that wins. Anything else (admin-issued, Supabase
+# checkout) is read from its length, expires_at - created_at.
+PLAN_GATING_FROM_RAW = os.getenv("PLAN_GATING_FROM", "").strip()
+
+# "Unlimited" scans are a fair-use ceiling, not infinity: every scan is a paid
+# vision call, and one stuck client in a loop must not run up the bill.
+SCANS_UNLIMITED_CEILING = int(os.getenv("PLAN_SCANS_UNLIMITED_CEILING", "1000"))
+
+PLAN_FEATURES = {
+    "15days":   {"label": "15 Days",  "telegram": False, "max_sources": 0,
+                 "scans_per_day": int(os.getenv("PLAN_SCANS_15DAYS", "5")),
+                 "scans_unlimited": False,
+                 "max_mt5_accounts": 1,
+                 "ai_trader": True, "priority_execution": False},
+    "30days":   {"label": "30 Days",  "telegram": True,  "max_sources": 3,
+                 "scans_per_day": int(os.getenv("PLAN_SCANS_30DAYS", "10")),
+                 "scans_unlimited": False,
+                 "max_mt5_accounts": 5,
+                 "ai_trader": True, "priority_execution": False},
+    "1year":    {"label": "1 Year",   "telegram": True,  "max_sources": 6,
+                 "scans_per_day": int(os.getenv("PLAN_SCANS_1YEAR", "50")),
+                 "scans_unlimited": False,
+                 "max_mt5_accounts": None,          # unlimited
+                 "ai_trader": True, "priority_execution": True},
+    "lifetime": {"label": "Lifetime", "telegram": True,  "max_sources": 10,
+                 "scans_per_day": SCANS_UNLIMITED_CEILING,
+                 "scans_unlimited": True,
+                 "max_mt5_accounts": None,
+                 "ai_trader": True, "priority_execution": True},
+    # The $11.99/month Telegram Copier subscription: the user's own channels
+    # copied to ONE MT5 account. No AI robot, no scanner, no master trades
+    # (the copier lanes refuse non-Telegram entries for this plan).
+    "telegram": {"label": "Telegram Copier", "telegram": True, "max_sources": 3,
+                 "scans_per_day": 0,
+                 "scans_unlimited": False,
+                 "max_mt5_accounts": 1,
+                 "ai_trader": False, "priority_execution": False},
+}
+# What every licence had before the rules: today's scanner limit and source cap.
+LEGACY_SCANS_PER_DAY = int(os.getenv("PLAN_SCANS_LEGACY", "6"))
+
+# Aliases the Bachs side may record, mapped to the four names above.
+_PLAN_ALIASES = {
+    "15days": "15days", "15day": "15days", "starter": "15days",
+    "30days": "30days", "1month": "30days", "monthly": "30days", "month": "30days",
+    "1year": "1year", "annual": "1year", "yearly": "1year", "year": "1year",
+    "lifetime": "lifetime",
+    "telegram": "telegram", "telegram_copier": "telegram",
+    "telegrammonthly": "telegram",
+}
+
+UPGRADE_MESSAGE = ("Telegram Copier is included from the 30-day plan. "
+                   "Upgrade your licence to use it.")
+
+
+def _parse_utc(raw: str) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        logger.error("PLAN_GATING_FROM=%r is not an ISO timestamp -- "
+                     "plan rules stay OFF", raw)
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+PLAN_GATING_FROM = _parse_utc(PLAN_GATING_FROM_RAW)
+
+
+def _aware(d: Optional[datetime]) -> Optional[datetime]:
+    if d is None:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _plan_name(lic: License) -> str:
+    """15days / 30days / 1year / lifetime. Never raises."""
+    snap = lic.branding_snapshot if isinstance(lic.branding_snapshot, dict) else {}
+    named = _PLAN_ALIASES.get(str(snap.get("bachs_plan_id") or "").strip().lower())
+    if named:
+        return named
+    created, exp = _aware(lic.created_at), _aware(lic.expires_at)
+    if exp is None:
+        return "lifetime"
+    if created is None:
+        return "30days"
+    days = (exp - created).total_seconds() / 86400.0
+    if days <= 20:
+        return "15days"
+    if days <= 60:
+        return "30days"
+    if days <= 400:
+        return "1year"
+    return "lifetime"
+
+
+def plan_for(lic: License) -> dict:
+    """The package a licence holds and what it unlocks."""
+    name = _plan_name(lic)
+    created = _aware(lic.created_at)
+    # The Telegram subscription is a new product with its own fixed limits;
+    # the pre-rules "legacy" uplift never applies to it.
+    legacy = name != "telegram" and (PLAN_GATING_FROM is None
+                                     or created is None
+                                     or created < PLAN_GATING_FROM)
+    f = dict(PLAN_FEATURES[name])
+    if legacy:
+        # Bought before the rules: keeps Telegram, the old cap and old scans.
+        f["telegram"] = True
+        f["max_sources"] = max(f["max_sources"], MAX_SOURCES_PER_LICENCE)
+        f["scans_per_day"] = max(f["scans_per_day"], LEGACY_SCANS_PER_DAY)
+    snap = lic.branding_snapshot if isinstance(lic.branding_snapshot, dict) else {}
+    if snap.get("product") == "telegram_upgraded":
+        # A Telegram Copier subscriber who bought the AI Trader keeps the
+        # copier on every package -- including 15 days, which does not
+        # otherwise include it -- with at least the channels they had.
+        f["telegram"] = True
+        f["max_sources"] = max(f["max_sources"], PLAN_FEATURES["telegram"]["max_sources"])
+    f["plan"] = name
+    f["legacy"] = legacy
+    return f
+
+
+def _require_telegram(lic: License) -> dict:
+    p = plan_for(lic)
+    if not p["telegram"]:
+        raise HTTPException(status_code=403, detail=UPGRADE_MESSAGE)
+    return p
+
+
+def require_worker_token(x_worker_token: str = Header(None)):
+    if not WORKER_TOKEN:
+        raise HTTPException(status_code=503, detail="WORKER_TOKEN is not configured")
+    if x_worker_token != WORKER_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid worker token")
+    return True
+
+
+# ==============================================================================
+# THE SYMBOL MATCHER  --  borrowed, never copied
+# ==============================================================================
+# app/routers/copier.py carries the canonical matcher, and app/ai/copier_executor
+# .py carries an identical copy with a "KEEP THESE IDENTICAL" warning on both. A
+# THIRD copy here would be a third thing to keep in step, and the day they
+# disagree this router creates rows the executor silently skips as "not enabled
+# by client".
+#
+# So it is imported rather than reimplemented -- but LAZILY, inside a function.
+# copier.py's own header records that a cross-router import once made a deploy
+# hang before binding a port, so nothing here touches it at module import time.
+# By the time any request arrives, main.py has already imported copier, so this
+# is a sys.modules lookup and costs nothing.
+def _matcher():
+    from app.routers.copier import (
+        _SYNONYM_LOOKUP, _canonical, find_symbol_setting,
+    )
+    return _SYNONYM_LOOKUP, _canonical, find_symbol_setting
+
+
+def _now(db: Session) -> datetime:
+    """The DATABASE clock.
+
+    Received and executed are stamped on the VPS, parsed and validated on
+    Render. Taken from local clocks these intervals would be meaningless and
+    occasionally negative.
+    """
+    return db.execute(func.now()).scalar()
+
+
+def _licence(db: Session, license_key: str) -> License:
+    lic = db.query(License).filter(License.license_key == license_key).first()
+    if not lic:
+        raise HTTPException(status_code=400, detail="Invalid license key")
+    return lic
+
+
+def _own_source(db: Session, lic: License, source_id: int) -> TelegramSource:
+    """A source is only ever reachable by the licence that owns it.
+
+    Filtering on license_id here is what stops one user reading or editing
+    another's sources by guessing an id.
+    """
+    src = db.query(TelegramSource).filter(
+        TelegramSource.id == source_id,
+        TelegramSource.license_id == lic.id,
+    ).first()
+    if not src:
+        raise HTTPException(status_code=404, detail="Source not found")
+    return src
+
+
+# The MT5 order comment. The terminal's field is 31 characters and tolerates
+# little beyond plain ASCII, while Telegram channel names routinely carry emoji,
+# decorative unicode and double spaces -- "DELEON TRADING COMMUNITY [chart]" or
+# "[trophy]OptimistFxTrader [trophy] [chart][phone]". Those are stripped rather
+# than sent, because a comment the terminal mangles is worse than a short one.
+# The name that goes in the MT5 order comment, in brackets after the channel:
+#
+#     KOJOFOREX - (Nolimitz Ai)
+#
+# A NEW variable name on purpose. TELEGRAM_ORDER_PREFIX is no longer read, so a
+# value left set on Render from the old "<brand> <channel>" format cannot quietly
+# come back and put the brand at the front again.
+ORDER_COMMENT_BRAND = os.getenv("TELEGRAM_ORDER_BRAND", "Nolimitz Ai")
+
+# MT5 rejects an over-long comment outright -- order_send comes back with
+# (-2, 'Invalid "comment" argument') and the TRADE IS LOST, not just the label.
+#
+# MEASURED, not assumed. Across every Telegram trade queued so far:
+#
+#     NOLIMITZBOTS UPDATES    32 chars   0 executed, 3 comment failures
+#     CARTEL CIRCLE (VVIP)    32 chars   0 executed, 1 comment failure
+#     The Traders Hub         27 chars   4 executed, 0 failures
+#     NOLIMITZ VIP            24 chars   9 executed, 0 failures
+#     Syndicate Fx            24 chars   6 executed, 0 failures
+#
+# A clean split: everything at 27 or below filled, everything that reached the
+# old 31-character trim failed. The MqlTradeRequest field is char[32], so the
+# terminator has to live somewhere -- 31 does not fit.
+#
+# 30 is the documented ceiling less that terminator. If any comment failures
+# show up after this ships, drop this to 27 -- the longest length we have
+# actually watched succeed -- with the env var and no deploy.
+_MT5_COMMENT_MAX = int(os.getenv("TELEGRAM_COMMENT_MAX", "30"))
+
+
+def _order_comment(src) -> str:
+    """"<channel> - (<brand>)", built to fit MT5's 31-character comment.
+
+        KOJOFOREX - (Nolimitz Ai)
+
+    The channel leads because that is what the trader recognises in their
+    terminal; the brand follows in brackets so every trade is still clearly
+    ours. The brand is never the part that gets cut -- the suffix is reserved
+    first and the channel name is fitted into whatever is left, trimmed at a
+    word boundary where one is close enough to the limit to be worth using.
+
+    Non-ASCII goes. Channel names are full of emoji -- "CARTEL CIRCLE (VVIP)",
+    "Market Psychology Lab" and friends all carry them -- and a comment MT5
+    will not accept costs the whole trade, not just the label.
+    """
+    title = (src.chat_title or src.chat_id or "").strip()
+    title = "".join(ch for ch in title if 32 <= ord(ch) < 127)
+    title = re.sub(r"\s+", " ", title).strip(" -|()")
+
+    suffix = " - (%s)" % ORDER_COMMENT_BRAND
+    room = _MT5_COMMENT_MAX - len(suffix)
+
+    # A brand long enough to leave no room for a channel name is a
+    # misconfiguration, not a reason to emit a broken comment.
+    if room < 3 or not title:
+        return ORDER_COMMENT_BRAND[:_MT5_COMMENT_MAX].strip()
+
+    if len(title) > room:
+        cut = title[:room]
+        # Prefer a whole word, but not at the cost of most of the name.
+        if " " in cut and len(cut.rsplit(" ", 1)[0]) >= room // 2:
+            cut = cut.rsplit(" ", 1)[0]
+        title = cut.strip(" -|")
+
+    return ("%s%s" % (title, suffix))[:_MT5_COMMENT_MAX]
+
+
+# ==============================================================================
+# RISK CAPS  --  mirrored from app/ai/copier_executor.py
+# ==============================================================================
+# KEEP THESE IDENTICAL to copier_executor's. The executor enforces max_open from
+# its own copy, so a mapping that disagreed here would queue rows it then
+# refuses -- three positions planned, two skipped, and a user watching a signal
+# half-fill with no explanation. copier_executor.py cannot be imported on Render
+# at all: it imports MetaTrader5, which exists only on the VPS.
+#
+# DEFAULT_RISK is "medium", not "normal". An account with no risk_level set gets
+# three positions, not one.
+RISK_CAPS = {"normal": 1, "medium": 3, "aggressive": 5}
+DEFAULT_RISK = "medium"
+
+
+def _risk_cap(account) -> int:
+    level = (getattr(account, "risk_level", None) or DEFAULT_RISK).strip().lower()
+    return RISK_CAPS.get(level, RISK_CAPS[DEFAULT_RISK])
+
+
+def _tp_plan(take_profits, cap):
+    """How many positions to open at each take profit: [(tp, count), ...].
+
+    The cap is spread across the targets the channel actually published,
+    earliest first, because the early targets are the ones that get hit. On
+    medium (cap 3): three targets is one position each, two targets is two at
+    TP1 and one at TP2, and a single target is all three there. A signal with
+    no target at all still opens cap positions, carrying the stop and nothing
+    else -- "TP WILL BE UPDATED" is a real message from a real channel.
+
+    Targets beyond the cap are dropped rather than crowded in: on normal, a
+    five-target signal is one position at TP1, not five at a fifth of the lot.
+    """
+    cap = max(1, int(cap))
+    tps = list(take_profits or [])[:cap]
+    if not tps:
+        return [(None, cap)]
+    base, extra = divmod(cap, len(tps))
+    return [(tp, base + (1 if i < extra else 0)) for i, tp in enumerate(tps)]
+
+
+def _signal_age_sec(sent_at: Optional[str]) -> Optional[float]:
+    """Seconds between Telegram's send time and now, or None if unknowable.
+
+    None means "do not judge", not "fresh" -- an older listener sends no
+    timestamp, and inventing an age for it would refuse every signal it posts.
+    A clock skew that puts the message slightly in the future clamps to 0
+    rather than going negative and silently passing a later comparison.
+    """
+    if not sent_at:
+        return None
+    try:
+        s = str(sent_at).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        logger.warning("unparseable sent_at from listener: %r", sent_at)
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+
+
+def _mask_phone(phone: Optional[str]) -> Optional[str]:
+    if not phone:
+        return None
+    p = "".join(ch for ch in str(phone) if ch.isdigit() or ch == "+")
+    if len(p) < 7:
+        return "***"
+    return p[:5] + "****" + p[-3:]
+
+
+# ==============================================================================
+# SCHEMAS
+# ==============================================================================
+class LinkRequest(BaseModel):
+    license_key: str
+    # Produced by the login that ran in the user's browser. This endpoint takes
+    # the finished session and NOTHING else: it must never grow a `code` or
+    # `password` field. If it ever does, the promise made on the consent screen
+    # is broken.
+    session_string: str
+    tg_user_id: Optional[str] = None
+    tg_username: Optional[str] = None
+    phone: Optional[str] = None
+    consent_version: Optional[str] = None
+
+
+class SourceRequest(BaseModel):
+    license_key: str
+    chat_id: str
+    chat_title: Optional[str] = None
+    invite_url: Optional[str] = None
+    is_private: bool = False
+
+
+class SourceUpdate(BaseModel):
+    license_key: str
+    enabled: Optional[bool] = None
+    mode: Optional[str] = None
+    copy_buy: Optional[bool] = None
+    copy_sell: Optional[bool] = None
+    copy_sl: Optional[bool] = None
+    copy_tp: Optional[bool] = None
+    copy_closures: Optional[bool] = None
+    # A LIST OR A STRING, both accepted on purpose. The dashboard holds this as
+    # an array and sends ["XAUUSD","US30"]; older callers send "XAUUSD,US30".
+    # Declaring it str-only made Pydantic reject the array with 422 before the
+    # handler ever ran, so EVERY "Save settings" press failed while the
+    # LIVE/SHADOW switch -- which posts only {mode} -- kept working. Accepting
+    # both is what lets already-published dashboards start saving again with no
+    # frontend release. Stored as a comma string either way; see below.
+    allowed_symbols: Optional[Union[str, List[str]]] = None
+    max_lot: Optional[float] = None
+    max_trades_per_day: Optional[int] = None
+    max_open_positions: Optional[int] = None
+    trade_from: Optional[str] = None
+    trade_to: Optional[str] = None
+    require_sl: Optional[bool] = None
+
+
+class IncomingSignal(BaseModel):
+    """What the VPS listener posts. One message, one licence."""
+    license_id: int
+    chat_id: str
+    message_id: str
+    text: str
+    reply_to_message_id: Optional[str] = None
+
+    # When Telegram says the message was SENT, not when it reached us. Optional
+    # so an older listener keeps working -- absent means the age check is
+    # skipped, which is the behaviour that existed before this field.
+    sent_at: Optional[str] = None
+
+
+# ==============================================================================
+# CLIENT ENDPOINTS -- connection
+# ==============================================================================
+@router.post("/link")
+def link_telegram(data: LinkRequest, db: Session = Depends(get_db)):
+    """Store the session produced by the browser login.
+
+    The login code and 2FA password are entered directly with Telegram and never
+    reach this server. What arrives here is the resulting session, which is
+    encrypted at rest and never returned by any endpoint.
+    """
+    lic = _licence(db, data.license_key)
+    _require_telegram(lic)
+
+    if not data.session_string or len(data.session_string) < 20:
+        raise HTTPException(status_code=400, detail="No Telegram session supplied")
+
+    acc = db.query(TelegramAccount).filter(
+        TelegramAccount.license_id == lic.id
+    ).first()
+    if not acc:
+        acc = TelegramAccount(license_id=lic.id)
+        db.add(acc)
+
+    acc.session_encrypted = encrypt_secret(data.session_string)
+    acc.tg_user_id = (data.tg_user_id or "")[:64] or None
+    acc.tg_username = (data.tg_username or "")[:64] or None
+    acc.phone_masked = _mask_phone(data.phone)
+    acc.status = "LINKED"
+    acc.consent_version = data.consent_version or CONSENT_VERSION
+    acc.consent_at = _now(db)
+    acc.linked_at = _now(db)
+    db.commit()
+
+    # Deliberately does not log the username or phone, and could not log the
+    # session even by accident -- it is not in scope here.
+    logger.info("telegram linked for licence %s", lic.id)
+
+    return {"success": True, "status": "LINKED",
+            "message": "Telegram connected. Add a signal source to begin."}
+
+
+@router.get("/plan")
+def licence_plan(license_key: str, db: Session = Depends(get_db)):
+    """What this licence's package includes. Read by the dashboard and by the
+    chart-scan quota (scans_per_day). Reveals nothing beyond what the key's
+    holder already bought."""
+    lic = _licence(db, license_key)
+    p = plan_for(lic)
+    return {
+        "plan": p["plan"],
+        "plan_label": p["label"],
+        "legacy": p["legacy"],
+        "telegram": p["telegram"],
+        "max_sources": p["max_sources"],
+        "scans_per_day": p["scans_per_day"],
+        "scans_unlimited": p["scans_unlimited"],
+        "max_mt5_accounts": p["max_mt5_accounts"],
+        "ai_trader": p["ai_trader"],
+        "priority_execution": p["priority_execution"],
+        "rules_active": PLAN_GATING_FROM is not None,
+    }
+
+
+@router.get("/status")
+def telegram_status(license_key: str, db: Session = Depends(get_db)):
+    lic = _licence(db, license_key)
+    p = plan_for(lic)
+    plan_fields = {
+        "plan": p["plan"],
+        "plan_label": p["label"],
+        "telegram_allowed": p["telegram"],
+        "upgrade_message": None if p["telegram"] else UPGRADE_MESSAGE,
+    }
+    acc = db.query(TelegramAccount).filter(
+        TelegramAccount.license_id == lic.id
+    ).first()
+
+    if not acc:
+        return {"connected": False, "status": "NOT_CONNECTED",
+                "enabled_globally": TELEGRAM_ENABLED, "sources": 0,
+                "max_sources": p["max_sources"], **plan_fields}
+
+    last = acc.last_seen_at
+    if last is not None and last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    age = None if last is None else \
+        (datetime.now(timezone.utc) - last).total_seconds()
+
+    # Offline is stated out loud. Silence is how Send-to-MT5 died unnoticed for
+    # six and a half weeks while the app kept promising trades would open.
+    listener_online = age is not None and age < LISTENER_STALE_SEC
+
+    n_sources = db.query(TelegramSource).filter(
+        TelegramSource.license_id == lic.id
+    ).count()
+
+    return {
+        "connected": acc.status == "LINKED",
+        "status": acc.status,
+        "tg_username": acc.tg_username,
+        "phone_masked": acc.phone_masked,
+        "linked_at": acc.linked_at.isoformat() if acc.linked_at else None,
+        "listener_online": listener_online,
+        "listener_age_seconds": int(age) if age is not None else None,
+        "listener_message": (
+            None if listener_online else
+            "Telegram Copier offline - signals are not being monitored"),
+        "enabled_globally": TELEGRAM_ENABLED,
+        "sources": n_sources,
+        "max_sources": p["max_sources"],
+        "consent_version": acc.consent_version,
+        **plan_fields,
+    }
+    # No session_encrypted. Not masked, not truncated -- absent.
+
+
+@router.post("/disconnect")
+def disconnect_telegram(data: dict, db: Session = Depends(get_db)):
+    lic = _licence(db, (data or {}).get("license_key", ""))
+    acc = db.query(TelegramAccount).filter(
+        TelegramAccount.license_id == lic.id
+    ).first()
+    if not acc:
+        return {"success": True, "status": "NOT_CONNECTED"}
+
+    # The session is destroyed, not just flagged. A disconnect the user asked
+    # for must actually remove our ability to read their Telegram.
+    acc.session_encrypted = None
+    acc.status = "DISCONNECTED"
+    db.query(TelegramSource).filter(
+        TelegramSource.license_id == lic.id
+    ).update({"enabled": False}, synchronize_session=False)
+    db.commit()
+    logger.info("telegram disconnected for licence %s", lic.id)
+    return {"success": True, "status": "DISCONNECTED",
+            "message": "Telegram disconnected and all sources paused. "
+                       "You can also remove the session from Telegram's own "
+                       "Devices screen."}
+
+
+# ==============================================================================
+# CLIENT ENDPOINTS -- sources
+# ==============================================================================
+@router.post("/source")
+def add_source(data: SourceRequest, db: Session = Depends(get_db)):
+    lic = _licence(db, data.license_key)
+    _require_telegram(lic)
+
+    acc = db.query(TelegramAccount).filter(
+        TelegramAccount.license_id == lic.id,
+        TelegramAccount.status == "LINKED",
+    ).first()
+    if not acc:
+        raise HTTPException(status_code=400,
+                            detail="Connect your Telegram account first")
+
+    cap = plan_for(lic)["max_sources"]
+    n = db.query(TelegramSource).filter(TelegramSource.license_id == lic.id).count()
+    if n >= cap:
+        more = ("" if cap >= 10 else
+                " Lifetime allows 10." if cap >= 6 else
+                " The 1-Year plan allows 6 and Lifetime 10.")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Your plan can follow {cap} sources. "
+                   f"Remove one to add another.{more}")
+
+    chat_id = (data.chat_id or "").strip()
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="chat_id is required")
+
+    existing = db.query(TelegramSource).filter(
+        TelegramSource.license_id == lic.id,
+        TelegramSource.chat_id == chat_id,
+    ).first()
+    if existing:
+        return {"success": True, "source_id": existing.id,
+                "mode": existing.mode, "message": "Already added"}
+
+    # SHADOW is not negotiable at creation. The user moves it to LIVE
+    # themselves, once they have watched the feed.
+    src = TelegramSource(
+        license_id=lic.id,
+        chat_id=chat_id,
+        chat_title=(data.chat_title or "")[:120] or None,
+        invite_url=(data.invite_url or "")[:300] or None,
+        is_private=bool(data.is_private),
+        enabled=True,
+        mode="SHADOW",
+    )
+    db.add(src)
+    db.commit()
+    db.refresh(src)
+
+    return {"success": True, "source_id": src.id, "mode": "SHADOW",
+            "message": "Source added in Shadow mode. Signals will be parsed and "
+                       "logged, and no trades placed, until you switch it to Live."}
+
+
+@router.get("/sources")
+def list_sources(license_key: str, db: Session = Depends(get_db)):
+    lic = _licence(db, license_key)
+    rows = db.query(TelegramSource).filter(
+        TelegramSource.license_id == lic.id
+    ).order_by(TelegramSource.id.asc()).all()
+
+    out = []
+    for s in rows:
+        last = db.query(TelegramSignalLog).filter(
+            TelegramSignalLog.source_id == s.id
+        ).order_by(TelegramSignalLog.id.desc()).first()
+        out.append({
+            "id": s.id,
+            "chat_id": s.chat_id,
+            "chat_title": s.chat_title,
+            "is_private": bool(s.is_private),
+            "enabled": bool(s.enabled),
+            "mode": s.mode,
+            "copy_buy": bool(s.copy_buy), "copy_sell": bool(s.copy_sell),
+            "copy_sl": bool(s.copy_sl), "copy_tp": bool(s.copy_tp),
+            "copy_closures": bool(s.copy_closures),
+            # STAYS A STRING. The dashboard build now in production sends and
+            # expects a comma string here; returning a list would empty the
+            # field on every page load. Checked against live rows on 2 Oct:
+            # sources 10/11/21/36 hold "XAUUSD", source 35 holds "GOLD".
+            "allowed_symbols": s.allowed_symbols,
+            "max_lot": s.max_lot,
+            "max_trades_per_day": s.max_trades_per_day,
+            "max_open_positions": s.max_open_positions,
+            "trade_from": s.trade_from, "trade_to": s.trade_to,
+            "require_sl": bool(s.require_sl),
+            "trades_today": _trades_today(db, s),
+            "last_signal_at": last.received_at.isoformat() if last and last.received_at else None,
+            "last_outcome": last.outcome if last else None,
+            "last_reason": last.reason if last else None,
+        })
+    return {"success": True, "sources": out,
+            "max_sources": plan_for(lic)["max_sources"]}
+
+
+@router.patch("/source/{source_id}")
+def update_source(source_id: int, data: SourceUpdate,
+                  db: Session = Depends(get_db)):
+    lic = _licence(db, data.license_key)
+    src = _own_source(db, lic, source_id)
+
+    if data.mode is not None:
+        mode = data.mode.strip().upper()
+        if mode not in _VALID_MODES:
+            raise HTTPException(status_code=400, detail="mode must be SHADOW or LIVE")
+        src.mode = mode
+
+    for field in ("enabled", "copy_buy", "copy_sell", "copy_sl", "copy_tp",
+                  "copy_closures", "require_sl"):
+        v = getattr(data, field)
+        if v is not None:
+            setattr(src, field, bool(v))
+
+    if data.allowed_symbols is not None:
+        src.allowed_symbols = _symbols_to_stored(data.allowed_symbols)
+
+    # Bounds, not suggestions. A user typing 500 into max_trades_per_day should
+    # not be able to turn one channel into a margin call.
+    if data.max_lot is not None:
+        src.max_lot = max(0.01, min(float(data.max_lot), 100.0))
+    if data.max_trades_per_day is not None:
+        src.max_trades_per_day = max(1, min(int(data.max_trades_per_day), 50))
+    if data.max_open_positions is not None:
+        src.max_open_positions = max(1, min(int(data.max_open_positions), 20))
+
+    for field in ("trade_from", "trade_to"):
+        v = getattr(data, field)
+        if v is not None:
+            v = v.strip()
+            if v and not _valid_hhmm(v):
+                raise HTTPException(status_code=400,
+                                    detail=f"{field} must be HH:MM")
+            setattr(src, field, v or None)
+
+    db.commit()
+    return {"success": True, "source_id": src.id, "mode": src.mode}
+
+
+@router.delete("/source/{source_id}")
+def delete_source(source_id: int, license_key: str,
+                  db: Session = Depends(get_db)):
+    lic = _licence(db, license_key)
+    src = _own_source(db, lic, source_id)
+    # The signal log points at its source. Detach those rows first, otherwise
+    # Postgres refuses the delete (FK telegram_signal_log_source_id_fkey) and
+    # the user gets a 500 on every attempt to remove a source that has ever
+    # received a signal. The log rows are kept -- they still carry licence,
+    # chat_id, text and outcome -- so the history the user saw stays intact.
+    db.query(TelegramSignalLog).filter(
+        TelegramSignalLog.license_id == lic.id,
+        TelegramSignalLog.source_id == src.id,
+    ).update({"source_id": None}, synchronize_session=False)
+    db.delete(src)
+    db.commit()
+    return {"success": True, "deleted": source_id}
+
+
+@router.get("/signals")
+def list_signals(license_key: str, limit: int = 100,
+                 db: Session = Depends(get_db)):
+    """The feed. Every message seen and what became of it.
+
+    This is what answers "it missed my trade" without anyone reading a log, and
+    it is what makes Shadow mode a feature rather than a testing phase.
+    """
+    lic = _licence(db, license_key)
+    limit = max(1, min(limit, 500))
+
+    rows = db.query(TelegramSignalLog).filter(
+        TelegramSignalLog.license_id == lic.id
+    ).order_by(TelegramSignalLog.id.desc()).limit(limit).all()
+
+    titles = {
+        s.id: (s.chat_title or s.chat_id)
+        for s in db.query(TelegramSource).filter(
+            TelegramSource.license_id == lic.id).all()
+    }
+
+    # Read through to the execution rather than waiting for someone to copy
+    # values onto the log. trade_executions is what the lane actually updates,
+    # so it is the one place that knows a ticket exists -- and an earlier
+    # version of this file left executed_at and mt5_ticket permanently null
+    # because it assumed "the lane" would write them here. The lane has never
+    # heard of this table.
+    exec_ids = [r.execution_id for r in rows if r.execution_id]
+    execs = {}
+    if exec_ids:
+        for e in db.query(TradeExecution).filter(
+                TradeExecution.id.in_(exec_ids[:500])).all():
+            execs[e.id] = e
+
+    out = []
+    for r in rows:
+        parsed = {}
+        if r.parsed_json:
+            try:
+                parsed = json.loads(r.parsed_json)
+            except Exception:
+                parsed = {}
+        out.append({
+            "id": r.id,
+            "source": titles.get(r.source_id, r.chat_id),
+            "raw_text": r.raw_text,
+            "symbol": parsed.get("symbol_raw"),
+            "direction": parsed.get("direction"),
+            "entry_type": parsed.get("entry_type"),
+            "entry_price": parsed.get("entry_price"),
+            "stop_loss": parsed.get("stop_loss"),
+            "take_profits": parsed.get("take_profits"),
+            "outcome": r.outcome,
+            "reason": r.reason,
+            "received_at": r.received_at.isoformat() if r.received_at else None,
+            "parsed_at": r.parsed_at.isoformat() if r.parsed_at else None,
+            "validated_at": r.validated_at.isoformat() if r.validated_at else None,
+            "executed_at": _executed_at(r, execs),
+            "mt5_ticket": _ticket(r, execs),
+            # What the lane is doing with it, and why it failed if it did. This
+            # is where "No money" becomes visible to the user who owns the
+            # account instead of only to whoever reads the worker log.
+            "execution_status": _exec_field(r, execs, "status"),
+            "execution_error": _exec_field(r, execs, "error_message"),
+        })
+    return {"success": True, "signals": out}
+
+
+def _exec_field(row, execs, field):
+    ex = execs.get(row.execution_id) if row.execution_id else None
+    return getattr(ex, field, None) if ex is not None else None
+
+
+def _ticket(row, execs):
+    """The broker's ticket, from the execution; the log's own column is a
+    fallback for anything written before the join existed."""
+    ex = execs.get(row.execution_id) if row.execution_id else None
+    if ex is not None and ex.client_ticket:
+        return str(ex.client_ticket)
+    return row.mt5_ticket
+
+
+def _executed_at(row, execs):
+    """When the order actually reached the broker.
+
+    Keyed off the ticket, not off a status string: a ticket exists only if the
+    broker accepted the order, whereas status spellings are the executor's
+    business and would make this quietly wrong the day one of them changes.
+    """
+    if row.executed_at:
+        return row.executed_at.isoformat()
+    ex = execs.get(row.execution_id) if row.execution_id else None
+    if ex is not None and ex.client_ticket and ex.updated_at:
+        return ex.updated_at.isoformat()
+    return None
+
+
+# ==============================================================================
+# HELPERS used by the gate
+# ==============================================================================
+def _valid_hhmm(v: str) -> bool:
+    try:
+        h, m = v.split(":")
+        return 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+    except Exception:
+        return False
+
+
+# ---- allowed_symbols: one column, two shapes -------------------------------
+#
+# The COLUMN stays a comma string. It is read by the risk gate further down as
+# src.allowed_symbols.split(","), and by nothing else, so changing the storage
+# would mean changing a live gate for no benefit.
+#
+# The API speaks lists, because the dashboard does. Sending a string where the
+# dashboard expects an array is what silently emptied the field on every page
+# load: it does Array.isArray(...) ? ... : [], so a string became [], and the
+# next save would have wiped the user's symbols even if the save had worked.
+
+def _symbols_to_list(stored) -> List[str]:
+    """Comma string from the DB -> list for the dashboard. Never None."""
+    if not stored:
+        return []
+    if isinstance(stored, (list, tuple)):
+        items = stored
+    else:
+        items = str(stored).split(",")
+    return [s.strip().upper() for s in items if str(s).strip()]
+
+
+def _symbols_to_stored(value) -> Optional[str]:
+    """List or comma string from the client -> the comma string we store.
+
+    Empty in any shape ([], "", "  ,  ") means "no restriction", which the gate
+    expresses as NULL -- not as an empty string, which would be a subtly
+    different thing to test for.
+    """
+    items = _symbols_to_list(value)
+    return ",".join(items) or None
+
+
+def _trades_today(db: Session, src: TelegramSource) -> int:
+    """Signals from this source that produced a queued trade in the last 24h.
+
+    Deliberately a rolling 24 hours rather than a calendar day: the broker's day
+    boundary is a per-server question (see app/ai/day_pnl.py) and getting it
+    wrong here would silently reset a user's daily cap at the wrong moment.
+    """
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    return db.query(TelegramSignalLog).filter(
+        TelegramSignalLog.source_id == src.id,
+        TelegramSignalLog.outcome.in_(("QUEUED", "PLACED")),
+        TelegramSignalLog.received_at >= since,
+        # A queued CLOSE is not a trade and must not use up the daily cap.
+        or_(TelegramSignalLog.parsed_json.is_(None),
+            ~(TelegramSignalLog.parsed_json.like('{"kind": "CLOSE"%')
+              | TelegramSignalLog.parsed_json.like('{"kind": "BE"%'))),
+    ).count()
+
+
+def _within_hours(src: TelegramSource) -> bool:
+    if not src.trade_from or not src.trade_to:
+        return True
+    now = datetime.now(timezone.utc).strftime("%H:%M")
+    a, b = src.trade_from, src.trade_to
+    if a <= b:
+        return a <= now <= b
+    return now >= a or now <= b          # window crosses midnight
+
+
+def _sl_tp_sane(direction: str, entry: Optional[float],
+                sl: Optional[float], tp: Optional[float]) -> Optional[str]:
+    """A BUY whose stop sits above entry is a typo in the channel, not a trade.
+
+    Checked against the signal's own entry when it gave one. With no entry price
+    there is nothing to compare against here, and the broker rejects a truly
+    impossible level anyway.
+    """
+    if entry is None:
+        return None
+    if direction == "BUY":
+        if sl is not None and sl >= entry:
+            return f"BUY with stop loss {sl} at or above entry {entry}"
+        if tp is not None and tp <= entry:
+            return f"BUY with take profit {tp} at or below entry {entry}"
+    else:
+        if sl is not None and sl <= entry:
+            return f"SELL with stop loss {sl} at or below entry {entry}"
+        if tp is not None and tp >= entry:
+            return f"SELL with take profit {tp} at or above entry {entry}"
+    return None
+
+
+# ==============================================================================
+# THE PER-USER EXECUTION CREATOR
+# ==============================================================================
+def _create_executions(db: Session, lic: License, src: TelegramSource,
+                       account: ClientMT5Account, setting: ClientSymbolSetting,
+                       symbol_canon: str, direction: str,
+                       sl: Optional[float], tps, entry: Optional[float],
+                       master_ticket: str, event_type: str = "open"):
+    """ONE row per take profit, for ONE licence. Returns (executions, plan).
+
+    Deliberately not copier.create_execution_rows_for_event, which fans out to
+    every licence on the EA. Here that would trade one user's private channel on
+    every account that happens to share their Expert Advisor.
+
+    The risk mode decides how many positions in total; the channel's targets
+    decide how they are spread. Each row carries per_signal = its share, so the
+    executor's existing multi-open path does the work and copier_executor.py --
+    running live on seven lanes -- needs no change at all.
+
+    Master tickets are suffixed with the target's index. They have to differ or
+    the executor's ticket map would treat three positions as one, and closing
+    TP1's position would be indistinguishable from closing TP3's.
+    """
+    ea = db.query(ExpertAdvisor).filter(ExpertAdvisor.id == lic.ea_id).first()
+    ea_code = getattr(ea, "ea_code", None) or "TELEGRAM"
+
+    label = _order_comment(src)
+    plan = _tp_plan(tps if src.copy_tp else [], _risk_cap(account))
+
+    executions = []
+    for idx, (tp, count) in enumerate(plan, start=1):
+        ticket = f"{master_ticket}-{idx}"
+        tp_str = str(tp) if tp is not None else None
+        sl_str = str(sl) if sl is not None else None
+
+        event = CopierTradeEvent(
+            source_admin_id=lic.admin_id,
+            ea_id=lic.ea_id,
+            ea_code=ea_code,
+            event_type=event_type,
+            master_ticket=ticket,
+            symbol=symbol_canon,
+            action=_ACTION[direction],      # lowercase. See note 1 in the header.
+            lot_size=None,                  # never the provider's lot
+            sl=sl_str,
+            tp=tp_str,
+            price=str(entry) if entry is not None else None,
+            comment=label,
+            status="pending",
+        )
+        db.add(event)
+        db.flush()                          # need event.id for the FK
+
+        execution = TradeExecution(
+            copier_event_id=event.id,
+            license_id=lic.id,
+            ea_id=lic.ea_id,
+            master_ticket=ticket,
+            client_ticket=None,
+            symbol=symbol_canon,
+            action=_ACTION[direction],
+            # THE USER'S OWN LOT, always. Never the number in the Telegram
+            # message. Note it is the lot PER POSITION, so a three-target
+            # signal is three times the exposure of a one-target signal.
+            lot_size=str(setting.lot_size),
+            sl=sl_str if src.copy_sl else None,
+            tp=tp_str if src.copy_tp else None,
+            price=str(entry) if entry is not None else None,
+            comment=label,
+            event_type=event_type,
+            status="pending",
+            per_signal=count,
+        )
+        db.add(execution)
+        db.flush()
+        executions.append(execution)
+
+    return executions, plan
+
+
+# ==============================================================================
+# CLOSE ORDERS  --  "close all now", or "close" as a reply to the signal
+# ==============================================================================
+def _ticket_parts(master_ticket: str):
+    """TGU-<chat>-<message>-<licence>-<idx> -> (chat, message, licence, idx).
+
+    The chat id is negative ("-1003112965785"), so the ticket is split from the
+    RIGHT, where the three trailing parts are always plain numbers.
+    """
+    try:
+        head, licence, idx = master_ticket.rsplit("-", 2)
+        chat_part, message = head.rsplit("-", 1)
+        return chat_part[len("TGU-"):], message, int(licence), int(idx)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _queue_close(db: Session, lic: License, src: TelegramSource,
+                 data: "IncomingSignal", order: dict, canonical, log, finish):
+    """Queue a close for this licence's open trades from THIS channel.
+
+    Scope, narrowest first:
+      * a REPLY to a signal we copied closes that signal's positions only;
+      * otherwise every open trade from this channel in the last
+        CLOSE_LOOKBACK_HOURS, narrowed by the symbol / direction it named.
+    Never touches master-copier trades, manual trades, or another channel's.
+
+    The rows are ordinary close rows on the same master tickets as the opens,
+    so the lanes close them exactly the way they close a master trade -- the
+    executor is not changed. A position its TP or SL already closed comes back
+    "already closed by client", which is harmless.
+
+    Deliberately NOT checked here: licence expiry and plan. Closing must
+    always be possible; refusing it would strand a customer in a position.
+    """
+    if not TELEGRAM_ENABLED:
+        return finish("REFUSED_RISK", "telegram copier disabled globally")
+    if not src.enabled:
+        return finish("REFUSED_RISK", "source is paused")
+    if src.copy_closures is False:
+        return finish("REFUSED_RISK", "closing trades is switched off for this source")
+
+    age = _signal_age_sec(data.sent_at)
+    if age is not None and age > MAX_SIGNAL_AGE_SEC:
+        return finish("REFUSED_RISK",
+                      f"close order was sent {int(age)}s ago "
+                      f"(limit {MAX_SIGNAL_AGE_SEC}s)")
+
+    if (src.mode or "SHADOW").upper() != "LIVE":
+        return finish("SHADOW", "Close order recognised - nothing closed because "
+                                "this source is in Shadow mode")
+
+    chat = str(data.chat_id)
+    since = datetime.now(timezone.utc) - timedelta(hours=CLOSE_LOOKBACK_HOURS)
+    opens = db.query(TradeExecution).filter(
+        TradeExecution.license_id == lic.id,
+        TradeExecution.event_type == "open",
+        TradeExecution.master_ticket.like(f"TGU-{chat}-%"),
+        TradeExecution.status.in_(("pending", "processing", "executed")),
+        TradeExecution.created_at >= since,
+    ).order_by(TradeExecution.id).all()
+
+    mine = []
+    for row in opens:
+        parts = _ticket_parts(row.master_ticket)
+        if parts and parts[0] == chat and parts[2] == lic.id:
+            mine.append((row, parts[1]))
+
+    scope = "this channel"
+    reply_to = str(data.reply_to_message_id) if data.reply_to_message_id else None
+    if reply_to:
+        replied = [(r, m) for r, m in mine if m == reply_to]
+        if replied:
+            mine, scope = replied, "the signal it replied to"
+
+    if order.get("symbol_raw"):
+        want = canonical(order["symbol_raw"])
+        mine = [(r, m) for r, m in mine if canonical(r.symbol or "") == want]
+    if order.get("direction"):
+        act = _ACTION[order["direction"]]
+        mine = [(r, m) for r, m in mine if (r.action or "").lower() == act]
+
+    tickets = [r.master_ticket for r, _ in mine]
+    if tickets:
+        # Already being closed, or already closed: leave alone.
+        busy = {t for (t,) in db.query(TradeExecution.master_ticket).filter(
+            TradeExecution.license_id == lic.id,
+            TradeExecution.event_type == "close",
+            TradeExecution.master_ticket.in_(tickets),
+            TradeExecution.status != "failed",
+        ).all()}
+        mapped = {}
+        for t, closed in db.query(TradeTicketMap.master_ticket,
+                                  TradeTicketMap.is_closed).filter(
+                TradeTicketMap.license_id == lic.id,
+                TradeTicketMap.master_ticket.in_(tickets)).all():
+            mapped.setdefault(t, []).append(bool(closed))
+        mine = [(r, m) for r, m in mine
+                if r.master_ticket not in busy
+                and not (r.master_ticket in mapped and all(mapped[r.master_ticket]))]
+
+    if not mine:
+        return finish("REFUSED_RISK",
+                      "close order recognised - no open trades from "
+                      f"{scope} to close")
+
+    ea = db.query(ExpertAdvisor).filter(ExpertAdvisor.id == lic.ea_id).first()
+    ea_code = getattr(ea, "ea_code", None) or "TELEGRAM"
+    rows = []
+    try:
+        for row, _ in mine:
+            event = CopierTradeEvent(
+                source_admin_id=lic.admin_id, ea_id=lic.ea_id, ea_code=ea_code,
+                event_type="close", master_ticket=row.master_ticket,
+                symbol=row.symbol, action=None, lot_size=None, sl=None, tp=None,
+                price=None, comment=row.comment, status="pending",
+            )
+            db.add(event)
+            db.flush()
+            ex = TradeExecution(
+                copier_event_id=event.id, license_id=lic.id, ea_id=lic.ea_id,
+                master_ticket=row.master_ticket, client_ticket=None,
+                symbol=row.symbol, action=None, lot_size=row.lot_size,
+                sl=None, tp=None, price=None, comment=row.comment,
+                event_type="close", status="pending",
+            )
+            db.add(ex)
+            db.flush()
+            rows.append(ex)
+        log.validated_at = _now(db)
+        log.execution_id = rows[0].id
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error("could not queue telegram close for licence %s: %s", lic.id, e)
+        return finish("REFUSED_RISK", f"could not queue close: {e}")
+
+    signals = len({m for _, m in mine})
+    logger.info("telegram CLOSE licence=%s chat=%s rows=%s", lic.id, chat,
+                [r.id for r in rows])
+    return finish("QUEUED",
+                  f"closing your trades from {signals} signal"
+                  f"{'' if signals == 1 else 's'} ({scope})")
+
+
+def _queue_breakeven(db: Session, lic: License, src: TelegramSource,
+                     data: "IncomingSignal", order: dict, canonical, log, finish):
+    """Record a MOVE-STOP-TO-BREAK-EVEN order for this licence's open trades
+    from THIS channel.
+
+    Same scope rules as a close: a REPLY narrows it to that signal, otherwise
+    every trade from this channel in the last CLOSE_LOOKBACK_HOURS, narrowed by
+    the symbol / direction it named. Never touches master-copier, manual or
+    another channel's trades.
+
+    Nothing is queued for the lanes. The order is written to this log row
+    ({"kind": "BE", "tickets": [...]}) and the trade guard on the VPS -- which
+    already logs into accounts to manage stops -- moves each position's stop to
+    THAT position's own entry price (plus a hair), only ever tightening it, and
+    only once the broker will accept it (price past entry by the stops level).
+
+    Deliberately NOT checked: licence expiry, plan, robot on/off. Protecting an
+    open position must always be possible.
+    """
+    if not TELEGRAM_ENABLED:
+        return finish("REFUSED_RISK", "telegram copier disabled globally")
+    if not src.enabled:
+        return finish("REFUSED_RISK", "source is paused")
+    if src.copy_sl is False:
+        return finish("REFUSED_RISK", "stop-loss updates are switched off for this source")
+
+    age = _signal_age_sec(data.sent_at)
+    if age is not None and age > MAX_SIGNAL_AGE_SEC:
+        return finish("REFUSED_RISK",
+                      f"break-even order was sent {int(age)}s ago "
+                      f"(limit {MAX_SIGNAL_AGE_SEC}s)")
+
+    if (src.mode or "SHADOW").upper() != "LIVE":
+        return finish("SHADOW", "Break-even order recognised - no stop moved because "
+                                "this source is in Shadow mode")
+
+    chat = str(data.chat_id)
+    since = datetime.now(timezone.utc) - timedelta(hours=CLOSE_LOOKBACK_HOURS)
+    opens = db.query(TradeExecution).filter(
+        TradeExecution.license_id == lic.id,
+        TradeExecution.event_type == "open",
+        TradeExecution.master_ticket.like(f"TGU-{chat}-%"),
+        TradeExecution.status.in_(("pending", "processing", "executed")),
+        TradeExecution.created_at >= since,
+    ).order_by(TradeExecution.id).all()
+
+    mine = []
+    for row in opens:
+        parts = _ticket_parts(row.master_ticket)
+        if parts and parts[0] == chat and parts[2] == lic.id:
+            mine.append((row, parts[1]))
+
+    scope = "this channel"
+    reply_to = str(data.reply_to_message_id) if data.reply_to_message_id else None
+    if reply_to:
+        replied = [(r, m) for r, m in mine if m == reply_to]
+        if replied:
+            mine, scope = replied, "the signal it replied to"
+
+    if order.get("symbol_raw"):
+        want = canonical(order["symbol_raw"])
+        mine = [(r, m) for r, m in mine if canonical(r.symbol or "") == want]
+    if order.get("direction"):
+        act = _ACTION[order["direction"]]
+        mine = [(r, m) for r, m in mine if (r.action or "").lower() == act]
+
+    tickets = [r.master_ticket for r, _ in mine]
+    if tickets:
+        closing = {t for (t,) in db.query(TradeExecution.master_ticket).filter(
+            TradeExecution.license_id == lic.id,
+            TradeExecution.event_type == "close",
+            TradeExecution.master_ticket.in_(tickets),
+            TradeExecution.status != "failed",
+        ).all()}
+        mapped = {}
+        for t, closed in db.query(TradeTicketMap.master_ticket,
+                                  TradeTicketMap.is_closed).filter(
+                TradeTicketMap.license_id == lic.id,
+                TradeTicketMap.master_ticket.in_(tickets)).all():
+            mapped.setdefault(t, []).append(bool(closed))
+        mine = [(r, m) for r, m in mine
+                if r.master_ticket not in closing
+                and not (r.master_ticket in mapped and all(mapped[r.master_ticket]))]
+
+    if not mine:
+        return finish("REFUSED_RISK",
+                      "break-even order recognised - no open trades from "
+                      f"{scope} to protect")
+
+    log.parsed_json = json.dumps({
+        "kind": "BE",
+        "symbol_raw": order.get("symbol_raw"),
+        "direction": order.get("direction"),
+        "tickets": sorted({r.master_ticket for r, _ in mine}),
+    })[:4000]
+    log.validated_at = _now(db)
+    n = len({r.master_ticket for r, _ in mine})
+    logger.info("telegram BREAKEVEN licence=%s chat=%s tickets=%s", lic.id, chat, n)
+    return finish("QUEUED",
+                  f"moving the stop to break-even on {n} trade"
+                  f"{'' if n == 1 else 's'} ({scope})")
+
+
+# ==============================================================================
+# THE INTAKE  --  the listener posts here
+# ==============================================================================
+@worker_router.post("/signal")
+def incoming_signal(data: IncomingSignal,
+                    _: bool = Depends(require_worker_token),
+                    db: Session = Depends(get_db)):
+    """Parse, validate, and either queue a trade or record why not.
+
+    Every path writes exactly one telegram_signal_log row, and that row's UNIQUE
+    (license_id, chat_id, message_id) is the dedupe. Claim first, then act: if
+    the insert conflicts, another delivery of the same message already owns it
+    and this one stops.
+    """
+    lic = db.query(License).filter(License.id == data.license_id).first()
+    if not lic:
+        raise HTTPException(status_code=400, detail="Unknown licence")
+
+    src = db.query(TelegramSource).filter(
+        TelegramSource.license_id == lic.id,
+        TelegramSource.chat_id == str(data.chat_id),
+    ).first()
+    if not src:
+        # The listener sent a chat this licence does not follow. Not an error
+        # worth 500-ing over, but worth refusing loudly rather than trading.
+        return {"received": True, "outcome": "NOT_A_SOURCE",
+                "reason": "this licence does not follow that chat"}
+
+    # ---- claim the message ------------------------------------------------
+    log = TelegramSignalLog(
+        license_id=lic.id,
+        source_id=src.id,
+        chat_id=str(data.chat_id),
+        message_id=str(data.message_id),
+        raw_text=(data.text or "")[:4000],
+        outcome="RECEIVED",
+    )
+    db.add(log)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return {"received": True, "outcome": "DUPLICATE",
+                "reason": "already processed for this licence"}
+    db.refresh(log)
+
+    def finish(outcome: str, reason: str = "", **extra):
+        log.outcome = outcome
+        log.reason = (reason or None) and reason[:300]
+        for k, v in extra.items():
+            setattr(log, k, v)
+        db.commit()
+        return {"received": True, "outcome": outcome, "reason": reason,
+                "log_id": log.id}
+
+    # ---- parse -------------------------------------------------------------
+    # The matcher is resolved OUTSIDE the try on purpose. It was inside once, and
+    # a missing import came back to the user as "REFUSED_PARSE: parser error" on
+    # every single signal -- a platform fault wearing a bad-signal label, which
+    # is about the most expensive way to debug anything. Let it raise: the
+    # listener sees a 500, retries, and the real traceback lands in the logs.
+    #
+    # The copier's own instrument vocabulary, so the parser accepts every symbol
+    # the platform already understands and there is no second list to drift.
+    synonyms, canonical, find_setting = _matcher()
+
+    def close_order():
+        return classify_close(data.text or "",
+                              is_reply=bool(data.reply_to_message_id),
+                              symbols=synonyms.keys())
+
+    def be_order():
+        return classify_breakeven(data.text or "",
+                                  is_reply=bool(data.reply_to_message_id),
+                                  symbols=synonyms.keys())
+
+    try:
+        parsed = parse_signal(data.text, extra_symbols=synonyms.keys())
+    except Refusal as r:
+        log.parsed_at = _now(db)
+        # "Close all now", "Take profit now" carry no instrument or direction,
+        # so the parser refuses them. Only an unmistakable close order is
+        # rescued here; everything else keeps its parse refusal.
+        order = close_order()
+        if order["close"]:
+            log.parsed_json = json.dumps({"kind": "CLOSE", **order})[:4000]
+            return _queue_close(db, lic, src, data, order, canonical, log, finish)
+        # "MOVE YOUR SL TO B.E" carries no BUY/SELL either.
+        be = be_order()
+        if be["be"]:
+            log.parsed_json = json.dumps({"kind": "BE", **be})[:4000]
+            return _queue_breakeven(db, lic, src, data, be, canonical, log, finish)
+        return finish("REFUSED_PARSE", f"{r.code}: {r.detail}".strip(": "))
+    except Exception as e:
+        # A genuine parser bug on one message. Refuse THAT message, keep
+        # serving, and make it loud in the log -- never silent, never a trade.
+        log.parsed_at = _now(db)
+        logger.exception("parser raised on licence %s for message %s: %s",
+                         lic.id, data.message_id, e)
+        return finish("REFUSED_PARSE", f"parser error: {type(e).__name__}")
+
+    log.parsed_at = _now(db)
+    log.parsed_json = json.dumps(parsed)[:4000]
+
+    if parsed["kind"] == "CLOSE":
+        # The parser says "this mentions closing". Most such messages are
+        # chatter -- questions, results posts, "close if satisfied" -- so the
+        # close-order rules decide whether it is actually an order.
+        order = close_order()
+        if not order["close"]:
+            be = be_order()
+            if be["be"]:
+                log.parsed_json = json.dumps({"kind": "BE", **be})[:4000]
+                return _queue_breakeven(db, lic, src, data, be, canonical, log, finish)
+            return finish("REFUSED_PARSE", f"not_a_close_order: {order['why']}")
+        log.parsed_json = json.dumps({"kind": "CLOSE", **order})[:4000]
+        return _queue_close(db, lic, src, data, order, canonical, log, finish)
+
+    direction = parsed["direction"]
+    symbol_raw = parsed["symbol_raw"]
+    symbol_canon = canonical(symbol_raw)
+
+    # ---- the risk gate. In order. Fail closed. ----------------------------
+    if not TELEGRAM_ENABLED:
+        return finish("REFUSED_RISK", "telegram copier disabled globally")
+
+    if not src.enabled:
+        return finish("REFUSED_RISK", "source is paused")
+
+    age = _signal_age_sec(data.sent_at)
+    if age is not None and age > MAX_SIGNAL_AGE_SEC:
+        # Refused, never queued late. A signal is a statement about a price at a
+        # moment; acting on it an hour later is a different trade that nobody
+        # chose. The row is still written, so the feed shows what was skipped.
+        return finish("REFUSED_RISK",
+                      f"signal was sent {int(age)}s ago "
+                      f"(limit {MAX_SIGNAL_AGE_SEC}s)")
+
+    exp = lic.expires_at
+    if exp is not None and exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if not lic.is_active or (exp and exp < datetime.now(timezone.utc)):
+        return finish("REFUSED_RISK", "licence expired")
+
+    if not plan_for(lic)["telegram"]:
+        return finish("REFUSED_RISK", "plan does not include Telegram Copier")
+
+    account = db.query(ClientMT5Account).filter(
+        ClientMT5Account.license_id == lic.id,
+        ClientMT5Account.is_active == True,        # noqa: E712
+        ClientMT5Account.is_verified == True,      # noqa: E712
+    ).first()
+    if not account:
+        return finish("REFUSED_RISK", "no verified MT5 account connected")
+
+    if direction == "BUY" and not src.copy_buy:
+        return finish("REFUSED_RISK", "BUY signals are switched off for this source")
+    if direction == "SELL" and not src.copy_sell:
+        return finish("REFUSED_RISK", "SELL signals are switched off for this source")
+
+    if src.allowed_symbols:
+        allowed = {canonical(s) for s in src.allowed_symbols.split(",") if s.strip()}
+        if symbol_canon not in allowed:
+            return finish("REFUSED_RISK",
+                          f"{symbol_raw} is not in this source's allowed symbols")
+
+    # The user's own enabled symbol, matched on the canonical key. This is also
+    # where the lot comes from, and the executor refuses a symbol with no lot.
+    setting = find_setting(db, lic.id, symbol_canon)
+    if not setting:
+        return finish("REFUSED_RISK",
+                      f"{symbol_raw} is not enabled in your settings")
+    try:
+        lot = float(setting.lot_size or 0)
+    except (TypeError, ValueError):
+        lot = 0.0
+    if lot <= 0:
+        return finish("REFUSED_RISK",
+                      f"no lot size set for {symbol_raw} in your settings")
+
+    if parsed["entry_type"] in ("LIMIT", "STOP"):
+        # Parsed correctly, and refused. NEVER converted to market: a BUY LIMIT
+        # 3720 filled at market 3740 is a different trade, with the channel's
+        # stop now far too close.
+        return finish("REFUSED_RISK", "pending_orders_not_supported_v1")
+
+    sl = parsed["stop_loss"] if src.copy_sl else None
+    tps = parsed["take_profits"] if src.copy_tp else []
+
+    if src.require_sl and sl is None:
+        return finish("REFUSED_RISK", "this source requires a stop loss")
+
+    # Every target, not just the first. Each one becomes its own position now,
+    # so an inverted TP3 is a trade born losing exactly like an inverted TP1.
+    for _t in (tps or [None]):
+        bad = _sl_tp_sane(direction, parsed["entry_price"], sl, _t)
+        if bad:
+            return finish("REFUSED_RISK", bad)
+
+    if not _within_hours(src):
+        return finish("REFUSED_RISK",
+                      f"outside this source's hours "
+                      f"({src.trade_from}-{src.trade_to} UTC)")
+
+    used = _trades_today(db, src)
+    if used >= (src.max_trades_per_day or 5):
+        return finish("REFUSED_RISK",
+                      f"daily limit reached ({used} of {src.max_trades_per_day})")
+
+    # WHAT THIS GUARD IS FOR: a channel that posts twenty signals in a minute
+    # should not put twenty orders into the queue before the lane has worked
+    # through the first one. It is about the BACKLOG, nothing else.
+    #
+    # It used to count 'executed' rows over SEVEN DAYS, which is not a backlog
+    # -- it is history. With max_open_positions at the default 2 that capped a
+    # licence at eight Telegram trades a WEEK and then went quiet, and the
+    # refusal still said "queued", so it read like a stuck queue rather than a
+    # limit being hit. It cost licence 155 a complete AMIIN FX signal (entry,
+    # stop and three targets) and 25 others besides.
+    #
+    # So: only work that has not been done yet, and only within a window where
+    # "still pending" means something is wrong. A row older than this is not
+    # backlog, it is a stale event the lane's own reaper will resolve.
+    backlog_window = timedelta(seconds=TELEGRAM_BACKLOG_WINDOW_SEC)
+    queued_now = db.query(TradeExecution).filter(
+        TradeExecution.license_id == lic.id,
+        TradeExecution.master_ticket.like("TGU-%"),
+        TradeExecution.status.in_(("pending", "processing")),
+        TradeExecution.event_type == "open",
+        TradeExecution.created_at >= datetime.now(timezone.utc) - backlog_window,
+    ).count()
+    if queued_now >= TELEGRAM_MAX_QUEUED:
+        return finish("REFUSED_RISK",
+                      f"{queued_now} Telegram trades are still waiting to be "
+                      f"placed -- try again once they clear")
+
+    if src.max_lot is not None and lot > float(src.max_lot):
+        return finish("REFUSED_RISK",
+                      f"lot {lot} exceeds this source's maximum {src.max_lot}")
+
+    log.validated_at = _now(db)
+
+    # ---- shadow mode -------------------------------------------------------
+    if (src.mode or "SHADOW").upper() != "LIVE":
+        db.commit()
+        return finish("SHADOW",
+                      "Valid signal - no trade placed because this source is "
+                      "in Shadow mode")
+
+    # ---- queue it ----------------------------------------------------------
+    master_ticket = f"TGU-{data.chat_id}-{data.message_id}-{lic.id}"
+    try:
+        executions, plan = _create_executions(
+            db, lic, src, account, setting, symbol_canon, direction,
+            sl, tps, parsed["entry_price"], master_ticket)
+        # The first row is the anchor the feed links to. The rest are siblings
+        # of the same message, found by the shared master_ticket prefix.
+        log.execution_id = executions[0].id
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error("could not queue telegram trade for licence %s: %s",
+                     lic.id, e)
+        return finish("REFUSED_RISK", f"could not queue: {e}")
+
+    total = sum(n for _, n in plan)
+    spread = ", ".join(
+        f"{n}@{'no TP' if t is None else t}" for t, n in plan)
+    logger.info("telegram QUEUED licence=%s %s %s lot=%s x%d (%s) rows=%s",
+                lic.id, _ACTION[direction], symbol_canon, lot, total, spread,
+                [e.id for e in executions])
+
+    return finish("QUEUED",
+                  f"queued for your MT5 ({_ACTION[direction]} {symbol_canon} "
+                  f"lot {lot}, {total} position{'' if total == 1 else 's'}: "
+                  f"{spread})")
+
+
+@worker_router.post("/heartbeat")
+def listener_heartbeat(data: dict,
+                       _: bool = Depends(require_worker_token),
+                       db: Session = Depends(get_db)):
+    """The listener says a session is alive. Absence of this is what makes the
+    dashboard say 'offline' instead of quietly implying everything is fine."""
+    ids = (data or {}).get("license_ids") or []
+    if not isinstance(ids, list) or not ids:
+        return {"ok": True, "updated": 0}
+    n = db.query(TelegramAccount).filter(
+        TelegramAccount.license_id.in_([int(i) for i in ids][:500])
+    ).update({"last_seen_at": func.now()}, synchronize_session=False)
+    db.commit()
+    return {"ok": True, "updated": n}
+
+
+@worker_router.get("/sessions")
+def listener_sessions(shard_index: int = 0, shard_count: int = 1,
+                      _: bool = Depends(require_worker_token),
+                      db: Session = Depends(get_db)):
+    """What the listener shard should connect and watch.
+
+    The ONLY endpoint that returns a session string, and it is guarded by the
+    worker token. No browser reaches it and no client endpoint exposes it.
+    """
+    from app.security_utils import decrypt_secret
+
+    accounts = db.query(TelegramAccount).filter(
+        TelegramAccount.status == "LINKED",
+        TelegramAccount.session_encrypted.isnot(None),
+    ).all()
+
+    out = []
+    for a in accounts:
+        if shard_count > 1 and (a.license_id % shard_count) != shard_index:
+            continue
+        chats = [
+            s.chat_id for s in db.query(TelegramSource).filter(
+                TelegramSource.license_id == a.license_id,
+                TelegramSource.enabled == True,      # noqa: E712
+            ).all()
+        ]
+        if not chats:
+            continue
+        try:
+            session = decrypt_secret(a.session_encrypted)
+        except Exception:
+            logger.warning("could not decrypt session for licence %s", a.license_id)
+            continue
+        out.append({"license_id": a.license_id, "session": session,
+                    "chat_ids": chats})
+    return {"sessions": out}
+
+
+@worker_router.post("/session-status")
+def set_session_status(data: dict,
+                       _: bool = Depends(require_worker_token),
+                       db: Session = Depends(get_db)):
+    """The listener reports a session it can no longer use.
+
+    REVOKED means the user logged it out; the listener stops retrying, because
+    hammering a dead session achieves nothing but drawing Telegram's attention.
+    """
+    lid = (data or {}).get("license_id")
+    status = str((data or {}).get("status", "")).upper()
+    if status not in ("LINKED", "DISCONNECTED", "LIMITED", "REVOKED"):
+        raise HTTPException(status_code=400, detail="bad status")
+    acc = db.query(TelegramAccount).filter(
+        TelegramAccount.license_id == int(lid)
+    ).first()
+    if not acc:
+        return {"ok": False}
+    acc.status = status
+    if status in ("REVOKED", "DISCONNECTED"):
+        acc.session_encrypted = None
+    db.commit()
+    logger.info("telegram session for licence %s -> %s", lid, status)
+    return {"ok": True, "status": status}
+
+
+@router.get("/health")
+def telegram_health(db: Session = Depends(get_db)):
+    """Safe to open in a browser. Names no user and returns no secret."""
+    return {
+        "enabled": TELEGRAM_ENABLED,
+        "worker_token_configured": bool(WORKER_TOKEN),
+        "max_sources_per_licence": MAX_SOURCES_PER_LICENCE,
+        "consent_version": CONSENT_VERSION,
+        "linked_accounts": db.query(TelegramAccount).filter(
+            TelegramAccount.status == "LINKED").count(),
+        "live_sources": db.query(TelegramSource).filter(
+            TelegramSource.mode == "LIVE",
+            TelegramSource.enabled == True).count(),      # noqa: E712
+        "shadow_sources": db.query(TelegramSource).filter(
+            TelegramSource.mode == "SHADOW").count(),
+    }

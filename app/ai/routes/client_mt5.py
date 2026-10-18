@@ -75,6 +75,13 @@ router = APIRouter(prefix="/api/client", tags=["Client MT5 & AI"])
 # longer reflects the live market. Stale cards are flagged + sorted to bottom.
 STALE_SECONDS = int(os.environ.get("SCANNER_STALE_SECONDS", "180"))
 
+# A day-P&L reading older than this is not served. The verifier refreshes
+# verified accounts every 5 minutes, so 30 means several missed cycles → that
+# account isn't being refreshed and its P&L (like its balance) is no longer
+# describing now. The API returns null and the card shows a dash. Showing a
+# stale number as if it were live is the failure mode worth avoiding here.
+SESSION_PNL_MAX_AGE_MIN = int(os.environ.get("SESSION_PNL_MAX_AGE_MIN", "30"))
+
 # Admin router — destructive cleanup operations, guarded by a shared token.
 admin_router = APIRouter(prefix="/api/admin", tags=["Admin"])
 
@@ -255,9 +262,36 @@ def get_mt5_status(license_key: str, db: Session = Depends(get_db)):
         return {"connected": False, "status": "NOT_CONNECTED"}
 
     status = (account.verification_status or "PENDING").upper()
+
+    # ── Session P&L ──────────────────────────────────────────────────────────
+    # Realised is what the verifier read from the broker. Floating is derived
+    # from the SAME snapshot, so the total is one coherent moment rather than a
+    # realised figure from five minutes ago plus a live float.
+    balance_v = float(account.balance or 0)
+    equity_v = float(account.equity or 0)
+    floating_pnl = round(equity_v - balance_v, 2)
+
+    realized = getattr(account, "day_realized_pnl", None)
+    pnl_at = getattr(account, "day_pnl_at", None)
+    if pnl_at is not None and pnl_at.tzinfo is None:
+        pnl_at = pnl_at.replace(tzinfo=timezone.utc)
+    pnl_fresh = bool(
+        pnl_at and (datetime.now(timezone.utc) - pnl_at).total_seconds()
+        <= SESSION_PNL_MAX_AGE_MIN * 60
+    )
+    # null, not 0.0 — "we don't know" and "you broke even" are different
+    # answers and the user can tell them apart.
+    session_pnl = (round(float(realized) + floating_pnl, 2)
+                   if (realized is not None and pnl_fresh) else None)
+
     return {
         "connected":           True,
         "status":              status,
+        "session_pnl":         session_pnl,
+        "day_realized_pnl":    float(realized) if realized is not None else None,
+        "floating_pnl":        floating_pnl,
+        "day_pnl_key":         getattr(account, "day_pnl_key", None),
+        "session_pnl_stale":   bool(realized is not None and not pnl_fresh),
         "login":               account.login,
         "account_name":        account.account_name,
         "broker":              account.broker_name,

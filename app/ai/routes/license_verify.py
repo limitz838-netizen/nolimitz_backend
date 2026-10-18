@@ -70,25 +70,27 @@ def verify_license(
             status_code=403,
             detail="License expired"
         )
-    
+
     # =========================
     # DEVICE LOCK
+    # (column is activated_device_id; only applied when the
+    #  caller sends a device_id)
     # =========================
 
-    if not license.device_id:
+    if device_id:
 
-        license.device_id = device_id
+        if not license.activated_device_id:
 
-        db.commit()
+            license.activated_device_id = device_id
 
-    else:
+            db.commit()
 
-         if license.device_id != device_id:
+        elif license.activated_device_id != device_id:
 
-              return {
-                 "success": False,
-                 "message": "License already used on another device"
-              }
+            return {
+                "success": False,
+                "message": "License already used on another device"
+            }
 
     # =========================
     # RETURN FEATURES

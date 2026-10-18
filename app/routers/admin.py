@@ -15,7 +15,7 @@ from app.auth import (
 )
 from app.database import get_db
 from app.models import LicenseQuotaRequest
-from app.models import Admin, AdminProfile, License, MasterAccount
+from app.models import Admin, AdminProfile, ExpertAdvisor, License, MasterAccount
 from app.schemas import (
     AdminApprovalResponse,
     AdminListItem,
@@ -99,6 +99,38 @@ def generate_admin_code(db: Session) -> int:
         return 100
 
     return int(last_admin.admin_code) + 1
+
+
+def get_ea_display(account: MasterAccount, current_admin: Admin, db: Session) -> dict:
+    """Resolve the admin's OWN EA so the Control Bot page can show its real
+    name (e.g. "NOLIMITZ PRO") instead of a generic label.
+
+    Scoped by admin_id, so each tenant only ever sees their own EA. Field names
+    are read with getattr because the column may be `name`, `ea_name` or
+    `title` depending on the schema version — this returns whichever exists
+    rather than raising.
+    """
+    if not account or not account.ea_id:
+        return {"ea_name": None, "ea_code": None}
+
+    ea = db.query(ExpertAdvisor).filter(
+        ExpertAdvisor.id == account.ea_id,
+        ExpertAdvisor.admin_id == current_admin.id,
+    ).first()
+
+    if not ea:
+        return {"ea_name": None, "ea_code": None}
+
+    name = (
+        getattr(ea, "name", None)
+        or getattr(ea, "ea_name", None)
+        or getattr(ea, "title", None)
+    )
+
+    return {
+        "ea_name": name,
+        "ea_code": getattr(ea, "ea_code", None),
+    }
 
 
 def build_admin_me_response(admin: Admin, profile: Optional[AdminProfile], db: Session) -> AdminMeResponse:
@@ -432,11 +464,15 @@ def save_master_account(
     db.commit()
     db.refresh(account)
 
+    ea = get_ea_display(account, current_admin, db)
+
     return {
         "success": True,
         "message": "Master account saved. Waiting for bridge connection...",
         "connected": False,
         "ea_id": account.ea_id,
+        "ea_name": ea["ea_name"],
+        "ea_code": ea["ea_code"],
         "mt_login": account.mt_login,
         "mt_server": account.mt_server,
     }
@@ -486,10 +522,15 @@ def get_master_account_status(
             "message": "No master account saved yet",
         }
 
+    # The admin's own EA, so the Control Bot page shows THEIR name for it.
+    ea = get_ea_display(account, current_admin, db)
+
     return {
         "connected": bool(account.is_connected),
         "is_connected": bool(account.is_connected),
         "ea_id": account.ea_id,
+        "ea_name": ea["ea_name"],
+        "ea_code": ea["ea_code"],
         "mt_login": account.mt_login,
         "mt_server": account.mt_server,
         "account_name": account.account_name,
@@ -507,10 +548,14 @@ def get_master_account(
     if not account:
         return {"connected": False, "is_connected": False}
 
+    ea = get_ea_display(account, current_admin, db)
+
     return {
         "connected": bool(account.is_connected),
         "is_connected": bool(account.is_connected),
         "ea_id": account.ea_id,
+        "ea_name": ea["ea_name"],
+        "ea_code": ea["ea_code"],
         "mt_login": account.mt_login,
         "mt_server": account.mt_server,
         "account_name": account.account_name,
@@ -607,6 +652,12 @@ def approve_request(
     admin = db.query(Admin).filter_by(id=req.admin_id).first()
 
     admin.license_quota += req.requested_amount
+    req.status = "approved"
+    req.processed_at = datetime.utcnow()
+
+    db.commit()
+
+    return {"success": True}
     req.status = "approved"
     req.processed_at = datetime.utcnow()
 
