@@ -22,6 +22,8 @@ launcher .bat can set them per process):
   DESK_SYMBOLS            XAUUSD            (comma list, e.g. XAUUSD,BTCUSD)
   DESK_SHADOW_SYMBOLS     (empty)           (symbols that NEVER send orders, even when trading is
                                              enabled - e.g. BTCUSD until it passes its own backtest)
+  DESK_STRATEGIES         XAUUSD=pullback   (per-symbol rules from app/desk/strategy.py:
+                                             pullback = gold rules, squeeze = BTC idea C)
   DESK_TRADING_ENABLED    false             (false = shadow mode: full pipeline, no orders)
   DESK_ALLOW_REAL         false             (refuses to trade a non-demo account unless true)
   DESK_RISK_PCT           1.0               (risk per trade, % of balance; capped at 2)
@@ -29,6 +31,13 @@ launcher .bat can set them per process):
   DESK_MAX_SPREAD_ATR     0.08              (skip if spread > this fraction of H1 ATR)
   DESK_MAGIC              78001
   DESK_LOOP_SEC           5
+  DESK_HEARTBEAT_FILE     (set by run_desk.ps1) touched every loop; the launcher restarts a frozen Desk
+  DESK_LOCK_PORT          47811             (only ONE Desk may run: a second copy exits with code 3)
+
+Shadow symbols are PAPER-TRADED: each shadow signal opens a paper position (one at a
+time per symbol) that is managed on the broker's live prices - stop, target, breakeven -
+and recorded in desk_trades with a ticket starting "paper-". No order is ever sent for
+it. That builds a forward-only record a backtest cannot give.
 
 Who copies these trades: nobody, unless this account is also set as a master
 in master_mt5_bridge. Keep it that way until the demo forward test passes.
@@ -37,6 +46,7 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -76,12 +86,16 @@ class Cfg:
     SYMBOLS = [s.strip().upper() for s in _env("DESK_SYMBOLS", "XAUUSD").split(",") if s.strip()]
     TRADING_ENABLED = _flag("DESK_TRADING_ENABLED", "false")
     SHADOW_SYMBOLS = {s.strip().upper() for s in _env("DESK_SHADOW_SYMBOLS", "").split(",") if s.strip()}
+    STRATEGIES = {k.strip().upper(): v.strip().lower() for k, v in
+                  (x.split("=", 1) for x in _env("DESK_STRATEGIES", "XAUUSD=pullback").split(",") if "=" in x)}
     ALLOW_REAL = _flag("DESK_ALLOW_REAL", "false")
     RISK_PCT = min(2.0, max(0.1, float(_env("DESK_RISK_PCT", "1.0"))))
     DAILY_LOSS_PCT = float(_env("DESK_DAILY_LOSS_PCT", "3.0"))
     MAX_SPREAD_ATR = float(_env("DESK_MAX_SPREAD_ATR", "0.08"))
     MAGIC = int(_env("DESK_MAGIC", "78001"))
     LOOP_SEC = float(_env("DESK_LOOP_SEC", "5"))
+    HEARTBEAT_FILE = _env("DESK_HEARTBEAT_FILE")
+    LOCK_PORT = int(_env("DESK_LOCK_PORT", "47811") or 0)
     DEVIATION = 50
     H4_BARS, H1_BARS, M15_CANDLES = 1000, 500, 64
     LATE_SIGNAL_SEC = 300          # never act on an H1 close older than this
@@ -123,12 +137,15 @@ class Desk:
         self.agents = {a: "starting" for a in ("scout", "check", "size", "entry", "exit", "guard")}
         self.offset_sec = 0                      # broker server time minus UTC
         self.offset_known = False
+        self.tick_seen: Dict[str, float] = {}     # canonical -> last tick time seen (to spot live markets)
+        self.offset_pending = (None, 0)           # (candidate offset, consecutive confirmations)
         self.day = None
         self.day_start_balance = None
         self.last_beat = 0.0
         self.last_prune = 0.0
         self.warned = set()
         self.closing_reason: Dict[str, str] = {}  # ticket -> reason we closed it for
+        self.paper: Dict[str, dict] = {}          # paper ticket -> {seen (utc ts of next bar), sl, best}
 
     # ---------------------------------------------------------------- db ---
     def _commit(self):
@@ -213,6 +230,17 @@ class Desk:
         sleep(30)
         return self.connect()
 
+    def strategy_of(self, canon: str) -> str:
+        name = self.cfg.STRATEGIES.get(canon, "pullback")
+        return name if name in S.STRATEGIES else "pullback"
+
+    def shadow(self, canon: str) -> bool:
+        return (not self.cfg.TRADING_ENABLED) or canon in self.cfg.SHADOW_SYMBOLS
+
+    def open_paper(self, canon: str):
+        return (self.db.query(DeskTrade).filter(DeskTrade.worker == self.cfg.WORKER, DeskTrade.symbol == canon,
+                                                 DeskTrade.is_open.is_(True), DeskTrade.ticket.like("paper-%")).first())
+
     @staticmethod
     def is_demo(info) -> bool:
         return getattr(info, "trade_mode", 2) == getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", 0)
@@ -260,17 +288,37 @@ class Desk:
         age = now_utc().timestamp() - (tick.time - self.offset_sec)
         return age < 180
 
-    def learn_offset(self, tick):
-        """Broker server time minus UTC, rounded to the hour (Exness is 0)."""
-        if tick is None:
+    def learn_offset(self, ticks: Dict[str, object]):
+        """Broker server time minus UTC, rounded to the hour (Exness is 0).
+        Only a LIVE tick can teach it: one whose time moved since the last loop. A closed market's
+        frozen last tick (gold at the weekend) would otherwise read as a -43h offset. Real broker
+        offsets are between UTC-12 and UTC+14, and a change must repeat on 3 loops before it is used."""
+        live = []
+        for canon, tick in ticks.items():
+            if tick is None:
+                continue
+            prev = self.tick_seen.get(canon)
+            self.tick_seen[canon] = tick.time
+            if prev is not None and tick.time != prev:
+                live.append(tick)
+        if not live:
             return
+        tick = max(live, key=lambda t: t.time)
         diff = tick.time - now_utc().timestamp()
         hours = round(diff / 3600)
-        if abs(diff - hours * 3600) < 300:      # tick is fresh: trust it
-            new = int(hours * 3600)
-            if not self.offset_known or new != self.offset_sec:
-                self.offset_sec, self.offset_known = new, True
-                log.info("broker time offset: UTC%+d", hours)
+        if abs(diff - hours * 3600) >= 300 or not -12 <= hours <= 14:
+            return
+        new = int(hours * 3600)
+        if self.offset_known and new == self.offset_sec:
+            self.offset_pending = (None, 0)
+            return
+        cand, n = self.offset_pending
+        n = n + 1 if cand == new else 1
+        self.offset_pending = (new, n)
+        if not self.offset_known or n >= 3:
+            self.offset_sec, self.offset_known = new, True
+            self.offset_pending = (None, 0)
+            log.info("broker time offset: UTC%+d", hours)
 
     # ------------------------------------------------------------- orders ---
     def _send(self, req: dict):
@@ -338,6 +386,8 @@ class Desk:
         broker = self.sym[canon]["broker"]
         if any(p.symbol == broker for p in self.our_positions()):
             return f"already holding {canon}"
+        if self.shadow(canon) and self.open_paper(canon) is not None:
+            return f"paper {canon} position still open"
         return None
 
     # ------------------------------------------------------------ pipeline ---
@@ -345,11 +395,11 @@ class Desk:
         s = self.sym[canon]
         bias = S.h4_bias(h4)
         self.bias[canon] = bias
-        d = S.evaluate(h1, bias)
+        d = S.STRATEGIES[self.strategy_of(canon)](h1, bias)
         self.decision[canon] = d
         bar_t = datetime.fromtimestamp(h1[-1]["t"] + 3600, timezone.utc).strftime("%H:%M")
         self.event("scout", f"H1 {bar_t} UTC \u00b7 {d.scout}", canon, "ok" if d.signal else "info",
-                   {"bias": bias, "atr": round(d.atr, 3), "atr_ratio": round(d.atr_ratio, 2),
+                   {"strategy": d.strategy, "bias": bias, "atr": round(d.atr, 3), "atr_ratio": round(d.atr_ratio, 2),
                     "ema20": round(d.ema20, s["digits"]), "close": d.close, "checks": d.checks})
         if not d.signal:
             return
@@ -404,10 +454,17 @@ class Desk:
 
         sl = round(stop_px, s["digits"])
         tp = round(price + d.signal * d.target_distance, s["digits"])
-        if not self.cfg.TRADING_ENABLED or canon in self.cfg.SHADOW_SYMBOLS:
-            self.event("entry", f"SHADOW \u00b7 would {'buy' if d.signal > 0 else 'sell'} {canon} {lot} @ "
-                                f"{fmt(price, s['digits'])} \u00b7 SL {fmt(sl, s['digits'])} \u00b7 TP {fmt(tp, s['digits'])}",
-                       canon, "warn", {"shadow": True, "price": price, "sl": sl, "tp": tp, "lot": lot})
+        if self.shadow(canon):
+            ticket = "paper-%d%s" % (int(now_utc().timestamp()), canon[:3])
+            self.db.add(DeskTrade(worker=self.cfg.WORKER, ticket=ticket, symbol=canon, broker_symbol=s["broker"],
+                                  direction=d.signal, lot=lot, entry_price=price, initial_stop=sl, current_stop=sl,
+                                  target=tp, atr_at_entry=d.atr, risk_usd=real_risk, opened_at=now_utc(),
+                                  is_demo=self.is_demo(info)))
+            self._commit()
+            self.event("entry", f"PAPER {side} {canon} {lot} @ {fmt(price, s['digits'])} \u00b7 "
+                                f"SL {fmt(sl, s['digits'])} \u00b7 TP {fmt(tp, s['digits'])} \u00b7 no order sent",
+                       canon, "warn", {"shadow": True, "paper": True, "ticket": ticket, "price": price,
+                                       "sl": sl, "tp": tp, "lot": lot, "strategy": d.strategy})
             return
 
         req = {"action": mt5.TRADE_ACTION_DEAL, "symbol": s["broker"], "volume": lot, "type": otype,
@@ -443,13 +500,17 @@ class Desk:
         rows = (self.db.query(DeskTrade).filter(DeskTrade.worker == self.cfg.WORKER, DeskTrade.symbol == canon,
                                                  DeskTrade.is_open.is_(True)).all())
         live = {str(p.ticket): p for p in self.our_positions() if p.symbol == s["broker"]}
+        rules = self.strategy_of(canon)
         for row in rows:
+            if row.ticket.startswith("paper-"):
+                self.manage_paper(row)
+                continue
             pos = live.get(row.ticket)
             if pos is None:
                 self.record_close(row)
                 continue
-            # H4 bias flip against us -> close
-            if self.bias.get(canon, 0) == -row.direction:
+            # H4 bias flip against us -> close (pullback rules only)
+            if rules == "pullback" and self.bias.get(canon, 0) == -row.direction:
                 if self.close_position(pos, "bias flip"):
                     self.event("exit", f"{canon} H4 trend flipped \u00b7 closing", canon, "warn")
                 continue
@@ -467,7 +528,8 @@ class Desk:
             else:
                 best = min([float(x["low"]) + spread for x in (m15 if m15 is not None else [])] + [tick.ask, row.entry_price])
             risk = abs(row.entry_price - row.initial_stop)
-            new = S.manage_stop(row.direction, row.entry_price, pos.sl or row.current_stop, risk, best, row.atr_at_entry)
+            new = S.manage_stop(row.direction, row.entry_price, pos.sl or row.current_stop, risk, best, row.atr_at_entry,
+                                trail=(rules == "pullback"))
             if new is None:
                 continue
             new = round(new, s["digits"])
@@ -482,6 +544,84 @@ class Desk:
                 self._commit()
                 what = "breakeven" if abs(new - row.entry_price) < 1e-9 else "trailing stop"
                 self.event("exit", f"{canon} {what} \u2192 {fmt(new, s['digits'])}", canon, "ok")
+
+    def manage_paper(self, row: DeskTrade):
+        """Walk the paper position through every M15 bar since entry, in order: a gap through the
+        stop fills at the open, the stop is checked before the target, breakeven applies from the
+        next bar. Long exits at bid, short exits at ask (bid + the bar's spread). Then the live tick."""
+        s = self.sym[row.symbol]
+        st = self.paper.get(row.ticket)
+        opened = row.opened_at if row.opened_at.tzinfo else row.opened_at.replace(tzinfo=timezone.utc)
+        if st is None:   # (re)start: rebuild from the entry bar, so the result never depends on restarts
+            first_bar = int(opened.timestamp()) // 900 * 900
+            st = self.paper[row.ticket] = {"seen": first_bar, "sl": row.initial_stop, "best": row.entry_price}
+        d, entry, tp = row.direction, row.entry_price, row.target
+        risk = abs(entry - row.initial_stop)
+        rules = self.strategy_of(row.symbol)
+        now = now_utc().timestamp()
+        rates = mt5.copy_rates_range(s["broker"], mt5.TIMEFRAME_M15,
+                                     datetime.fromtimestamp(st["seen"] + self.offset_sec, timezone.utc),
+                                     datetime.fromtimestamp(now + self.offset_sec + 900, timezone.utc))
+        exit_px = reason = None
+        exit_t = None
+        for x in (rates if rates is not None else []):
+            t = int(x["time"]) - self.offset_sec
+            if t < st["seen"] or t + 900 > now:
+                continue                      # already processed, or still forming
+            o, h, l, c = float(x["open"]), float(x["high"]), float(x["low"]), float(x["close"])
+            sp = float(x["spread"]) * s["point"]
+            lo, hi, op = (l, h, o) if d > 0 else (l + sp, h + sp, o + sp)
+            sl = st["sl"]
+            if (d > 0 and op <= sl) or (d < 0 and op >= sl):
+                exit_px, reason = op, "stop"
+            elif (d > 0 and lo <= sl) or (d < 0 and hi >= sl):
+                exit_px = sl
+                reason = "breakeven" if abs(sl - entry) < 1e-12 else ("trail" if (sl - entry) * d > 0 else "stop")
+            elif (d > 0 and hi >= tp) or (d < 0 and lo <= tp):
+                exit_px, reason = tp, "target"
+            st["seen"] = t + 900
+            if exit_px is not None:
+                exit_t = t + 900
+                break
+            st["best"] = max(st["best"], h) if d > 0 else min(st["best"], l + sp)
+            new = S.manage_stop(d, entry, st["sl"], risk, st["best"], row.atr_at_entry, trail=(rules == "pullback"))
+            if new is not None and (new - st["sl"]) * d > 0:
+                st["sl"] = new
+                row.current_stop = new
+                self._commit()
+                what = "breakeven" if abs(new - entry) < 1e-12 else "trailing stop"
+                self.event("exit", f"PAPER {row.symbol} {what} \u2192 {fmt(new, s['digits'])}", row.symbol, "ok",
+                           {"paper": True, "ticket": row.ticket})
+        if exit_px is None:                   # live tick inside the forming bar
+            tick = mt5.symbol_info_tick(s["broker"])
+            if tick is not None and self.market_open(s["broker"], tick):
+                px = tick.bid if d > 0 else tick.ask
+                sl = st["sl"]
+                if (px - sl) * d <= 0:        # through the stop: a real stop fills at market, not at the level
+                    exit_px = px
+                    reason = "breakeven" if abs(sl - entry) < 1e-12 else ("trail" if (sl - entry) * d > 0 else "stop")
+                elif (px - tp) * d >= 0:
+                    exit_px, reason = tp, "target"
+                elif rules == "pullback" and self.bias.get(row.symbol, 0) == -d:
+                    exit_px, reason = px, "bias_flip"
+                exit_t = now
+        if exit_px is None:
+            return
+        otype = mt5.ORDER_TYPE_BUY if d > 0 else mt5.ORDER_TYPE_SELL
+        profit = mt5.order_calc_profit(otype, s["broker"], row.lot, entry, exit_px) or 0.0
+        row.is_open = False
+        row.closed_at = datetime.fromtimestamp(exit_t, timezone.utc)
+        row.exit_price = exit_px
+        row.profit_usd = round(profit, 2)
+        row.r_multiple = round((exit_px - entry) * d / risk, 2) if risk else None
+        row.exit_reason = reason
+        self._commit()
+        self.paper.pop(row.ticket, None)
+        self.event("exit", f"PAPER {row.symbol} closed \u00b7 {reason} \u00b7 "
+                           f"{'+' if profit >= 0 else '-'}${fmt(abs(profit))} ({row.r_multiple:+.2f}R) "
+                           f"@ {fmt(exit_px, s['digits'])}",
+                   row.symbol, "ok" if profit >= 0 else "warn",
+                   {"paper": True, "ticket": row.ticket, "profit": row.profit_usd, "r": row.r_multiple, "reason": reason})
 
     def record_close(self, row: DeskTrade):
         deals = mt5.history_deals_get(position=int(row.ticket)) or []
@@ -553,6 +693,16 @@ class Desk:
             positions.append({"ticket": str(p.ticket), "symbol": canon, "direction": 1 if p.type == mt5.POSITION_TYPE_BUY else -1,
                               "lot": p.volume, "entry": p.price_open, "sl": p.sl, "tp": p.tp,
                               "price": p.price_current, "profit": round(p.profit + p.swap, 2)})
+        for row in (self.db.query(DeskTrade).filter(DeskTrade.worker == self.cfg.WORKER, DeskTrade.is_open.is_(True),
+                                                    DeskTrade.ticket.like("paper-%")).all()):
+            s = self.sym.get(row.symbol)
+            tick = mt5.symbol_info_tick(s["broker"]) if s else None
+            px = (tick.bid if row.direction > 0 else tick.ask) if tick else None
+            otype = mt5.ORDER_TYPE_BUY if row.direction > 0 else mt5.ORDER_TYPE_SELL
+            pr = mt5.order_calc_profit(otype, s["broker"], row.lot, row.entry_price, px) if (s and px) else None
+            positions.append({"ticket": row.ticket, "symbol": row.symbol, "direction": row.direction, "lot": row.lot,
+                              "entry": row.entry_price, "sl": row.current_stop, "tp": row.target, "price": px,
+                              "profit": round(pr, 2) if pr is not None else 0.0, "paper": True})
         symbols = {}
         for canon, s in self.sym.items():
             tick = mt5.symbol_info_tick(s["broker"])
@@ -565,6 +715,8 @@ class Desk:
                 "bias": self.bias.get(canon, 0),
                 "atr": round(d.atr, 4) if d else None, "ema20": round(d.ema20, s["digits"]) if d else None,
                 "scout": d.scout if d else None, "checks": d.checks if d else None,
+                "strategy": self.strategy_of(canon), "rules": S.RULES_TEXT[self.strategy_of(canon)],
+                "shadow": self.shadow(canon),
                 "candles": [[b["t"], b["o"], b["h"], b["l"], b["c"]] for b in m15],
             }
         entries, losses = self.day_counts() if self.day else (0, 0)
@@ -577,7 +729,8 @@ class Desk:
             "mode": {"trading_enabled": self.cfg.TRADING_ENABLED,
                      "shadow": not self.cfg.TRADING_ENABLED,
                      "risk_pct": self.cfg.RISK_PCT, "daily_loss_pct": self.cfg.DAILY_LOSS_PCT,
-                     "symbols": self.cfg.SYMBOLS, "shadow_symbols": sorted(self.cfg.SHADOW_SYMBOLS), "rules": "H4 EMA50/200 bias \u00b7 H1 EMA20 pullback \u00b7 1.5/2.5 ATR"},
+                     "symbols": self.cfg.SYMBOLS, "shadow_symbols": sorted(self.cfg.SHADOW_SYMBOLS), "rules": S.RULES_TEXT["pullback"],
+                     "strategies": {c: self.strategy_of(c) for c in self.cfg.SYMBOLS}},
             "day": {"date": str(self.day), "start_balance": self.day_start_balance,
                     "entries": entries, "losses": losses,
                     "daily_loss_limit_pct": self.cfg.DAILY_LOSS_PCT},
@@ -635,13 +788,19 @@ class Desk:
         if not self.is_demo(info) and not self.cfg.ALLOW_REAL:
             self.warn_once("real", "guard", "REAL account detected \u00b7 no new trades (DESK_ALLOW_REAL is off)", level="error")
 
+        ticks = {}
+        for canon in self.cfg.SYMBOLS:
+            s = self.resolve(canon)
+            if s:
+                ticks[canon] = mt5.symbol_info_tick(s["broker"])
+        self.learn_offset(ticks)
+
         for canon in self.cfg.SYMBOLS:
             s = self.resolve(canon)
             if not s:
                 self.warn_once(f"nosym-{canon}", "check", f"{canon} is not offered by this broker", canon, "error")
                 continue
-            tick = mt5.symbol_info_tick(s["broker"])
-            self.learn_offset(tick)
+            self.manage(canon)                    # close what has closed before deciding on new signals
             h1 = self.bars(s["broker"], mt5.TIMEFRAME_H1, 1, self.cfg.H1_BARS)
             if len(h1) < 3:
                 continue
@@ -661,6 +820,16 @@ class Desk:
         self.write_state(info)
         self.heartbeat(f"bal={info.balance:.2f} eq={info.equity:.2f} pos={len(self.our_positions())}")
         self.prune()
+        self.touch()
+
+    def touch(self):
+        """Tell the launcher we are alive (it restarts a Desk that stops touching this file)."""
+        if self.cfg.HEARTBEAT_FILE:
+            try:
+                with open(self.cfg.HEARTBEAT_FILE, "w") as f:
+                    f.write(now_utc().isoformat())
+            except OSError:
+                pass
 
     def run(self):
         mode = "LIVE ORDERS" if self.cfg.TRADING_ENABLED else "SHADOW (no orders)"
@@ -670,8 +839,10 @@ class Desk:
                  self.cfg.WORKER, ",".join(self.cfg.SYMBOLS), self.cfg.RISK_PCT, mode)
         while not self.connect():
             log.error("retrying MT5 connect in 30s")
+            self.touch()
             sleep(30)
-        self.event("chief", f"Desk online \u00b7 {mode} \u00b7 {', '.join(self.cfg.SYMBOLS)} \u00b7 risk {self.cfg.RISK_PCT}%",
+        rules = ", ".join(f"{c} {self.strategy_of(c)}{' (paper)' if self.shadow(c) else ''}" for c in self.cfg.SYMBOLS)
+        self.event("chief", f"Desk online \u00b7 {mode} \u00b7 {rules} \u00b7 risk {self.cfg.RISK_PCT}%",
                    level="ok" if self.cfg.TRADING_ENABLED else "warn")
         first = True
         while True:
@@ -688,8 +859,29 @@ class Desk:
             sleep(max(0.5, self.cfg.LOOP_SEC - (time.time() - t0)))
 
 
+_LOCK = None
+
+
+def single_instance(port: int) -> bool:
+    """Hold a localhost port for the life of the process. Two Desks on one account would double every
+    order, so a second copy (a double-clicked run_desk.bat next to the scheduled one) refuses to start."""
+    global _LOCK
+    if not port:
+        return True
+    _LOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        _LOCK.bind(("127.0.0.1", port))
+        _LOCK.listen(1)
+        return True
+    except OSError:
+        return False
+
+
 def main():
     global mt5
+    if not single_instance(Cfg.LOCK_PORT):
+        log.critical("another Desk worker is already running on this machine - this copy is exiting")
+        sys.exit(3)
     import MetaTrader5 as _mt5
     mt5 = _mt5
     Desk().run()

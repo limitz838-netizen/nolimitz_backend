@@ -19,6 +19,13 @@ Rules (the September gold rules, unchanged):
           3R, so it was removed). The worker keeps a 3% daily-loss circuit breaker.
   EXIT    Close if the H4 bias flips against the position.
 
+SQUEEZE (idea C of the 18 Oct 2026 BTC protocol; BTCUSD shadow / paper only until it
+earns real orders):
+  REGIME  On each closed H1 bar: ATR14 / median of the last 100 ATR values < 0.8 (quiet).
+  TRIGGER Long if the close is above the highest high of the previous 24 H1 bars,
+          short if below the lowest low of the previous 24 bars. Any hour (24/7).
+  RISK    Stop 1.5 x ATR, target 3 x ATR, breakeven at +1R. No trailing, no H4 exit.
+
 Bars are dicts: {"t": <bar open, unix seconds UTC>, "o", "h", "l", "c"}.
 """
 from __future__ import annotations
@@ -36,6 +43,8 @@ STOP_ATR, TARGET_ATR = 1.5, 2.5
 BREAKEVEN_R, TRAIL_START_R, TRAIL_ATR = 1.0, 1.5, 1.0
 MIN_H4_BARS = H4_SLOW + 20
 MIN_H1_BARS = ATR_MEDIAN_LEN + ATR_LEN + 10
+SQUEEZE_RATIO_MAX, SQUEEZE_LOOKBACK = 0.8, 24
+SQUEEZE_STOP_ATR, SQUEEZE_TARGET_ATR = 1.5, 3.0
 
 
 def ema(values: List[float], n: int) -> List[float]:
@@ -83,14 +92,19 @@ class Decision:
     entry_hour_utc: int = -1
     scout: str = ""                 # one-line reason, shown in the Desk
     checks: dict = field(default_factory=dict)
+    strategy: str = "pullback"
+    stop_mult: float = STOP_ATR
+    target_mult: float = TARGET_ATR
+    trail: bool = True              # trail 1 x ATR after +1.5R
+    flip_exit: bool = True          # close if the H4 bias flips
 
     @property
     def stop_distance(self) -> float:
-        return STOP_ATR * self.atr
+        return self.stop_mult * self.atr
 
     @property
     def target_distance(self) -> float:
-        return TARGET_ATR * self.atr
+        return self.target_mult * self.atr
 
 
 def evaluate(h1_closed: List[dict], bias: int) -> Decision:
@@ -138,15 +152,49 @@ def evaluate(h1_closed: List[dict], bias: int) -> Decision:
     return d
 
 
+def evaluate_squeeze(h1_closed: List[dict], bias: int = 0) -> Decision:
+    """Idea C: breakout of the 24-hour range while the market is quiet. bias is shown, not used."""
+    d = Decision(bias=bias, strategy="squeeze", stop_mult=SQUEEZE_STOP_ATR,
+                 target_mult=SQUEEZE_TARGET_ATR, trail=False, flip_exit=False)
+    if len(h1_closed) < MIN_H1_BARS:
+        d.scout = f"warming up ({len(h1_closed)}/{MIN_H1_BARS} H1 bars)"
+        return d
+    a = atr(h1_closed)
+    last = h1_closed[-1]
+    d.atr, d.close = a[-1], last["c"]
+    med = median(a[-ATR_MEDIAN_LEN:])
+    d.atr_ratio = a[-1] / med if med > 0 else 9.0
+    d.entry_hour_utc = int(((last["t"] + 3600) // 3600) % 24)
+    prior = h1_closed[-SQUEEZE_LOOKBACK - 1:-1]
+    hi, lo = max(b["h"] for b in prior), min(b["l"] for b in prior)
+    quiet = d.atr_ratio < SQUEEZE_RATIO_MAX
+    d.checks = {"quiet": quiet, "range_high": hi, "range_low": lo,
+                "break_up": last["c"] > hi, "break_down": last["c"] < lo}
+    if not quiet:
+        d.scout = f"ATR {d.atr_ratio:.2f}x normal \u00b7 waiting for a quiet market"
+    elif d.checks["break_up"]:
+        d.signal, d.scout = 1, f"quiet ({d.atr_ratio:.2f}x) \u00b7 broke the 24h high \u00b7 signal: long"
+    elif d.checks["break_down"]:
+        d.signal, d.scout = -1, f"quiet ({d.atr_ratio:.2f}x) \u00b7 broke the 24h low \u00b7 signal: short"
+    else:
+        d.scout = f"quiet ({d.atr_ratio:.2f}x) \u00b7 inside the 24h range"
+    return d
+
+
+STRATEGIES = {"pullback": evaluate, "squeeze": evaluate_squeeze}
+RULES_TEXT = {"pullback": "H4 EMA50/200 bias \u00b7 H1 EMA20 pullback \u00b7 1.5/2.5 ATR",
+              "squeeze": "H1 squeeze breakout \u00b7 quiet ATR < 0.8x \u00b7 24h range \u00b7 1.5/3 ATR \u00b7 24/7"}
+
+
 def manage_stop(direction: int, entry: float, stop: float, initial_risk: float,
-                best_price: float, atr_at_entry: float) -> Optional[float]:
+                best_price: float, atr_at_entry: float, trail: bool = True) -> Optional[float]:
     """New stop after breakeven / trailing, or None if unchanged.
     best_price = highest high (long) or lowest ask-low (short) since entry."""
     fav = (best_price - entry) * direction
     new = stop
     if fav >= BREAKEVEN_R * initial_risk:
         new = max(new, entry) if direction > 0 else min(new, entry)
-    if fav >= TRAIL_START_R * initial_risk:
+    if trail and fav >= TRAIL_START_R * initial_risk:
         trail = best_price - direction * TRAIL_ATR * atr_at_entry
         new = max(new, trail) if direction > 0 else min(new, trail)
     return new if abs(new - stop) > 1e-12 else None

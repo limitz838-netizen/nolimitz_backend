@@ -282,8 +282,8 @@ function play(){
     const chain=['scout','check','size','entry'];
     if(prevAgent && prevAgent!==e.agent && LAY[prevAgent] && LAY[e.agent]) parts.push({a:prevAgent,b:e.agent,c:AGC[e.agent]||'#67e8f9',t0:now/1000});
     prevAgent=e.agent;
-    if(e.agent==='exit' && e.data && typeof e.data.profit==='number'){ popup(e.data.profit); const p=P(LAY.exit.bot[0],LAY.exit.bot[1],0); fx.push({x:p[0]+40,y:p[1]-80,txt:sgn$(e.data.profit),col:e.data.profit>=0?'#34d399':'#f87171',t0:now/1000}); }
-    if(e.agent==='entry' && e.data && e.data.price){ const p=P(LAY.entry.bot[0],LAY.entry.bot[1],0); fx.push({x:p[0]+40,y:p[1]-80,txt:(e.data.shadow?'SHADOW ':'')+(e.data.lot||'')+' lots',col:e.data.shadow?'#fbbf24':'#4ade80',t0:now/1000}); }
+    if(e.agent==='exit' && e.data && typeof e.data.profit==='number'){ if(!e.data.paper) popup(e.data.profit); const p=P(LAY.exit.bot[0],LAY.exit.bot[1],0); fx.push({x:p[0]+40,y:p[1]-80,txt:(e.data.paper?'PAPER ':'')+sgn$(e.data.profit),col:e.data.profit>=0?'#34d399':'#f87171',t0:now/1000}); }
+    if(e.agent==='entry' && e.data && e.data.price){ const p=P(LAY.entry.bot[0],LAY.entry.bot[1],0); fx.push({x:p[0]+40,y:p[1]-80,txt:(e.data.paper?'PAPER ':e.data.shadow?'SHADOW ':'')+(e.data.lot||'')+' lots',col:e.data.shadow?'#fbbf24':'#4ade80',t0:now/1000}); }
   }
   setTimeout(play, queue.length>6?250:PLAY_MS);
 }
@@ -416,7 +416,7 @@ function drawOffice(t){
     c.globalAlpha=1}
   for(const a of AG){const L=LAY[a.id],h=a._head;label(c,h[0],h[1],h[0]+L.lab[0],h[1]+L.lab[1],a.n,say[a.id]||'waiting',a.c,(activeUntil[a.id]||0)>now)}
   const ch=chief._head, ss=symState();
-  const chiefTxt=!R?'connecting\u2026':!R.online?'Desk offline':(ss&&!ss.open)?'market closed \u00b7 resting':(R.state&&R.state.mode&&(R.state.mode.shadow||(R.state.mode.shadow_symbols||[]).includes(sym())))?'watching '+sym()+' \u00b7 shadow':'watching '+sym();
+  const chiefTxt=!R?'connecting\u2026':!R.online?'Desk offline':(ss&&!ss.open)?'market closed \u00b7 resting':(ss&&ss.shadow)?'paper-trading '+sym():'watching '+sym();
   label(c,ch[0],ch[1]+60,92,338,'CHIEF',chiefTxt,'#67e8f9',false);
   for(let i=fx.length-1;i>=0;i--){const f=fx[i],age=t-f.t0;if(age>2){fx.splice(i,1);continue}
     const y=f.y-age*22;c.globalAlpha=Math.min(1,(2-age)*1.5);c.font='700 13px "JetBrains Mono", monospace';const w=c.measureText(f.txt).width+14;
@@ -466,7 +466,7 @@ function drawCandles(){
 function drawBal(){
   const {w,h,d}=fit(BV);const c=BC;c.setTransform(d,0,0,d,0,0);c.clearRect(0,0,w,h);
   const st=R&&R.state; if(!st){return}
-  const closed=(R.trades||[]).filter(t=>!t.is_open&&t.closed_at&&t.profit!=null).sort((a,b)=>Date.parse(a.closed_at)-Date.parse(b.closed_at));
+  const closed=(R.trades||[]).filter(t=>!t.paper&&!t.is_open&&t.closed_at&&t.profit!=null).sort((a,b)=>Date.parse(a.closed_at)-Date.parse(b.closed_at));
   const eq=st.account.equity, bal=st.account.balance;
   const sumP=closed.reduce((a,t)=>a+t.profit,0);
   let run=bal-sumP; const pts=[[0, run]];
@@ -540,31 +540,34 @@ function render(t){
   setText($('#posCash'),`balance ${fmt(acc.balance)} $`);
   const pp=$('#posPct');setText(pp,(pct>=0?'+':'')+fmt(pct)+' % today');pp.style.color=pct>=0?'var(--up)':'var(--down)';
   const dg=digits();
-  setHTML($('#posList'),pos.length?pos.map(p=>`<div class="p"><span><span class="x">${esc(p.symbol.replace('USD',''))}</span> <span class="${p.direction>0?'L':'S'}">${p.direction>0?'LONG':'SHORT'} ${p.lot}</span> ${fmt(p.entry,dg)}</span><span class="${p.profit>=0?'L':'S'}">${p.profit>=0?'+':'-'}${fmt(Math.abs(p.profit))}$</span></div>`).join(''):'<div class="empty">no open positions \u00b7 all cash</div>');
+  setHTML($('#posList'),pos.length?pos.map(p=>`<div class="p"><span>${p.paper?'<span class="w">PAPER</span> ':''}<span class="x">${esc(p.symbol.replace('USD',''))}</span> <span class="${p.direction>0?'L':'S'}">${p.direction>0?'LONG':'SHORT'} ${p.lot}</span> ${fmt(p.entry,dg)}</span><span class="${p.profit>=0?'L':'S'}">${p.profit>=0?'+':'-'}${fmt(Math.abs(p.profit))}$</span></div>`).join(''):'<div class="empty">no open positions \u00b7 all cash</div>');
   const sm=R.summary||{};
-  setText($('#posFoot'),`${sm.closed_trades||0} trades closed \u00b7 win rate ${sm.win_rate==null?'--':sm.win_rate+'%'} \u00b7 ${sm.total_r>=0?'+':''}${fmt(sm.total_r||0,1)}R \u00b7 today ${day.entries||0} entries`);
+  const ps=R.paper_summary||{};
+  const paperTxt=Object.keys(ps).map(k=>{const v=ps[k];return ` \u00b7 ${k.replace('USD','')} paper: ${v.closed_trades} trades, ${v.total_r>=0?'+':''}${fmt(v.total_r||0,1)}R`}).join('');
+  setText($('#posFoot'),`${sm.closed_trades||0} trades closed \u00b7 win rate ${sm.win_rate==null?'--':sm.win_rate+'%'} \u00b7 ${sm.total_r>=0?'+':''}${fmt(sm.total_r||0,1)}R${paperTxt}`);
 
   setText($('#chSym'),NAMES[sym()]||sym());
   const ce=$('#chPx');const live=ss&&(ss.bid||(ss.candles&&ss.candles.length?ss.candles[ss.candles.length-1][4]:null));
   setText(ce,live?fmt(live,dg):'--');ce.style.color=ss&&ss.open?'var(--up)':'var(--dim)';
 
   setText($('#officeL'),`BOT OFFICE \u00b7 ${dn} \u00b7 ${shadow?'shadow mode':'live trading'}`);
-  setText($('#officeR'),`${sym()} \u00b7 ${ss?ss.broker_symbol:''} \u00b7 real candles`);
+  setText($('#officeR'),`${sym()} \u00b7 ${ss&&ss.strategy?ss.strategy+' rules':''}${ss&&ss.shadow?' \u00b7 paper':''} \u00b7 real candles`);
   setText($('#logT'),(USER?'DESK TRADE LOG \u00b7 ':'TRADE LOG \u00b7 ')+dn);
   const dl=$('#logD');setText(dl,`day ${pct>=0?'+':''}${fmt(pct,1)} %`);dl.style.color=pct>=0?'var(--up)':'var(--down)';
 
   const trades=(R.trades||[]).slice().sort((a,b)=>a.id-b.id).slice(-30);
-  const ghost=feed.filter(e=>e.agent==='entry'&&e.data&&e.data.shadow).slice(-10);
+  const ghost=feed.filter(e=>e.agent==='entry'&&e.data&&e.data.shadow&&!e.data.paper).slice(-10);
   const rowsHtml=[];
   ghost.forEach(e=>{const g=e.data;rowsHtml.push({k:Date.parse(e.at)||0,h:`<div class="row ghost"><span>shadow</span><span class="mid">${esc(short(e.message).replace(/^SHADOW \u00b7 /,''))}</span><span class="w">no order</span></div>`})});
   trades.forEach(t=>{
     const side=`<span class="${t.direction>0?'L':'S'}">${t.direction>0?'LONG':'SHORT'} ${t.lot}</span>`, nm=`<span class="x">${esc(NAMES[t.symbol]||t.symbol)}</span>`;
+    const tag=t.paper?'<span class="w">paper</span>':`#${t.id}`;
     if(t.is_open){const p=pos.find(q=>q.ticket===t.ticket);const u=p?p.profit:0;
-      rowsHtml.push({k:Date.parse(t.opened_at)||0,h:`<div class="row open"><span>#${t.id}</span><span class="mid">${nm} ${side} ${fmt(t.entry,dg)}\u2192${p?fmt(p.price,dg):'--'}</span><span class="${u>=0?'L':'S'}">${u>=0?'+':'-'}$${fmt(Math.abs(u))} open</span></div>`})}
-    else{const p=t.profit||0;rowsHtml.push({k:Date.parse(t.opened_at)||0,h:`<div class="row"><span>#${t.id}</span><span class="mid">${nm} ${side} ${fmt(t.entry,dg)}\u2192${t.exit?fmt(t.exit,dg):'--'} <span style="color:var(--dim)">${esc(t.reason||'')}</span></span><span class="${p>=0?'L':'S'}">${t.r!=null?(t.r>=0?'+':'')+fmt(t.r,2)+'R ':''}${sgn$(p)}</span></div>`})}
+      rowsHtml.push({k:Date.parse(t.opened_at)||0,h:`<div class="row open"><span>${tag}</span><span class="mid">${nm} ${side} ${fmt(t.entry,dg)}\u2192${p&&p.price!=null?fmt(p.price,dg):'--'}</span><span class="${u>=0?'L':'S'}">${u>=0?'+':'-'}$${fmt(Math.abs(u))} open</span></div>`})}
+    else{const p=t.profit||0;rowsHtml.push({k:Date.parse(t.opened_at)||0,h:`<div class="row"><span>${tag}</span><span class="mid">${nm} ${side} ${fmt(t.entry,dg)}\u2192${t.exit?fmt(t.exit,dg):'--'} <span style="color:var(--dim)">${esc(t.reason||'')}</span></span><span class="${p>=0?'L':'S'}">${t.r!=null?(t.r>=0?'+':'')+fmt(t.r,2)+'R ':''}${sgn$(p)}</span></div>`})}
   });
   rowsHtml.sort((a,b)=>a.k-b.k);
-  const re=$('#rows');const html=rowsHtml.length?rowsHtml.map(r=>r.h).join(''):'<div class="empty">no trades yet \u00b7 the Desk takes 0 to 3 setups a day</div>';
+  const re=$('#rows');const html=rowsHtml.length?rowsHtml.map(r=>r.h).join(''):'<div class="empty">no trades yet</div>';
   if(re._h!==html){const atEnd=re.scrollTop+re.clientHeight>=re.scrollHeight-30;re.innerHTML=html;re._h=html;if(atEnd)re.scrollTop=re.scrollHeight}
 
   const fe=$('#feed');const fh=feed.slice(-40).map(e=>{const tm=e.at?new Date(e.at):null;return `<div class="e"><span>${tm?String(tm.getUTCHours()).padStart(2,'0')+':'+String(tm.getUTCMinutes()).padStart(2,'0'):''}</span><span style="color:${AGC[e.agent]||'#67e8f9'}">${esc(e.agent.toUpperCase())}</span><span>${esc(e.message)}</span></div>`}).join('')||'<div class="e"><span></span><span></span><span>no events yet</span></div>';

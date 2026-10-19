@@ -42,7 +42,22 @@ def _trade_json(t: DeskTrade) -> dict:
         "target": t.target, "opened_at": t.opened_at.isoformat() if t.opened_at else None,
         "is_open": t.is_open, "closed_at": t.closed_at.isoformat() if t.closed_at else None,
         "exit": t.exit_price, "profit": t.profit_usd, "r": t.r_multiple, "reason": t.exit_reason,
-        "is_demo": t.is_demo,
+        "is_demo": t.is_demo, "paper": (t.ticket or "").startswith("paper-"),
+    }
+
+
+def _summary(rows) -> dict:
+    """rows: (profit_usd, r_multiple) of closed trades."""
+    rs = [r for _, r in rows if r is not None]
+    profits = [p for p, _ in rows if p is not None]
+    wins = sum(1 for r in rs if r > 0)
+    return {
+        "closed_trades": len(rows),
+        "wins": wins,
+        "win_rate": round(100 * wins / len(rs), 1) if rs else None,
+        "net_profit": round(sum(profits), 2) if profits else 0.0,
+        "total_r": round(sum(rs), 2) if rs else 0.0,
+        "avg_r": round(sum(rs) / len(rs), 3) if rs else None,
     }
 
 
@@ -67,10 +82,17 @@ def desk_state(
 
     trades = (db.query(DeskTrade).filter(DeskTrade.worker == worker)
               .order_by(DeskTrade.id.desc()).limit(40).all())
-    closed = (db.query(DeskTrade.profit_usd, DeskTrade.r_multiple)
+    closed = (db.query(DeskTrade.profit_usd, DeskTrade.r_multiple, DeskTrade.ticket, DeskTrade.symbol,
+                       DeskTrade.opened_at)
               .filter(DeskTrade.worker == worker, DeskTrade.is_open.is_(False)).all())
-    rs = [r for _, r in closed if r is not None]
-    profits = [p for p, _ in closed if p is not None]
+    real = [(p, r) for p, r, tk, _, _ in closed if not (tk or "").startswith("paper-")]
+    paper = {}
+    for p, r, tk, sym, opened in closed:
+        if (tk or "").startswith("paper-"):
+            paper.setdefault(sym, {"rows": [], "since": opened})
+            paper[sym]["rows"].append((p, r))
+            if opened and (paper[sym]["since"] is None or opened < paper[sym]["since"]):
+                paper[sym]["since"] = opened
 
     return {
         "worker": worker,
@@ -82,12 +104,9 @@ def desk_state(
             "agent": e.agent, "level": e.level, "message": e.message, "data": e.data,
         } for e in events],
         "trades": [_trade_json(t) for t in trades],
-        "summary": {
-            "closed_trades": len(closed),
-            "wins": sum(1 for p in profits if p > 0),
-            "win_rate": round(100 * sum(1 for p in profits if p > 0) / len(profits), 1) if profits else None,
-            "net_profit": round(sum(profits), 2) if profits else 0.0,
-            "total_r": round(sum(rs), 2) if rs else 0.0,
-            "avg_r": round(sum(rs) / len(rs), 3) if rs else None,
-        },
+        # Real Desk-account trades only. Paper trades (shadow symbols) never touch the balance.
+        "summary": _summary(real),
+        # Forward-only paper record per shadow symbol, e.g. BTCUSD on the squeeze rules.
+        "paper_summary": {sym: dict(_summary(v["rows"]), since=v["since"].isoformat() if v["since"] else None)
+                          for sym, v in paper.items()},
     }
