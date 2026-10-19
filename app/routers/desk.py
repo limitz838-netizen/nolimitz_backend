@@ -9,19 +9,30 @@ every few seconds: the worker's latest snapshot (balance, equity, positions,
 candles, agent status lines), new events since after_id, recent trades and a
 running summary.
 
-Read-only and public on purpose: it shows the Desk demo account's results,
-never credentials. The worker masks the MT5 login before writing the snapshot.
-Nothing in this router can place, change or close a trade.
+The two GET routes are read-only and public on purpose: they show the Desk demo
+account's results, never credentials. The worker masks the MT5 login before
+writing the snapshot.
+
+  POST /api/desk/copy/event     the Desk worker reports a real trade (step 9)
+  POST /api/desk/copy/follow    switch the Desk on/off for one MT5 login
+  GET  /api/desk/copy/followers who follows the Desk
+
+The /copy routes need the machine X-Worker-Token. They never place an order
+themselves: they queue rows for the existing copier lanes (see app/desk/copy.py).
 """
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Query
+import os
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.desk.models import DeskEvent, DeskState, DeskTrade
+from app.desk.models import DeskEvent, DeskFollower, DeskState, DeskTrade
 
 router = APIRouter(prefix="/api/desk", tags=["desk"])
 
@@ -110,3 +121,70 @@ def desk_state(
         "paper_summary": {sym: dict(_summary(v["rows"]), since=v["since"].isoformat() if v["since"] else None)
                           for sym, v in paper.items()},
     }
+
+
+# =====================================================================================
+# COPY TO USERS (step 9) -- machine routes, protected by the same X-Worker-Token as /worker/*
+# =====================================================================================
+WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
+
+
+def _require_worker(x_worker_token: Optional[str]):
+    if not WORKER_TOKEN or x_worker_token != WORKER_TOKEN:
+        raise HTTPException(status_code=401, detail="worker token required")
+
+
+class DeskCopyEvent(BaseModel):
+    event: str                          # open | modify | close
+    ticket: str                         # the Desk's own MT5 ticket
+    symbol: str                         # canonical, e.g. XAUUSD
+    action: Optional[str] = None        # buy | sell (open only)
+    sl_distance: Optional[float] = None
+    tp_distance: Optional[float] = None
+    stop_offset: Optional[float] = None  # new stop minus the Desk's entry (modify only)
+    price: Optional[float] = None
+
+
+@router.post("/copy/event", include_in_schema=False)
+def desk_copy_event(payload: DeskCopyEvent, x_worker_token: str = Header(None), db: Session = Depends(get_db)):
+    """The Desk worker reports a real trade event; queue it for every follower's account."""
+    _require_worker(x_worker_token)
+    from app.desk.copy import fan_out
+    return fan_out(db, payload.event, payload.ticket, payload.symbol, payload.action, payload.sl_distance,
+                   payload.tp_distance, payload.stop_offset, payload.price)
+
+
+class DeskFollowRequest(BaseModel):
+    mt5_login: str
+    enabled: bool = True
+
+
+@router.post("/copy/follow", include_in_schema=False)
+def desk_copy_follow(payload: DeskFollowRequest, x_worker_token: str = Header(None), db: Session = Depends(get_db)):
+    """Switch the Desk on or off for one MT5 account (by login). Admin/test tool until the
+    in-app switch exists. Turning it off stops new entries only; open copies are still managed."""
+    _require_worker(x_worker_token)
+    from app.models import ClientMT5Account
+    acct = (db.query(ClientMT5Account).filter(ClientMT5Account.login == str(payload.mt5_login).strip(),
+                                              ClientMT5Account.is_active == True)  # noqa: E712
+            .order_by(ClientMT5Account.id.desc()).first())
+    if acct is None or not acct.license_id:
+        raise HTTPException(status_code=404, detail="no active MT5 account with that login")
+    row = db.query(DeskFollower).filter(DeskFollower.license_id == acct.license_id).first()
+    if row is None:
+        row = DeskFollower(license_id=acct.license_id, mt5_login=str(acct.login), enabled=payload.enabled)
+        db.add(row)
+    else:
+        row.enabled = payload.enabled
+        row.mt5_login = str(acct.login)
+    db.commit()
+    return {"license_id": acct.license_id, "mt5_login": acct.login, "enabled": row.enabled,
+            "verified": bool(acct.is_verified), "risk_level": acct.risk_level}
+
+
+@router.get("/copy/followers", include_in_schema=False)
+def desk_copy_followers(x_worker_token: str = Header(None), db: Session = Depends(get_db)):
+    _require_worker(x_worker_token)
+    return [{"license_id": r.license_id, "mt5_login": r.mt5_login, "enabled": r.enabled,
+             "since": r.created_at.isoformat() if r.created_at else None}
+            for r in db.query(DeskFollower).order_by(DeskFollower.id).all()]

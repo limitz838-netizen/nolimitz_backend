@@ -65,3 +65,22 @@ class DeskState(Base):
     worker = Column(String(64), unique=True, nullable=False, index=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     payload = Column(JSON, nullable=False)
+
+
+class DeskFollower(Base):
+    """A licence whose MT5 account copies the Desk's real trades (Oct 2026, step 9).
+
+    Opt-in only: no row, or enabled=False, means the Desk never opens a trade on
+    that account. Turning it off stops NEW entries; trades already copied keep
+    being managed (breakeven, trailing, close) until they finish.
+    The user's own symbol settings decide the lot, and their risk mode decides
+    how many trades one Desk signal opens (normal 1, medium 3, aggressive 5).
+    """
+    __tablename__ = "desk_followers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    license_id = Column(Integer, nullable=False, unique=True, index=True)
+    mt5_login = Column(String(32), nullable=True)
+    enabled = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)

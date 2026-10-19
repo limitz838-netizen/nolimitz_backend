@@ -670,6 +670,89 @@ def _client_closed_it_themselves(db: Session, row: TradeExecution) -> bool:
 # ==============================================================================
 # EVENT HANDLERS
 # ==============================================================================
+# ==============================================================================
+# NOLIMITZ DESK ROWS (step 9, Oct 2026)
+# ==============================================================================
+# The Desk sends stop/target as DISTANCES ("dist:20.616") and breakeven/trailing as an OFFSET from the
+# entry ("off:0" = breakeven), because brokers quote gold slightly differently: a copied price level
+# could land on the wrong side on another broker. Lot and number of trades stay the user's own.
+DESK_WARN_PCT = float(os.environ.get("DESK_WARN_PCT", "10"))
+
+
+def _desk_levels(row, broker_symbol):
+    """None for any non-Desk row. Else ("ok", sl, tp) from THIS account's live price, or ("error", text)."""
+    s, t = str(row.sl or ""), str(row.tp or "")
+    if not s.startswith("dist:"):
+        return None
+    try:
+        sd = float(s[5:])
+        td = float(t[5:]) if t.startswith("dist:") else 0.0
+    except ValueError:
+        return ("error", "Desk: bad stop distance")
+    ok, err = _ensure_symbol(broker_symbol)
+    if not ok:
+        return ("error", err)
+    tick, info = mt5.symbol_info_tick(broker_symbol), mt5.symbol_info(broker_symbol)
+    if not tick or not info:
+        return ("error", f"no price for {broker_symbol}")
+    d = 1 if (row.action or "").lower() == "buy" else -1
+    ref = tick.ask if d > 0 else tick.bid
+    sl = round(ref - d * sd, info.digits)
+    tp = round(ref + d * td, info.digits) if td > 0 else None
+    return ("ok", sl, tp)
+
+
+def _desk_guard(broker_symbol, action, lot, sl, count):
+    """(allowed, note). Blocks only when the stop would cost more than the whole account."""
+    tick, acc = mt5.symbol_info_tick(broker_symbol), mt5.account_info()
+    if not tick or acc is None:
+        return True, "Desk Guard: could not read the account - risk not checked"
+    buy = (action or "").lower() == "buy"
+    ref = tick.ask if buy else tick.bid
+    lot_n, _ = _normalise_lot(broker_symbol, lot)
+    loss = mt5.order_calc_profit(mt5.ORDER_TYPE_BUY if buy else mt5.ORDER_TYPE_SELL,
+                                 broker_symbol, float(lot_n), float(ref), float(sl))
+    if loss is None:
+        return True, "Desk Guard: could not price the stop - risk not checked"
+    risk = abs(float(loss)) * count
+    eq, cur = float(acc.equity or 0), (getattr(acc, "currency", "") or "")
+    if eq <= 0 or risk > eq:
+        return False, (f"Desk Guard: blocked - {count} x {lot_n} lot would lose {risk:.2f} {cur} at the stop, "
+                       f"account equity is {eq:.2f} {cur}")
+    pct = 100.0 * risk / eq
+    note = f"Desk: {count} x {lot_n} lot, risk {risk:.2f} {cur} = {pct:.1f}% of {eq:.2f}"
+    return True, note + (" - HIGH RISK" if pct > DESK_WARN_PCT else "")
+
+
+def _desk_modify(maps, row):
+    try:
+        off = float(str(row.sl)[4:])
+    except ValueError:
+        return "failed", None, "Desk: bad stop offset"
+    done, errors = [], []
+    for m in maps:
+        if not m.client_ticket:
+            continue
+        pos = _position_by_ticket(m.client_ticket)
+        if not pos:
+            continue
+        info = mt5.symbol_info(pos.symbol)
+        buy = pos.type == mt5.POSITION_TYPE_BUY
+        new = round(pos.price_open + off, info.digits if info else 5)
+        cur = float(pos.sl or 0)
+        if cur and ((buy and new <= cur) or ((not buy) and new >= cur)):
+            continue                                    # never loosen a stop
+        ok, err = _modify_position(int(m.client_ticket), new, None)
+        if ok:
+            done.append(str(m.client_ticket))
+        else:
+            errors.append(f"{m.client_ticket}: {err}")
+    if done:
+        logger.info("Desk MODIFY %s -> %s (offset %+.3f)", row.symbol, done, off)
+        return "executed", ",".join(done), ""
+    return "skipped", None, "; ".join(errors) or "stop already at or past the Desk level"
+
+
 def _handle_open(db: Session, row: TradeExecution, broker_symbol: str,
                  setting: ClientSymbolSetting, account) -> Tuple[str, Optional[str], str]:
     """Returns (status, client_ticket, error_message)."""
@@ -723,11 +806,22 @@ def _handle_open(db: Session, row: TradeExecution, broker_symbol: str,
             f"allows {max_open} open on {row.symbol}, {current} already open")
 
     lot = float(row.lot_size or getattr(setting, "lot_size", 0.01) or 0.01)
-    sl = float(row.sl) if row.sl and str(row.sl) not in ("0", "0.0", "") else None
-    tp = float(row.tp) if row.tp and str(row.tp) not in ("0", "0.0", "") else None
+    desk = _desk_levels(row, broker_symbol)          # None for every non-Desk row
+    if desk is not None and desk[0] == "error":
+        return "skipped", None, desk[1]
+    if desk is not None:
+        sl, tp = desk[1], desk[2]
+    else:
+        sl = float(row.sl) if row.sl and str(row.sl) not in ("0", "0.0", "") else None
+        tp = float(row.tp) if row.tp and str(row.tp) not in ("0", "0.0", "") else None
     comment = (row.comment or "Nolimitz Copier")[:30]
 
     wanted = min(per_signal, slots)
+    desk_note = ""
+    if desk is not None:
+        allowed, desk_note = _desk_guard(broker_symbol, row.action, lot, sl, wanted)
+        if not allowed:
+            return "skipped", None, desk_note
     tickets: List[int] = []
     last_error = ""
     for _ in range(wanted):
@@ -748,7 +842,7 @@ def _handle_open(db: Session, row: TradeExecution, broker_symbol: str,
 
     logger.info("📋 copier OPEN %s %s x%d lot=%.2f → %s",
                 row.action.upper(), broker_symbol, len(tickets), lot, tickets)
-    return "executed", str(tickets[0]), partial
+    return "executed", str(tickets[0]), "; ".join(x for x in (partial, desk_note) if x)
 
 
 def _handle_close(db: Session, row: TradeExecution) -> Tuple[str, Optional[str], str]:
@@ -785,6 +879,8 @@ def _handle_modify(db: Session, row: TradeExecution) -> Tuple[str, Optional[str]
     maps = _maps_for(db, row, open_only=True)
     if not maps:
         return "skipped", None, "no open trades mapped to this master ticket"
+    if str(row.sl or "").startswith("off:"):
+        return _desk_modify(maps, row)
 
     sl = float(row.sl) if row.sl and str(row.sl) not in ("0", "0.0", "") else None
     tp = float(row.tp) if row.tp and str(row.tp) not in ("0", "0.0", "") else None

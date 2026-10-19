@@ -49,6 +49,8 @@ import os
 import socket
 import subprocess
 import sys
+import queue
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -126,6 +128,46 @@ def mask_login(login) -> str:
 
 
 # =============================================================================
+class DeskCopier:
+    """Sends the Desk's real trade events to the backend (POST /api/desk/copy/event), which queues them
+    for every follower's own MT5 account. Off unless DESK_COPY_ENABLED=true."""
+
+    def __init__(self):
+        self.on = os.getenv("DESK_COPY_ENABLED", "false").strip().lower() == "true"
+        base = os.getenv("DESK_COPY_URL", "https://nolimitz-backend-yfne.onrender.com").rstrip("/")
+        self.url = base + "/api/desk/copy/event"
+        self.token = os.getenv("DESK_COPY_TOKEN") or os.getenv("WORKER_TOKEN") or ""
+        self.q = queue.Queue()
+        self.closed = set()
+        if self.on and not self.token:
+            log.warning("[COPY] DESK_COPY_ENABLED but no DESK_COPY_TOKEN / WORKER_TOKEN - copying stays OFF")
+            self.on = False
+        if self.on:
+            threading.Thread(target=self._run, name="desk-copy", daemon=True).start()
+        log.info("[COPY] copying to followers is %s", "ON -> " + self.url if self.on else "OFF")
+
+    def send(self, payload: dict):
+        if self.on:
+            self.q.put(payload)
+
+    def _run(self):
+        import requests
+        while True:
+            p = self.q.get()
+            for attempt in range(6):
+                try:
+                    r = requests.post(self.url, json=p, headers={"X-Worker-Token": self.token}, timeout=15)
+                    if r.status_code < 300:
+                        log.info("[COPY] %s %s -> %s", p.get("event"), p.get("ticket"), r.text[:200])
+                        break
+                    log.warning("[COPY] %s %s HTTP %s %s", p.get("event"), p.get("ticket"), r.status_code, r.text[:200])
+                    if 400 <= r.status_code < 500:
+                        break                       # bad request or token: retrying will not help
+                except Exception as e:
+                    log.warning("[COPY] %s %s failed: %s", p.get("event"), p.get("ticket"), e)
+                time.sleep(3 * (attempt + 1))
+
+
 class Desk:
     def __init__(self, cfg=Cfg):
         self.cfg = cfg
@@ -135,6 +177,7 @@ class Desk:
         self.bias: Dict[str, int] = {}
         self.decision: Dict[str, S.Decision] = {}
         self.agents = {a: "starting" for a in ("scout", "check", "size", "entry", "exit", "guard")}
+        self.copier = DeskCopier()
         self.offset_sec = 0                      # broker server time minus UTC
         self.offset_known = False
         self.tick_seen: Dict[str, float] = {}     # canonical -> last tick time seen (to spot live markets)
@@ -493,6 +536,12 @@ class Desk:
         self.event("entry", f"{side.upper()} {canon} {lot} @ {fmt(fill, s['digits'])} \u00b7 "
                             f"SL {fmt(sl, s['digits'])} \u00b7 TP {fmt(tp, s['digits'])}",
                    canon, "ok", {"ticket": ticket, "lot": lot, "price": fill, "sl": sl, "tp": tp})
+        stop0 = pos.sl if pos and pos.sl else sl
+        tgt0 = pos.tp if pos and pos.tp else tp
+        self.copier.send({"event": "open", "ticket": ticket, "symbol": canon,
+                          "action": "buy" if d.signal > 0 else "sell", "price": fill,
+                          "sl_distance": round(abs(fill - stop0), 6),
+                          "tp_distance": round(abs(tgt0 - fill), 6) if tgt0 else None})
 
     # ---------------------------------------------------------- management ---
     def manage(self, canon: str):
@@ -544,6 +593,8 @@ class Desk:
                 self._commit()
                 what = "breakeven" if abs(new - row.entry_price) < 1e-9 else "trailing stop"
                 self.event("exit", f"{canon} {what} \u2192 {fmt(new, s['digits'])}", canon, "ok")
+                self.copier.send({"event": "modify", "ticket": row.ticket, "symbol": canon,
+                                  "stop_offset": round(new - row.entry_price, 6)})
 
     def manage_paper(self, row: DeskTrade):
         """Walk the paper position through every M15 bar since entry, in order: a gap through the
@@ -624,6 +675,9 @@ class Desk:
                    {"paper": True, "ticket": row.ticket, "profit": row.profit_usd, "r": row.r_multiple, "reason": reason})
 
     def record_close(self, row: DeskTrade):
+        if not row.ticket.startswith("paper-") and row.ticket not in self.copier.closed:
+            self.copier.closed.add(row.ticket)
+            self.copier.send({"event": "close", "ticket": row.ticket, "symbol": row.symbol})
         deals = mt5.history_deals_get(position=int(row.ticket)) or []
         out = [x for x in deals if x.entry in (getattr(mt5, "DEAL_ENTRY_OUT", 1), getattr(mt5, "DEAL_ENTRY_OUT_BY", 3))]
         if not deals:
@@ -686,6 +740,41 @@ class Desk:
             self.event("chief", f"adopted open {canon} position #{p.ticket} after restart", canon, "warn")
 
     # ---------------------------------------------------------------- state ---
+    def agent_view(self, positions):
+        """Agent cards: the last event per agent, but Exit and Scout show the live picture on every loop."""
+        view = dict(self.agents)
+        try:
+            rows = {r.ticket: r for r in self.db.query(DeskTrade).filter(DeskTrade.worker == self.cfg.WORKER,
+                                                                         DeskTrade.is_open.is_(True)).all()}
+            parts = []
+            for p in positions:
+                row = rows.get(str(p["ticket"]))
+                dg = self.sym.get(p["symbol"], {}).get("digits", 2)
+                side = "long" if p["direction"] > 0 else "short"
+                tag = ("PAPER " if p.get("paper") else "") + p["symbol"].replace("USD", "")
+                txt = f"{tag} {side} {p['profit']:+.2f}$"
+                if row is not None and row.initial_stop and p.get("price"):
+                    risk = abs(row.entry_price - row.initial_stop)
+                    if risk > 0:
+                        txt += f" ({(p['price'] - row.entry_price) * p['direction'] / risk:+.1f}R)"
+                        sl = p.get("sl") or row.current_stop
+                        locked = sl is not None and (sl - row.entry_price) * p["direction"] >= -1e-9
+                        if locked and abs(sl - row.entry_price) < 10 ** -dg:
+                            txt += " \u00b7 stop at breakeven"
+                        elif locked:
+                            txt += f" \u00b7 trailing {fmt(sl, dg)}"
+                        else:
+                            txt += (f" \u00b7 SL {fmt(sl, dg)} \u00b7 BE at "
+                                    f"{fmt(row.entry_price + p['direction'] * risk, dg)}")
+                parts.append(txt)
+            view["exit"] = " | ".join(parts) if parts else "flat \u00b7 no open trades"
+            sc = [f"{c.replace('USD', '')}: {d.scout}" for c, d in self.decision.items() if d is not None and d.scout]
+            if sc:
+                view["scout"] = " | ".join(sc)
+        except Exception as e:
+            log.debug("agent view failed: %s", e)
+        return view
+
     def write_state(self, info):
         positions = []
         for p in self.our_positions():
@@ -734,7 +823,7 @@ class Desk:
             "day": {"date": str(self.day), "start_balance": self.day_start_balance,
                     "entries": entries, "losses": losses,
                     "daily_loss_limit_pct": self.cfg.DAILY_LOSS_PCT},
-            "agents": self.agents, "positions": positions, "symbols": symbols,
+            "agents": self.agent_view(positions), "positions": positions, "symbols": symbols,
             "broker_utc_offset_h": self.offset_sec // 3600,
         }
         try:
