@@ -30,7 +30,7 @@ from app.routers import reminders
 from app.routers import entitlement
 from app.routers import telegram_copier
 from app.routers import telegram_user_copier
-from app.routers import desk as desk_routes  # Desk: read-only live view (creates desk_* tables via its models)
+from app.routers import bridge_heartbeat
 
 # --------------------------------------------------------- AI routers ---
 from app.ai.routes.ai_assistant import router as ai_assistant_router
@@ -188,7 +188,7 @@ app.include_router(entitlement.router)
 app.include_router(telegram_copier.router)
 app.include_router(telegram_user_copier.router)
 app.include_router(telegram_user_copier.worker_router)
-app.include_router(desk_routes.router)
+app.include_router(bridge_heartbeat.router)  # VPS master bridge heartbeat (/worker/...)
 
 
 @app.get("/")
