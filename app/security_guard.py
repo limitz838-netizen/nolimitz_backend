@@ -10,8 +10,8 @@ What it does, before any route runs:
                         anything in the BLOCKED_IPS env var (comma separated).
   2. Admin signup    -> 403 unless ADMIN_SIGNUP_OPEN=true. You are the only
                         admin; open signup is how the intruder got accounts.
-  3. Admin login     -> 5 failed logins from one IP in 15 min = that IP is
-                        blocked for 1 hour (429).
+  3. Admin login     -> 5 failed logins (/admin/login or /api/ai/login) from
+                        one IP in 15 min = that IP is blocked for 1 hour (429).
   4. Probing         -> 30 refused calls (401/404/405) to admin, worker,
                         copier or internal routes from one IP in 10 min =
                         blocked for 1 hour (429). Customers using the app do
@@ -19,9 +19,16 @@ What it does, before any route runs:
   Never blocked: the VPS (80.241.217.13) and anything in SAFE_IPS.
 
 Nothing is stored; blocks reset on a deploy. Every block is logged.
+
+  5. Memory watch   -> every 2 s it reads the process memory. Above
+                       MEMWATCH_MB (default 700 MB, normal is ~250 MB) it
+                       logs every request still running (method, path, IP,
+                       seconds so far), so if one request blows the 2 GB limit
+                       we see which one it was before the restart wipes it.
 """
 import logging
 import os
+import threading
 import time
 from collections import defaultdict, deque
 
@@ -43,6 +50,37 @@ SENSITIVE = ("/admin", "/api/admin", "/api/worker", "/worker", "/client/worker",
              "/copier", "/payments/jarvis", "/payments/telegram-upgrade",
              "/entitlement", "/reminders", "/eas", "/docs", "/openapi.json", "/redoc")
 
+MEMWATCH_MB = int(os.getenv("MEMWATCH_MB", "700"))
+_inflight = {}
+_inflight_lock = threading.Lock()
+
+
+def _rss_mb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        return 0
+    return 0
+
+
+def _memwatch():
+    last_log = 0.0
+    while True:
+        time.sleep(2)
+        mb = _rss_mb()
+        if mb >= MEMWATCH_MB and time.time() - last_log > 10:
+            last_log = time.time()
+            now = time.time()
+            with _inflight_lock:
+                rows = sorted(_inflight.values(), key=lambda r: r[0])
+            running = "; ".join(f"{m} {p} from {ip} for {now - t0:.0f}s" for t0, m, p, ip in rows[:15])
+            # print, not log: always lands in Render logs whatever the log level
+            print(f"[memwatch] process at {mb} MB. In-flight requests: {running or 'none'}", flush=True)
+
+
 _login = defaultdict(deque)
 _probe = defaultdict(deque)
 _until = {}
@@ -61,6 +99,9 @@ def _hit(store, ip, window, limit, now):
 
 
 def install_security_guard(app):
+    if MEMWATCH_MB > 0:
+        threading.Thread(target=_memwatch, name="memwatch", daemon=True).start()
+
     @app.middleware("http")
     async def security_guard(request: Request, call_next):
         ip = _ip(request)
@@ -76,11 +117,18 @@ def install_security_guard(app):
                 log.warning("admin signup refused from %s", ip)
                 return JSONResponse({"detail": "Admin signup is closed"}, status_code=403)
 
-        response = await call_next(request)
+        key = id(request)
+        with _inflight_lock:
+            _inflight[key] = (now, request.method, path, ip)
+        try:
+            response = await call_next(request)
+        finally:
+            with _inflight_lock:
+                _inflight.pop(key, None)
 
         if ip and ip not in SAFE:
             code = response.status_code
-            if path.rstrip("/") == "/admin/login" and code in (401, 403):
+            if path.rstrip("/") in ("/admin/login", "/api/ai/login") and code in (401, 403):
                 if _hit(_login, ip, LOGIN_WINDOW, LOGIN_FAILS, now):
                     _until[ip] = now + BLOCK_SEC
                     log.warning("blocked %s for 1h: %d failed admin logins", ip, LOGIN_FAILS)
