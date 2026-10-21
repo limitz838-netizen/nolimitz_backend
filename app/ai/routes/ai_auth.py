@@ -1,3 +1,5 @@
+import os
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
@@ -15,13 +17,27 @@ router = APIRouter(
     tags=["AI Auth"]
 )
 
-SECRET_KEY = "nolimitz_ai_secret"
+# The signing key used to be hard-coded here ("nolimitz_ai_secret"), so anyone
+# who saw this file could forge a token. It now comes from the environment:
+# AI_JWT_SECRET if set, otherwise the (already rotated) JWT_SECRET.
+# Any other file that signs or checks these tokens must import SECRET_KEY
+# from here instead of keeping its own copy.
+SECRET_KEY = os.getenv("AI_JWT_SECRET") or os.getenv("JWT_SECRET")
+if not SECRET_KEY:
+    raise RuntimeError("Set AI_JWT_SECRET (or JWT_SECRET) in the environment")
 ALGORITHM = "HS256"
 
 pwd_context = CryptContext(
     schemes=["bcrypt"],
     deprecated="auto"
 )
+
+# A real bcrypt hash of a random string: checked when the email is unknown so
+# a wrong email takes as long as a wrong password (no email probing by timing).
+try:
+    _DUMMY_HASH = pwd_context.hash(os.urandom(16).hex())
+except Exception:          # never let this stop the app from starting
+    _DUMMY_HASH = None
 
 
 class SignupSchema(BaseModel):
@@ -43,39 +59,42 @@ class LoginSchema(BaseModel):
 def signup(data: SignupSchema):
 
     db: Session = SessionLocal()
-
-    existing_user = (
-        db.query(AIUser)
-        .filter(AIUser.email == data.email)
-        .first()
-    )
-
-    if existing_user:
-        raise HTTPException(
-            status_code=400,
-            detail="Email already registered"
+    try:
+        existing_user = (
+            db.query(AIUser)
+            .filter(AIUser.email == data.email)
+            .first()
         )
 
-    hashed_password = pwd_context.hash(
-        data.password
-    )
+        if existing_user:
+            raise HTTPException(
+                status_code=400,
+                detail="Email already registered"
+            )
 
-    new_user = AIUser(
-        name=data.name,
-        email=data.email,
-        password_hash=hashed_password
-    )
+        hashed_password = pwd_context.hash(
+            data.password
+        )
 
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
+        new_user = AIUser(
+            name=data.name,
+            email=data.email,
+            password_hash=hashed_password
+        )
 
-    db.close()
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
 
-    return {
-        "message": "Account created successfully",
-        "credits": new_user.credits
-    }
+        return {
+            "message": "Account created successfully",
+            "credits": new_user.credits
+        }
+    finally:
+        # Always hand the connection back, even when we raise. Before this,
+        # every refused request leaked one pooled connection; ~15 of them
+        # took the whole API down on 21 Oct (QueuePool timeout).
+        db.close()
 
 
 # =========================
@@ -86,50 +105,62 @@ def signup(data: SignupSchema):
 def login(data: LoginSchema):
 
     db: Session = SessionLocal()
-
-    admin = (
-        db.query(Admin)
-        .filter(Admin.email == data.email)
-        .first()
-    )
-
-    if not admin:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid credentials"
+    try:
+        admin = (
+            db.query(Admin)
+            .filter(Admin.email == data.email)
+            .first()
         )
 
-    valid_password = pwd_context.verify(
-        data.password,
-        admin.password_hash
-    )
+        if not admin:
+            if _DUMMY_HASH:
+                try:
+                    pwd_context.verify(data.password, _DUMMY_HASH)
+                except Exception:
+                    pass
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid credentials"
+            )
 
-    if not valid_password:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid credentials"
+        valid_password = pwd_context.verify(
+            data.password,
+            admin.password_hash
         )
 
-    token_data = {
-        "admin_id": admin.id,
-        "exp": datetime.utcnow() + timedelta(days=7)
-    }
+        # Switched-off admins (is_active = false) and admins nobody approved
+        # must not get a token here either -- the main admin login already
+        # refuses them, this one did not.
+        allowed = bool(admin.is_active) and (
+            admin.role == "super_admin" or bool(admin.is_approved)
+        )
 
-    token = jwt.encode(
-        token_data,
-        SECRET_KEY,
-        algorithm=ALGORITHM
-    )
+        if not valid_password or not allowed:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid credentials"
+            )
 
-    db.close()
-
-    return {
-        "access_token": token,
-        "admin": {
-            "id": admin.id,
-            "email": admin.email,
-            "role": admin.role,
-            "plan": admin.plan,
-            "is_super_admin": admin.is_super_admin
+        token_data = {
+            "admin_id": admin.id,
+            "exp": datetime.utcnow() + timedelta(days=7)
         }
-    }
+
+        token = jwt.encode(
+            token_data,
+            SECRET_KEY,
+            algorithm=ALGORITHM
+        )
+
+        return {
+            "access_token": token,
+            "admin": {
+                "id": admin.id,
+                "email": admin.email,
+                "role": admin.role,
+                "plan": admin.plan,
+                "is_super_admin": admin.is_super_admin
+            }
+        }
+    finally:
+        db.close()
