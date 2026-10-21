@@ -740,7 +740,55 @@ class Desk:
             self.event("chief", f"adopted open {canon} position #{p.ticket} after restart", canon, "warn")
 
     # ---------------------------------------------------------------- state ---
-    def agent_view(self, positions):
+    def live_cards(self, info, positions):
+        """Check, Size, Entry and Guard as they stand right now (refreshed every loop)."""
+        out, chk, siz, ent = {}, [], [], []
+        held = {p["symbol"] for p in positions if not p.get("paper")}
+        paper = {p["symbol"] for p in positions if p.get("paper")}
+        for canon, s in self.sym.items():
+            tag = canon.replace("USD", "")
+            tick = mt5.symbol_info_tick(s["broker"])
+            d = self.decision.get(canon)
+            if tick is None or not self.market_open(s["broker"], tick):
+                chk.append(f"{tag} market closed")
+                ent.append(f"{tag} market closed")
+                continue
+            spread = tick.ask - tick.bid
+            if d is not None and d.atr:
+                ok = spread <= self.cfg.MAX_SPREAD_ATR * d.atr
+                chk.append(f"{tag} spread {fmt(spread, s['digits'])} = {spread / d.atr:.0%} of ATR "
+                           + ("ok" if ok else "TOO WIDE"))
+            else:
+                chk.append(f"{tag} spread {fmt(spread, s['digits'])} \u00b7 warming up")
+            if self.shadow(canon):
+                ent.append(f"{tag} paper only" + (" \u00b7 holding" if canon in paper else ""))
+            elif canon in held:
+                ent.append(f"{tag} in a trade \u00b7 one per symbol")
+            else:
+                ent.append(f"{tag} armed \u00b7 waits for Scout")
+            if d is not None and d.atr and info is not None and info.balance and not self.shadow(canon):
+                dist = d.stop_distance
+                loss1 = mt5.order_calc_profit(mt5.ORDER_TYPE_BUY, s["broker"], 1.0, tick.ask, tick.ask - dist)
+                if loss1:
+                    lot = int(info.balance * self.cfg.RISK_PCT / 100 / abs(loss1) / s["vstep"] + 1e-9) * s["vstep"]
+                    lot = round(max(lot, s["vmin"]), 2)
+                    risk = abs(loss1) * lot
+                    siz.append(f"next {tag}: {lot:.2f} lot \u00b7 risk ${risk:,.2f} ({risk / info.balance:.1%}) "
+                               f"\u00b7 stop {fmt(dist, s['digits'])}")
+        if chk:
+            out["check"] = " | ".join(chk)
+        if ent:
+            out["entry"] = " | ".join(ent)
+        if siz:
+            out["size"] = " | ".join(siz)
+        if info is not None:
+            start = self.day_start_balance or info.balance
+            used = max(0.0, (start - info.equity) / start * 100) if start else 0.0
+            out["guard"] = (f"day loss {used:.1f}% of {self.cfg.DAILY_LOSS_PCT:g}% limit \u00b7 {len(held)} open "
+                            f"\u00b7 free margin ${info.margin_free:,.0f}")
+        return out
+
+    def agent_view(self, positions, info=None):
         """Agent cards: the last event per agent, but Exit and Scout show the live picture on every loop."""
         view = dict(self.agents)
         try:
@@ -771,6 +819,10 @@ class Desk:
             sc = [f"{c.replace('USD', '')}: {d.scout}" for c, d in self.decision.items() if d is not None and d.scout]
             if sc:
                 view["scout"] = " | ".join(sc)
+            try:
+                view.update(self.live_cards(info, positions))
+            except Exception as e:
+                log.debug("live cards failed: %s", e)
         except Exception as e:
             log.debug("agent view failed: %s", e)
         return view
@@ -823,7 +875,7 @@ class Desk:
             "day": {"date": str(self.day), "start_balance": self.day_start_balance,
                     "entries": entries, "losses": losses,
                     "daily_loss_limit_pct": self.cfg.DAILY_LOSS_PCT},
-            "agents": self.agent_view(positions), "positions": positions, "symbols": symbols,
+            "agents": self.agent_view(positions, info), "positions": positions, "symbols": symbols,
             "broker_utc_offset_h": self.offset_sec // 3600,
         }
         try:

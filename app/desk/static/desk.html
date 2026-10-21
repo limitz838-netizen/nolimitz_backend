@@ -50,7 +50,7 @@ body{font-family:var(--mono);font-size:13px;padding-left:max(10px, env(safe-area
 .ag .face::before{left:3px}.ag .face::after{right:3px}
 .ag .n{font-size:10.5px;font-weight:700;color:var(--c);letter-spacing:.06em;line-height:1.1}
 .ag .r{font-size:9px;color:var(--dim)}
-.ag .s{font-size:9.5px;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:.85}
+.ag .s{font-size:9.5px;line-height:1.35;color:var(--ink);overflow:hidden;opacity:.85;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;min-height:2.7em;word-break:break-word}
 .ag .bar{height:3px;background:var(--line);border-radius:2px;overflow:hidden}
 .ag .bar i{display:block;height:100%;background:var(--c);width:30%;transition:width .3s}
 
@@ -214,6 +214,8 @@ let lastId=0, firstLoad=true, failures=0;
 const queue=[];             // new events waiting to be animated
 const feed=[];              // recent events for the feed list
 const say={}, activeUntil={};
+const live={};  // each agent's live status from the worker
+function cardTxt(id,now){ return (((activeUntil[id]||0)>now) ? say[id] : (live[id]||say[id])) || 'waiting'; }
 let prevAgent=null;
 const fx=[], parts=[];
 const EMBED=window.parent!==window;
@@ -267,7 +269,7 @@ async function poll(){
     // keep previous events/trades view when polling incrementally
     j.events=evs;
     R=j;
-    if(j.state&&j.state.agents) for(const a of AG){ if(!say[a.id]&&j.state.agents[a.id]) say[a.id]=short(j.state.agents[a.id]); }
+    if(j.state&&j.state.agents) for(const a of AG){ const v=j.state.agents[a.id]; if(v) live[a.id]=short(v); }
   }catch(e){ failures++; }
   setTimeout(poll,POLL_MS);
 }
@@ -414,7 +416,7 @@ function drawOffice(t){
     const A=LAY[p.a].bot,B=LAY[p.b].bot;const a=P(A[0],A[1],70),b=P(B[0],B[1],70);const cx=(a[0]+b[0])/2,cy=Math.min(a[1],b[1])-40;
     for(let j=0;j<7;j++){const u=Math.min(1,age*1.4-j*0.06);if(u<0)continue;const x=(1-u)*(1-u)*a[0]+2*(1-u)*u*cx+u*u*b[0],y=(1-u)*(1-u)*a[1]+2*(1-u)*u*cy+u*u*b[1];c.globalAlpha=(1-age)*(1-j/8);c.fillStyle=p.c;c.beginPath();c.arc(x,y,2.6-j*.25,0,7);c.fill()}
     c.globalAlpha=1}
-  for(const a of AG){const L=LAY[a.id],h=a._head;label(c,h[0],h[1],h[0]+L.lab[0],h[1]+L.lab[1],a.n,say[a.id]||'waiting',a.c,(activeUntil[a.id]||0)>now)}
+  for(const a of AG){const L=LAY[a.id],h=a._head;label(c,h[0],h[1],h[0]+L.lab[0],h[1]+L.lab[1],a.n,cardTxt(a.id,now),a.c,(activeUntil[a.id]||0)>now)}
   const ch=chief._head, ss=symState();
   const chiefTxt=!R?'connecting\u2026':!R.online?'Desk offline':(ss&&!ss.open)?'market closed \u00b7 resting':(ss&&ss.shadow)?'paper-trading '+sym():'watching '+sym();
   label(c,ch[0],ch[1]+60,92,338,'CHIEF',chiefTxt,'#67e8f9',false);
@@ -496,7 +498,7 @@ function render(t){
   const dn=`${DOW[d.getUTCDay()]} ${d.getUTCDate()} ${MON[d.getUTCMonth()]}`;
   setText($('#dayLbl'),dn+' \u00b7 LIVE');
 
-  AG.forEach((a,i)=>{const on=(activeUntil[a.id]||0)>now;setText(agS[a.id],say[a.id]||'waiting');agBox[a.id].classList.toggle('on',on);
+  AG.forEach((a,i)=>{const on=(activeUntil[a.id]||0)>now;setText(agS[a.id],cardTxt(a.id,now));agBox[a.id].classList.toggle('on',on);
     agB[a.id].style.width=(on?100:(R&&R.online?28+22*(1+Math.sin(t*0.9+i*1.3)):8))+'%'});
 
   const st=R&&R.state, banner=$('#banner'), badge=$('#modeBadge');
