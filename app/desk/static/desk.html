@@ -638,19 +638,13 @@ function renderUser(dn,ss){
   setText(ce,lv?fmt(lv,dg):'--');ce.style.color=ss&&ss.open?'var(--up)':'var(--dim)';
   setText($('#officeL'),`BOT OFFICE · ${dn} · ${V.following?'working on MY account':'idle · not on my account'}`);
   setText($('#officeR'),'XAUUSD · real candles');
-  // my MT5 activity: master, AI and Telegram trades, SL/TP, stop moves, closes, failures, and why the AI skipped
-  setText($('#logT'),'MY MT5 ACTIVITY · '+dn);
+  // The Desk shows only the AI agent feed. Trade activity lives in the app's Trade Activity card.
+  setText($('#logT'),'AI AGENT FEED · '+dn);
   const dl=$('#logD');setText(dl,V.following?'AI trading my account':'AI not trading my account');dl.style.color=V.following?'var(--up)':'var(--dim)';
-  const SC2={AI:'#4ade80',MASTER:'#60a5fa',TELEGRAM:'#a78bfa'};
-  const EV={open:'OPEN',close:'CLOSE',modify:'SL/TP MOVE',skipped:'NO TRADE'};
-  const act=(V.activity||[]).slice().reverse();
-  const html=act.length?act.map(a=>{const tm=a.at?new Date(a.at):null;const st=String(a.status||'');const ok=/done|success|filled|closed|executed|ok/i.test(st);const bad=/fail|error|reject|block|not placed|skip/i.test(st)||a.event==='skipped';
-    const lv=[a.sl?'SL '+esc(a.sl):'',a.tp?'TP '+esc(a.tp):''].filter(Boolean).join(' · ');
-    return `<div class="row" style="white-space:normal;align-items:start"><span>${tm?String(tm.getUTCDate()).padStart(2,'0')+' '+MON[tm.getUTCMonth()]+' '+String(tm.getUTCHours()).padStart(2,'0')+':'+String(tm.getUTCMinutes()).padStart(2,'0'):''}</span><span class="mid" style="white-space:normal"><span style="color:${SC2[a.source]||'#9aa5b5'};font-weight:700">${esc(a.source||'')}</span> <span class="x">${esc(EV[a.event]||(a.event||'').toUpperCase())}</span> ${esc(a.symbol||'')} ${a.action?`<span class="${a.action==='buy'?'L':'S'}">${esc(a.action.toUpperCase())}</span>`:''} ${a.lot?esc(a.lot)+' lot':''}${lv?` <span style="color:var(--dim)">${lv}</span>`:''}${a.note?`<br><span style="color:${bad?'var(--down)':'var(--dim)'}">${esc(a.note)}</span>`:''}</span><span class="${bad?'S':ok?'L':'w'}">${esc(st)}</span></div>`}).join(''):'<div class="empty">no activity on my account yet</div>';
-  const re=$('#rows');if(re._h!==html){const atEnd=re.scrollTop+re.clientHeight>=re.scrollHeight-30;re.innerHTML=html;re._h=html;if(atEnd)re.scrollTop=re.scrollHeight}
+  $('#rows').hidden=true;
+  $('#feedT').hidden=true;
   // agent feed: only what the agents are thinking about the market (no Desk-account lots or profits)
-  setText($('#feedT'),'AGENT FEED · market');
-  const fe=$('#feed');const fh=feed.filter(e=>(e.agent==='scout'||e.agent==='check')&&!/\$|lot/i.test(e.message||'')&&!/BTC/.test(e.symbol||e.message||'')).slice(-30).map(e=>{const tm=e.at?new Date(e.at):null;return `<div class="e"><span>${tm?String(tm.getUTCHours()).padStart(2,'0')+':'+String(tm.getUTCMinutes()).padStart(2,'0'):''}</span><span style="color:${AGC[e.agent]||'#67e8f9'}">${esc(e.agent.toUpperCase())}</span><span>${esc(short(e.message))}</span></div>`}).join('')||'<div class="e"><span></span><span></span><span>no market notes yet</span></div>';
+  const fe=$('#feed');const fh=feed.filter(e=>!/\$|\blots?\b|balance|equity|paper|shadow/i.test(e.message||'')&&!/BTC/i.test((e.symbol||'')+' '+(e.message||''))).slice(-40).map(e=>{const tm=e.at?new Date(e.at):null;return `<div class="e"><span>${tm?String(tm.getUTCHours()).padStart(2,'0')+':'+String(tm.getUTCMinutes()).padStart(2,'0'):''}</span><span style="color:${AGC[e.agent]||'#67e8f9'}">${esc(e.agent.toUpperCase())}</span><span>${esc(short(e.message))}</span></div>`}).join('')||'<div class="e"><span></span><span></span><span>no market notes yet</span></div>';
   if(fe._h!==fh){const atEnd=fe.scrollTop+fe.clientHeight>=fe.scrollHeight-30;fe.innerHTML=fh;fe._h=fh;if(atEnd)fe.scrollTop=fe.scrollHeight}
   setText($('#disc'),'Your own MT5 account · real prices · Not financial advice');
 }
