@@ -191,15 +191,14 @@ def desk_copy_followers(x_worker_token: str = Header(None), db: Session = Depend
 
 
 # =====================================================================================
-# USER SWITCH (step 11) -- /api/client/desk/*, authenticated by the user's licence key like every
-# other /api/client route (the app's proxy only relays /api/client/...). A user switches the Desk on
-# for THEIR OWN account; their own gold lot and risk mode decide the size.
-# Gate while testing: DESK_PUBLIC_ENABLED=true opens it to everyone; otherwise only the licence ids or
-# keys listed in DESK_BETA_LICENSES (comma separated) can switch it on.
+# USER SIDE (steps 11-12) -- /api/client/desk/*, authenticated by the user's licence key like every
+# other /api/client route (the app's proxy only relays /api/client/...).
+# The Desk IS the AI Auto Trader (step 12): it trades a NOLIMITZ PRO account whenever that account's
+# AI Auto Trader is ON. start/stop flip that same switch (ClientMT5Account.ai_auto_trade).
+# Gate while testing: DESK_PUBLIC_ENABLED=true opens it to every Pro licence; otherwise only the licence
+# ids or keys in DESK_BETA_LICENSES (comma separated). Rules live in app/desk/access.py.
 # =====================================================================================
-DESK_PUBLIC = os.getenv("DESK_PUBLIC_ENABLED", "false").strip().lower() == "true"
-DESK_BETA = {x.strip() for x in os.getenv("DESK_BETA_LICENSES", "").split(",") if x.strip()}
-TRADES_PER_MODE = {"normal": 1, "medium": 3, "aggressive": 5}
+from app.desk.access import TRADES_PER_MODE, desk_public, is_pro, licence_live, open_to  # noqa: E402
 
 
 class DeskLicence(BaseModel):
@@ -215,18 +214,32 @@ def _desk_licence(db: Session, license_key: str):
 
 
 def _desk_open_to(lic) -> bool:
-    return DESK_PUBLIC or str(lic.id) in DESK_BETA or lic.license_key in DESK_BETA
+    return open_to(lic)
+
+
+def _account(db: Session, lic):
+    from app.models import ClientMT5Account
+    return (db.query(ClientMT5Account).filter(ClientMT5Account.license_id == lic.id,
+                                              ClientMT5Account.is_active == True)  # noqa: E712
+            .order_by(ClientMT5Account.id.desc()).first())
+
+
+def _desk_payload(db: Session):
+    st = db.query(DeskState).filter(DeskState.worker == "desk-1").first()
+    if st is None:
+        return {}, None
+    age = None
+    if st.updated_at:
+        ua = st.updated_at if st.updated_at.tzinfo else st.updated_at.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - ua).total_seconds()
+    return (st.payload or {}), age
 
 
 def _desk_status(db: Session, lic) -> dict:
-    from app.models import ClientMT5Account, ClientSymbolSetting, TradeExecution
+    from app.models import TradeExecution
     from app.routers.copier import find_symbol_setting
-    now = datetime.now(timezone.utc)
-    exp = lic.expires_at if (lic.expires_at is None or lic.expires_at.tzinfo) else lic.expires_at.replace(tzinfo=timezone.utc)
-    acct = (db.query(ClientMT5Account).filter(ClientMT5Account.license_id == lic.id, ClientMT5Account.is_active == True)  # noqa: E712
-            .order_by(ClientMT5Account.id.desc()).first())
+    acct = _account(db, lic)
     gold = find_symbol_setting(db, lic.id, "XAUUSD")
-    fol = db.query(DeskFollower).filter(DeskFollower.license_id == lic.id).first()
     mode = ((acct.risk_level if acct else None) or "medium").lower()
     per_signal = TRADES_PER_MODE.get(mode, 3)
     lot = None
@@ -234,17 +247,19 @@ def _desk_status(db: Session, lic) -> dict:
         lot = float(gold.lot_size) if gold else None
     except (TypeError, ValueError):
         lot = None
+    pro = is_pro(lic)
     checks = [
-        {"ok": bool(lic.is_active and (exp is None or exp > now)), "text": "Licence active"},
+        {"ok": pro, "text": "NOLIMITZ PRO licence"},
+        {"ok": licence_live(lic), "text": "Licence active"},
         {"ok": bool(acct and acct.is_verified), "text": "MT5 account connected and verified"},
-        {"ok": bool(acct and acct.ai_auto_trade), "text": "Robot switched ON"},
         {"ok": bool(lot and lot > 0), "text": "Gold (XAUUSD) enabled with a lot size"},
+        {"ok": bool(acct and acct.ai_auto_trade), "text": "AI Auto Trader switched ON"},
     ]
     # rough risk preview: gold stop = 1.5 x the Desk's current H1 ATR; 0.01 lot ~ $1 per $1 move
     est = None
-    st = db.query(DeskState).filter(DeskState.worker == "desk-1").first()
+    payload, _ = _desk_payload(db)
     try:
-        atr = float(((st.payload or {}).get("symbols") or {}).get("XAUUSD", {}).get("atr") or 0) if st else 0
+        atr = float((payload.get("symbols") or {}).get("XAUUSD", {}).get("atr") or 0)
     except (TypeError, ValueError, AttributeError):
         atr = 0
     if atr and lot:
@@ -257,10 +272,16 @@ def _desk_status(db: Session, lic) -> dict:
     rows = (db.query(TradeExecution).filter(TradeExecution.license_id == lic.id,
                                             TradeExecution.master_ticket.like("DESK-%"))
             .order_by(TradeExecution.id.desc()).limit(30).all())
+    available = open_to(lic)
+    ready = all(c["ok"] for c in checks[:4])
     return {
-        "available": _desk_open_to(lic),
-        "following": bool(fol and fol.enabled),
-        "ready": all(c["ok"] for c in checks),
+        "pro": pro,
+        "available": available,
+        "public": desk_public(),
+        # following = the Desk will put its next trade on this account
+        "following": bool(available and ready and acct and acct.ai_auto_trade),
+        "ready": ready,                      # everything except the on/off switch itself
+        "robot_on": bool(acct and acct.ai_auto_trade),
         "checks": checks,
         "account": None if acct is None else {
             "login": (str(acct.login)[:2] + "***" + str(acct.login)[-3:]) if acct.login else None,
@@ -277,47 +298,180 @@ def _desk_status(db: Session, lic) -> dict:
 
 @router.get("/api/client/desk/status")
 def client_desk_status(license_key: str = Query(..., max_length=128), db: Session = Depends(get_db)):
-    """Everything the Desk tab needs to show the Start switch for THIS user."""
+    """Everything the Desk tab needs to show the AI Auto Trader switch for THIS user."""
     return _desk_status(db, _desk_licence(db, license_key))
 
 
 @router.post("/api/client/desk/start")
 def client_desk_start(data: DeskLicence, db: Session = Depends(get_db)):
+    """Turn the AI Auto Trader ON (the Desk trades this account from its next signal)."""
     lic = _desk_licence(db, data.license_key)
-    if not _desk_open_to(lic):
+    if not is_pro(lic):
+        raise HTTPException(status_code=403, detail="The Desk is for NOLIMITZ PRO licences")
+    if not open_to(lic):
         raise HTTPException(status_code=403, detail="The Desk is not open for new accounts yet")
     st = _desk_status(db, lic)
-    missing = [c["text"] for c in st["checks"] if not c["ok"]]
+    missing = [c["text"] for c in st["checks"][:4] if not c["ok"]]
     if missing:
         raise HTTPException(status_code=409, detail="Before starting the Desk: " + "; ".join(missing))
     if st["estimate"] and st["estimate"]["blocked"]:
         raise HTTPException(status_code=409, detail=(
             f"Your gold lot x {st['trades_per_signal']} trades would risk about ${st['estimate']['risk_usd']:.2f} "
             "per Desk trade, more than your balance. Lower the gold lot or set risk mode to Normal."))
-    from app.models import ClientMT5Account
-    acct = (db.query(ClientMT5Account).filter(ClientMT5Account.license_id == lic.id, ClientMT5Account.is_active == True)  # noqa: E712
-            .order_by(ClientMT5Account.id.desc()).first())
-    row = db.query(DeskFollower).filter(DeskFollower.license_id == lic.id).first()
-    if row is None:
-        row = DeskFollower(license_id=lic.id, mt5_login=str(acct.login) if acct else None, enabled=True)
-        db.add(row)
-    else:
-        row.enabled = True
-        row.mt5_login = str(acct.login) if acct else row.mt5_login
+    acct = _account(db, lic)
+    acct.ai_auto_trade = True
     db.commit()
     out = _desk_status(db, lic)
-    out["message"] = "Desk started: its next trade will open on your account with your own lot and risk mode."
+    out["message"] = "AI Auto Trader ON: the Desk's next gold trade opens on your account with your own lot and risk mode."
     return out
 
 
 @router.post("/api/client/desk/stop")
 def client_desk_stop(data: DeskLicence, db: Session = Depends(get_db)):
-    """Stops NEW Desk trades on this account. Trades already open keep being managed until they close."""
+    """AI Auto Trader OFF: no NEW trades. Trades already open keep being managed until they close."""
     lic = _desk_licence(db, data.license_key)
-    row = db.query(DeskFollower).filter(DeskFollower.license_id == lic.id).first()
-    if row is not None:
-        row.enabled = False
+    acct = _account(db, lic)
+    if acct is not None:
+        acct.ai_auto_trade = False
         db.commit()
     out = _desk_status(db, lic)
-    out["message"] = "Desk stopped: no new Desk trades. Open Desk trades are still managed until they close."
+    out["message"] = "AI Auto Trader OFF: no new trades. Open Desk trades are still managed until they close."
     return out
+
+
+def _seg(text, tag="XAU"):
+    """The gold part of a worker card ('XAU: ... | BTC: ...' -> 'XAU: ...')."""
+    if not text:
+        return None
+    for part in str(text).split(" | "):
+        if part.strip().upper().startswith(tag):
+            return part.strip()
+    return None
+
+
+def _money(x):
+    try:
+        return f"${float(x):,.2f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+@router.get("/api/client/desk/view")
+def client_desk_view(license_key: str = Query(..., max_length=128), db: Session = Depends(get_db)):
+    """The Desk as THIS user sees it: their own balance, their own Desk trades, and each agent's card
+    written for their account. Nothing from the Desk's own demo account (balance, profit, lots) is returned."""
+    from app.models import TradeTicketMap
+    lic = _desk_licence(db, license_key)
+    st = _desk_status(db, lic)
+    payload, age = _desk_payload(db)
+    online = age is not None and age < STALE_AFTER_SEC
+    agents_src = payload.get("agents") or {}
+    xau = (payload.get("symbols") or {}).get("XAUUSD") or {}
+    mkt_open = bool(xau.get("open"))
+    acc = st["account"] or {}
+    bal = float(acc.get("balance") or 0)
+    eq = float(acc.get("equity") or 0)
+    lot, n = st["gold_lot"], st["trades_per_signal"]
+
+    # this user's open Desk copies
+    mine = (db.query(TradeTicketMap).filter(TradeTicketMap.license_id == lic.id,
+                                            TradeTicketMap.master_ticket.like("DESK-%"),
+                                            TradeTicketMap.is_closed == False)  # noqa: E712
+            .order_by(TradeTicketMap.id.desc()).all())
+    desk_pos = {f"DESK-{p.get('ticket')}": p for p in (payload.get("positions") or []) if not p.get("paper")}
+    rows = {f"DESK-{t.ticket}": t for t in db.query(DeskTrade).filter(DeskTrade.is_open.is_(True)).all()}
+    open_list, mgmt = [], []
+    for m in mine:
+        p, row = desk_pos.get(m.master_ticket), rows.get(m.master_ticket)
+        side = None
+        if p is not None:
+            side = "buy" if p.get("direction", 0) > 0 else "sell"
+        elif row is not None:
+            side = "buy" if row.direction > 0 else "sell"
+        state = None
+        if row is not None and p is not None and p.get("sl") is not None:
+            locked = (p["sl"] - row.entry_price) * row.direction >= -1e-9
+            if locked and abs(p["sl"] - row.entry_price) < 0.01:
+                state = "stop at breakeven"
+            elif locked:
+                state = "trailing stop, profit locked"
+            else:
+                state = "original stop · breakeven at +1R"
+        open_list.append({"symbol": m.symbol, "client_ticket": m.client_ticket, "master_ticket": m.master_ticket,
+                          "side": side, "management": state,
+                          "opened_at": m.created_at.isoformat() if m.created_at else None})
+        if state:
+            mgmt.append(state)
+
+    off_reason = next((c["text"] for c in st["checks"] if not c["ok"]), None)
+    if not st["available"] and st["pro"]:
+        off_reason = "Desk not open to your account yet"
+
+    def scout():
+        if not online:
+            return "Desk offline · reconnecting"
+        if not mkt_open:
+            return "gold market closed · resumes at the open"
+        return (xau.get("scout") or _seg(agents_src.get("scout")) or "reading gold").replace("XAU: ", "")
+
+    def check():
+        parts = []
+        c = _seg(agents_src.get("check"))
+        parts.append((c or ("gold market closed" if not mkt_open else "checking gold")).replace("XAU ", "gold "))
+        parts.append("your MT5 " + ("connected" if acc.get("verified") else "NOT connected"))
+        return " · ".join(parts)
+
+    def size():
+        if not lot:
+            return "set a gold (XAUUSD) lot size to trade"
+        txt = f"your next gold: {lot:.2f} lot × {n} trade{'s' if n != 1 else ''}"
+        e = st["estimate"]
+        if e:
+            txt += f" · risk ≈ {_money(e['risk_usd'])}"
+            if e.get("risk_pct") is not None:
+                txt += f" ({e['risk_pct']}% of {_money(bal)})"
+            if e.get("high_risk"):
+                txt += " · HIGH"
+        return txt
+
+    def entry():
+        if not st["following"]:
+            return "not trading your account · " + (off_reason or "AI Auto Trader is OFF")
+        if open_list:
+            return f"in a gold trade · {len(open_list)} on your account"
+        if not mkt_open:
+            return "gold market closed"
+        return "armed · waits for Scout's next gold setup"
+
+    def exit_():
+        if not open_list:
+            return "flat · no Desk trades on your account"
+        sides = {o["side"] for o in open_list if o["side"]}
+        txt = f"managing {len(open_list)} Desk trade{'s' if len(open_list) != 1 else ''}"
+        if sides:
+            txt += " (" + "/".join(sorted(sides)) + ")"
+        if mgmt:
+            txt += " · " + mgmt[0]
+        return txt
+
+    def guard():
+        if not bal:
+            return "waiting for your account balance"
+        floating = eq - bal
+        return (f"your balance {_money(bal)} · equity {_money(eq)} ({floating:+,.2f}) · "
+                "blocks any trade that could cost more than your balance")
+
+    return {
+        "online": online, "market_open": mkt_open, "updated": payload.get("updated"),
+        "following": st["following"], "robot_on": st["robot_on"], "available": st["available"],
+        "pro": st["pro"], "ready": st["ready"], "checks": st["checks"], "off_reason": None if st["following"] else off_reason,
+        "account": {"balance": acc.get("balance"), "equity": acc.get("equity"),
+                    "floating": round(eq - bal, 2) if bal else None, "login": acc.get("login"),
+                    "server": acc.get("server"), "broker": acc.get("broker")},
+        "risk_mode": st["risk_mode"], "trades_per_signal": n, "gold_lot": lot, "estimate": st["estimate"],
+        "agents": {"scout": scout(), "check": check(), "size": size(), "entry": entry(), "exit": exit_(),
+                   "guard": guard()},
+        "gold": {"bias": xau.get("bias"), "bid": xau.get("bid"), "ask": xau.get("ask")},
+        "open_trades": open_list,
+        "activity": st["activity"],
+    }

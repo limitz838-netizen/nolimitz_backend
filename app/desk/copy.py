@@ -15,7 +15,7 @@ The Desk decides WHEN to trade and WHERE the stop and target go. Each user decid
                  on the wrong side on another broker.
   breakeven / trailing = an OFFSET from the user's own entry ("off:0" = breakeven), only ever tightening.
 
-Opt-in: only licences with an enabled DeskFollower row receive NEW Desk trades. Close and modify go
+Who: every NOLIMITZ PRO account with the AI Auto Trader ON receives NEW Desk trades (app/desk/access.py). Close and modify go
 to every licence that still holds a copy, so switching the Desk off never strands an open trade.
 The copier executor's Desk Guard (VPS) reads each user's real equity before every entry: it blocks a
 trade whose stop would cost more than the whole account and labels anything above 10% as high risk.
@@ -30,7 +30,7 @@ from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.desk.models import DeskFollower
+from app.desk.access import licence_live, open_to
 from app.models import (ClientMT5Account, CopierTradeEvent, ExpertAdvisor, License, TradeExecution,
                         TradeTicketMap)
 
@@ -91,20 +91,23 @@ def fan_out(db: Session, event: str, desk_ticket: str, symbol: str, action: Opti
     if event == "open":
         if action not in ("buy", "sell") or not sl_distance or sl_distance <= 0:
             return {"queued": 0, "error": "open needs action buy/sell and a positive sl_distance"}
-        followers = db.query(DeskFollower).filter(DeskFollower.enabled == True).all()  # noqa: E712
-        for f in followers:
-            lic = db.query(License).filter(License.id == f.license_id).first()
-            if lic is None or not lic.is_active or (_aware(lic.expires_at) and _aware(lic.expires_at) < now):
-                skipped.append((f.license_id, "licence inactive or expired"))
+        # The Desk IS the AI Auto Trader: every Pro account with the AI Auto Trader ON receives it
+        # (see app/desk/access.py). One account per licence, newest row wins.
+        accts = (db.query(ClientMT5Account).filter(ClientMT5Account.is_active == True,       # noqa: E712
+                                                   ClientMT5Account.is_verified == True,     # noqa: E712
+                                                   ClientMT5Account.ai_auto_trade == True)   # noqa: E712
+                 .order_by(ClientMT5Account.id.desc()).all())
+        seen = set()
+        for acct in accts:
+            if not acct.license_id or acct.license_id in seen:
                 continue
-            acct = db.query(ClientMT5Account).filter(ClientMT5Account.license_id == lic.id,
-                                                     ClientMT5Account.is_active == True,       # noqa: E712
-                                                     ClientMT5Account.is_verified == True).first()  # noqa: E712
-            if acct is None:
-                skipped.append((lic.id, "no active verified MT5 account"))
+            seen.add(acct.license_id)
+            lic = db.query(License).filter(License.id == acct.license_id).first()
+            if lic is None or not licence_live(lic, now):
+                skipped.append((acct.license_id, "licence inactive or expired"))
                 continue
-            if getattr(acct, "ai_auto_trade", True) is False:
-                skipped.append((lic.id, "robot switched off by the user"))
+            if not open_to(lic):
+                skipped.append((lic.id, "not a NOLIMITZ PRO licence or Desk not open to it yet"))
                 continue
             setting = _symbol_setting(db, lic.id, symbol)
             if setting is None or not setting.lot_size:
