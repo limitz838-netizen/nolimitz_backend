@@ -47,9 +47,11 @@ def is_pro(lic) -> bool:
     return snap.get("product") != "telegram_copier"
 
 
-def open_to(lic) -> bool:
-    """Pro, and the Desk is open to them (everyone once public, the beta list until then)."""
+def open_to(lic, mt5_login=None) -> bool:
+    """Pro, and the Desk is open to them (everyone once public, the beta list until then).
+    DESK_BETA_LICENSES may hold licence ids, licence keys or MT5 logins."""
     if not is_pro(lic):
         return False
     beta = _env_set("DESK_BETA_LICENSES")
-    return desk_public() or str(lic.id) in beta or lic.license_key in beta
+    return (desk_public() or str(lic.id) in beta or lic.license_key in beta
+            or (mt5_login is not None and str(mt5_login).strip() in beta))

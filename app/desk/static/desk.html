@@ -174,7 +174,7 @@ html.booting .app{opacity:0}
         <div class="list" id="posList"><div class="empty">no open positions &middot; all cash</div></div>
         <div class="foot" id="posFoot">&nbsp;</div>
       </div>
-      <div class="panel balp">
+      <div class="panel balp" id="balp">
         <div class="phead">DESK DEMO BALANCE (USD)</div>
         <canvas id="balc"></canvas>
       </div>
@@ -184,7 +184,7 @@ html.booting .app{opacity:0}
   <section class="panel log">
     <div class="lh"><span class="t" id="logT">TRADE LOG</span><span class="d" id="logD">&nbsp;</span></div>
     <div class="rows" id="rows"></div>
-    <div class="phead" style="padding-top:2px">AGENT FEED</div>
+    <div class="phead" style="padding-top:2px" id="feedT">AGENT FEED</div>
     <div class="feed" id="feed"></div>
   </section>
   <div class="disc" id="disc">Not financial advice</div>
@@ -215,7 +215,7 @@ const queue=[];             // new events waiting to be animated
 const feed=[];              // recent events for the feed list
 const say={}, activeUntil={};
 const live={};  // each agent's live status from the worker
-function cardTxt(id,now){ return (((activeUntil[id]||0)>now) ? say[id] : (live[id]||say[id])) || 'waiting'; }
+function cardTxt(id,now){ if(LKEY&&VIEW&&VIEW.agents&&VIEW.agents[id]) return VIEW.agents[id]; return (((activeUntil[id]||0)>now) ? say[id] : (live[id]||say[id])) || 'waiting'; }
 let prevAgent=null;
 const fx=[], parts=[];
 const EMBED=window.parent!==window;
@@ -223,13 +223,27 @@ if(EMBED) document.documentElement.classList.add('embed');
 // The dashboard sends the signed-in user's own MT5 numbers. Only accept them from our own sites.
 const PARENT_OK=/^(https:\/\/((www\.)?nolimitzbots\.co\.ke|[a-z0-9-]+\.lovable\.(app|dev)|[a-z0-9-]+\.lovableproject\.com|localhost)|capacitor:\/\/localhost)$/;
 let USER=null;
+// USER MODE (step 13): when the dashboard passes the signed-in user's licence key, the whole page is about
+// THEIR account: their balance, their Desk trades, and agent cards written for them by
+// /api/client/desk/view. Nothing from the Desk's own demo account (balance, lots, profits) is shown.
+let LKEY=new URLSearchParams(location.search).get('license_key')||'', VIEW=null, LIVEPOS={};
 window.addEventListener('message',ev=>{
   if(!PARENT_OK.test(ev.origin)) return;
   const d=ev.data; if(!d||d.type!=='nolimitz-desk-account') return;
+  if(d.license_key && d.license_key!==LKEY){LKEY=String(d.license_key);pollView()}
+  if(Array.isArray(d.positions)){LIVEPOS={};d.positions.forEach(p=>{if(p&&p.ticket!=null)LIVEPOS[String(p.ticket)]=p})}
   USER={balance:+d.balance, equity:d.equity==null?null:+d.equity, pnl:d.pnl_today==null?null:+d.pnl_today,
         currency:d.currency||'USD', login:d.login||'', server:d.server||'', connected:!!d.connected, copying:!!d.desk_copying};
   if(!isFinite(USER.balance)||!USER.connected) USER=null;
 });
+const UM=()=>!!(LKEY&&VIEW);
+let viewTimer=null;
+async function pollView(){
+  clearTimeout(viewTimer);
+  if(LKEY){try{const r=await fetch('/api/client/desk/view?license_key='+encodeURIComponent(LKEY),{cache:'no-store'});
+    if(r.ok){VIEW=await r.json();for(const a of AG){const v=VIEW.agents&&VIEW.agents[a.id];if(v)live[a.id]=v}}}catch(e){}}
+  viewTimer=setTimeout(pollView,5000);
+}
 if(EMBED){try{window.parent.postMessage({type:'nolimitz-desk-ready'},'*')}catch(e){}}
 
 const fmt=(v,d=2)=>v==null||isNaN(v)?'--':Number(v).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
@@ -269,7 +283,7 @@ async function poll(){
     // keep previous events/trades view when polling incrementally
     j.events=evs;
     R=j;
-    if(j.state&&j.state.agents) for(const a of AG){ const v=j.state.agents[a.id]; if(v) live[a.id]=short(v); }
+    if(j.state&&j.state.agents&&!UM()) for(const a of AG){ const v=j.state.agents[a.id]; if(v) live[a.id]=short(v); }
   }catch(e){ failures++; }
   setTimeout(poll,POLL_MS);
 }
@@ -284,8 +298,9 @@ function play(){
     const chain=['scout','check','size','entry'];
     if(prevAgent && prevAgent!==e.agent && LAY[prevAgent] && LAY[e.agent]) parts.push({a:prevAgent,b:e.agent,c:AGC[e.agent]||'#67e8f9',t0:now/1000});
     prevAgent=e.agent;
-    if(e.agent==='exit' && e.data && typeof e.data.profit==='number'){ if(!e.data.paper) popup(e.data.profit); const p=P(LAY.exit.bot[0],LAY.exit.bot[1],0); fx.push({x:p[0]+40,y:p[1]-80,txt:(e.data.paper?'PAPER ':'')+sgn$(e.data.profit),col:e.data.profit>=0?'#34d399':'#f87171',t0:now/1000}); }
-    if(e.agent==='entry' && e.data && e.data.price){ const p=P(LAY.entry.bot[0],LAY.entry.bot[1],0); fx.push({x:p[0]+40,y:p[1]-80,txt:(e.data.paper?'PAPER ':e.data.shadow?'SHADOW ':'')+(e.data.lot||'')+' lots',col:e.data.shadow?'#fbbf24':'#4ade80',t0:now/1000}); }
+    if(!UM() && e.agent==='exit' && e.data && typeof e.data.profit==='number'){ if(!e.data.paper) popup(e.data.profit); const p=P(LAY.exit.bot[0],LAY.exit.bot[1],0); fx.push({x:p[0]+40,y:p[1]-80,txt:(e.data.paper?'PAPER ':'')+sgn$(e.data.profit),col:e.data.profit>=0?'#34d399':'#f87171',t0:now/1000}); }
+    if(UM() && e.agent==='entry' && e.data && e.data.price && !e.data.paper && !e.data.shadow){ const p=P(LAY.entry.bot[0],LAY.entry.bot[1],0); fx.push({x:p[0]+40,y:p[1]-80,txt:VIEW.following?('YOUR '+(VIEW.gold_lot||'')+' lot \u00d7'+(VIEW.trades_per_signal||1)):'not on your account',col:'#4ade80',t0:now/1000}); }
+    else if(!UM() && e.agent==='entry' && e.data && e.data.price){ const p=P(LAY.entry.bot[0],LAY.entry.bot[1],0); fx.push({x:p[0]+40,y:p[1]-80,txt:(e.data.paper?'PAPER ':e.data.shadow?'SHADOW ':'')+(e.data.lot||'')+' lots',col:e.data.shadow?'#fbbf24':'#4ade80',t0:now/1000}); }
   }
   setTimeout(play, queue.length>6?250:PLAY_MS);
 }
@@ -400,7 +415,7 @@ function drawOffice(t){
   for(let r=0;r<8;r++){const p=P(1.2,0.55,12+r*8.5);c.fillStyle=online&&(Math.sin(t*4+r*1.7)>0.2)?'#34d399':'#1d4d3a';c.fillRect(p[0]+2,p[1]-2,2,2);c.fillStyle=online&&(Math.sin(t*3+r)>0.6)?'#5ad1e6':'#163a44';c.fillRect(p[0]+7,p[1]+1,2,2)}
   { const p=P(0.75,0.75,82);c.strokeStyle='#8aa0b8';c.lineWidth=1.2;c.beginPath();c.moveTo(p[0],p[1]);c.lineTo(p[0],p[1]-10);c.stroke();c.beginPath();c.ellipse(p[0]+3,p[1]-13,7,3.5,-0.5,0,7);c.stroke();
     if(online){c.strokeStyle='rgba(90,209,230,'+(0.3+0.3*Math.sin(t*3))+')';c.beginPath();c.arc(p[0]+6,p[1]-18,5,-2.2,-0.9);c.stroke();c.beginPath();c.arc(p[0]+6,p[1]-18,9,-2.2,-0.9);c.stroke()} }
-  const now=performance.now(), asleep=!online;
+  const now=performance.now(), asleep=!online||(UM()&&!VIEW.following);
   const items=[];
   for(const a of AG){const L=LAY[a.id];
     items.push({d:L.desk[0]+L.desk[1]+1.2,f:()=>{const[x,y]=L.desk;box(c,x,y,1.7,0.9,17,'#1b2534','#121a27','#16202e','rgba(90,209,230,.12)');
@@ -418,7 +433,7 @@ function drawOffice(t){
     c.globalAlpha=1}
   for(const a of AG){const L=LAY[a.id],h=a._head;label(c,h[0],h[1],h[0]+L.lab[0],h[1]+L.lab[1],a.n,cardTxt(a.id,now),a.c,(activeUntil[a.id]||0)>now)}
   const ch=chief._head, ss=symState();
-  const chiefTxt=!R?'connecting\u2026':!R.online?'Desk offline':(ss&&!ss.open)?'market closed \u00b7 resting':(ss&&ss.shadow)?'paper-trading '+sym():'watching '+sym();
+  const chiefTxt=UM()&&!VIEW.following?'not trading your account':UM()&&R&&R.online&&!(ss&&!ss.open)?'working on YOUR account':!R?'connecting\u2026':!R.online?'Desk offline':(ss&&!ss.open)?'market closed \u00b7 resting':(ss&&ss.shadow)?'paper-trading '+sym():'watching '+sym();
   label(c,ch[0],ch[1]+60,92,338,'CHIEF',chiefTxt,'#67e8f9',false);
   for(let i=fx.length-1;i>=0;i--){const f=fx[i],age=t-f.t0;if(age>2){fx.splice(i,1);continue}
     const y=f.y-age*22;c.globalAlpha=Math.min(1,(2-age)*1.5);c.font='700 13px "JetBrains Mono", monospace';const w=c.measureText(f.txt).width+14;
@@ -455,10 +470,10 @@ function drawCandles(){
     const oi=idxOf(Date.parse(t.opened_at)/1000);
     if(oi>=0&&oi<bars.length){const x=X(oi),col=t.direction>0?'#34d399':'#f87171';c.fillStyle=col;c.beginPath();const yy=Y(t.entry);
       if(t.direction>0){c.moveTo(x,yy+4);c.lineTo(x-4,yy+11);c.lineTo(x+4,yy+11)}else{c.moveTo(x,yy-4);c.lineTo(x-4,yy-11);c.lineTo(x+4,yy-11)}
-      c.closePath();c.fill();txt(`${t.direction>0?'LONG':'SHORT'} ${t.lot} ${fmt(t.entry,dg)}`,x,t.direction>0?yy+22:yy-15,col)}
+      c.closePath();c.fill();txt(`${t.direction>0?'LONG':'SHORT'}${UM()?'':' '+t.lot} ${fmt(t.entry,dg)}`,x,t.direction>0?yy+22:yy-15,col)}
     if(!t.is_open&&t.closed_at&&t.exit){const xi=idxOf(Date.parse(t.closed_at)/1000);
       if(xi>=0&&xi<bars.length){const x=X(xi),yy=Y(t.exit);c.fillStyle='#fff';c.beginPath();c.arc(x,yy,3,0,7);c.fill();
-        const p=t.profit||0;txt(`exit ${fmt(t.exit,dg)} ${p>=0?'+':'-'}${fmt(Math.abs(p),0)}$`,x,t.direction>0?yy-8:yy+14,p>=0?'#34d399':'#f87171')}}
+        const p=t.profit||0;txt(UM()?`exit ${fmt(t.exit,dg)}`:`exit ${fmt(t.exit,dg)} ${p>=0?'+':'-'}${fmt(Math.abs(p),0)}$`,x,t.direction>0?yy-8:yy+14,p>=0?'#34d399':'#f87171')}}
     if(t.is_open&&t.stop){c.setLineDash([2,4]);c.strokeStyle='rgba(248,113,113,.5)';const ys=Y(t.stop);c.beginPath();c.moveTo(0,ys);c.lineTo(w-RW,ys);c.stroke();
       if(t.target){c.strokeStyle='rgba(52,211,153,.5)';const yt=Y(t.target);if(yt>top&&yt<bot){c.beginPath();c.moveTo(0,yt);c.lineTo(w-RW,yt);c.stroke()}}c.setLineDash([])}
   }
@@ -511,9 +526,11 @@ function render(t){
   const shadow=st&&st.mode&&st.mode.shadow;
   badge.className='badge '+(!R.online?'off':shadow?'shadow':'live');
   setText(badge,!R.online?'OFFLINE':shadow?'SHADOW':'LIVE');
-  $('#btcTag').classList.toggle('off',!(st&&st.mode&&(st.mode.symbols||[]).includes('BTCUSD')));
+  $('#btcTag').classList.toggle('off',UM()||!(st&&st.mode&&(st.mode.symbols||[]).includes('BTCUSD')));
+  if(UM()){badge.className='badge '+(!R.online?'off':VIEW.following?'live':'shadow');setText(badge,!R.online?'OFFLINE':VIEW.following?'ON MY ACCOUNT':'OFF');}
   if(!st) return;
 
+  if(UM()){ renderUser(dn,ss); return; }
   const acc=st.account, day=st.day||{}, eq=acc.equity, start=day.start_balance||acc.balance;
   const pct=(eq/start-1)*100;
   const note=$('#note');
@@ -578,6 +595,66 @@ function render(t){
   setText($('#disc'),`${acc.demo?'Exness demo account':'Live account'} \u00b7 real prices${shadow?' \u00b7 shadow mode: no orders are sent':' and fills'} \u00b7 Not financial advice`);
 }
 
+
+/* ---------------------------------------------------------------- USER MODE render */
+function renderUser(dn,ss){
+  const V=VIEW, A=V.account||{}, dg=digits();
+  const bal=USER?USER.balance:+A.balance, eq=USER&&USER.equity!=null?USER.equity:+A.equity;
+  const fl=(eq!=null&&bal!=null)?eq-bal:null;
+  setText($('#balLbl'),'MY BALANCE · '+dn);
+  setText($('#bal'),'$ '+fmt(bal));
+  const pe=$('#pct');
+  if(USER&&USER.pnl!=null){const base=USER.balance-USER.pnl,u=base>0?USER.pnl/base*100:null;setText(pe,`${USER.pnl>=0?'+':'-'}$${fmt(Math.abs(USER.pnl))} today${u!=null?` (${u>=0?'+':''}${fmt(u)}%)`:''}`);pe.classList.toggle('neg',USER.pnl<0)}
+  else{setText(pe,fl==null?' ':`equity $${fmt(eq)} · floating ${fl>=0?'+':'-'}$${fmt(Math.abs(fl))}`);pe.classList.toggle('neg',(fl||0)<0)}
+  setText($('#acct'),`MY MT5 · ${(USER&&USER.server)||A.broker||A.server||'--'}${(USER&&USER.login)||A.login?' · '+((USER&&USER.login)||A.login):''}`);
+  const note=$('#note');note.hidden=false;
+  setHTML(note,V.following?`The AI is trading <b>your account</b> · your lot ${esc(V.gold_lot)} × ${V.trades_per_signal} trade${V.trades_per_signal>1?'s':''} per signal (${esc(V.risk_mode)})`
+    :`The AI is <b>not trading your account</b> · ${esc(V.off_reason||'turn the AI Auto Trader ON')}`);
+  // EVERYTHING open on my MT5: AI (Desk), master copier and Telegram trades, with SL/TP
+  const SRC=V.position_sources||{}, SC={AI:'#4ade80',MASTER:'#60a5fa',TELEGRAM:'#a78bfa',MANUAL:'#9aa5b5'};
+  const lps=Object.values(LIVEPOS);
+  const ot=V.open_trades||[];
+  let list=lps.map(p=>{const src=(SRC[String(p.ticket)]||{}).source||'MANUAL';return {src,sym:p.symbol,side:(p.side||p.type||'').toLowerCase(),lot:p.lot,entry:p.entry,sl:p.sl,tp:p.tp,profit:p.profit==null?null:+p.profit,mg:null,ticket:String(p.ticket)}});
+  // AI trades the dashboard has not reported yet still show
+  ot.forEach(o=>{if(!list.some(x=>x.ticket===String(o.client_ticket)))list.push({src:'AI',sym:o.symbol,side:o.side,lot:null,entry:null,sl:null,tp:null,profit:null,ticket:String(o.client_ticket)})});
+  list.forEach(x=>{const o=ot.find(o=>String(o.client_ticket)===x.ticket);if(o&&o.management)x.mg=o.management});
+  let tot=0,known=0;list.forEach(x=>{if(x.profit!=null){tot+=x.profit;known++}});
+  setText($('#posTitle'),'MY MT5 POSITIONS');
+  setText($('#posEq'),fmt(eq)+' $');
+  const nAI=list.filter(x=>x.src==='AI').length;
+  setText($('#posMeta'),`${list.length} open · ${nAI} by the AI`);
+  const pc=$('#posChg');setText(pc,known?(tot>=0?'+':'-')+fmt(Math.abs(tot))+' $':' ');pc.style.color=tot>=0?'var(--up)':'var(--down)';
+  setText($('#posCash'),`balance ${fmt(bal)} $`);
+  const pp=$('#posPct');setText(pp,fl==null?' ':`floating ${fl>=0?'+':'-'}${fmt(Math.abs(fl))} $`);pp.style.color=(fl||0)>=0?'var(--up)':'var(--down)';
+  const nm=x=>esc(String(x||'').replace(/USD.*$/i,m=>m.length>3?'':''))||'--';
+  setHTML($('#posList'),list.length?list.map(x=>{const dg=/XAU|BTC|US30|NAS|SPX|GER/i.test(x.sym||'')?2:/JPY/i.test(x.sym||'')?3:5;const buy=/buy|long|^0$/.test(x.side);const sell=/sell|short|^1$/.test(x.side);
+    return `<div class="p" style="flex-wrap:wrap"><span><span style="color:${SC[x.src]};font-weight:700">${x.src}</span> <span class="x">${esc(x.sym||'')}</span> ${buy?'<span class="L">BUY</span>':sell?'<span class="S">SELL</span>':''}${x.lot?' '+esc(x.lot):''}${x.entry?' @ '+fmt(+x.entry,dg):''}</span><span class="${(x.profit||0)>=0?'L':'S'}">${x.profit==null?'open':(x.profit>=0?'+':'-')+fmt(Math.abs(x.profit))+'$'}</span>
+      <span style="flex-basis:100%;color:var(--dim);font-size:.92em">SL ${x.sl?fmt(+x.sl,dg):'--'} · TP ${x.tp?fmt(+x.tp,dg):'--'}${x.mg?' · '+esc(x.mg):''}</span></div>`}).join(''):'<div class="empty">no open trades on my account</div>');
+  setText($('#posFoot'),V.gold_lot?`AI gold lot ${V.gold_lot} · ${V.risk_mode} · ${V.trades_per_signal} trade${V.trades_per_signal>1?'s':''} per signal${V.estimate?` · risk ≈ $${fmt(V.estimate.risk_usd)} per signal`:''} · change these in Settings`:'set a gold (XAUUSD) lot size in Settings');
+  $('#balp').hidden=true;
+  // chart stays: it is the gold market itself
+  setText($('#chSym'),'XAU (Gold)');
+  const ce=$('#chPx');const lv=ss&&(ss.bid||(ss.candles&&ss.candles.length?ss.candles[ss.candles.length-1][4]:null));
+  setText(ce,lv?fmt(lv,dg):'--');ce.style.color=ss&&ss.open?'var(--up)':'var(--dim)';
+  setText($('#officeL'),`BOT OFFICE · ${dn} · ${V.following?'working on MY account':'idle · not on my account'}`);
+  setText($('#officeR'),'XAUUSD · real candles');
+  // my MT5 activity: master, AI and Telegram trades, SL/TP, stop moves, closes, failures, and why the AI skipped
+  setText($('#logT'),'MY MT5 ACTIVITY · '+dn);
+  const dl=$('#logD');setText(dl,V.following?'AI trading my account':'AI not trading my account');dl.style.color=V.following?'var(--up)':'var(--dim)';
+  const SC2={AI:'#4ade80',MASTER:'#60a5fa',TELEGRAM:'#a78bfa'};
+  const EV={open:'OPEN',close:'CLOSE',modify:'SL/TP MOVE',skipped:'NO TRADE'};
+  const act=(V.activity||[]).slice().reverse();
+  const html=act.length?act.map(a=>{const tm=a.at?new Date(a.at):null;const st=String(a.status||'');const ok=/done|success|filled|closed|executed|ok/i.test(st);const bad=/fail|error|reject|block|not placed|skip/i.test(st)||a.event==='skipped';
+    const lv=[a.sl?'SL '+esc(a.sl):'',a.tp?'TP '+esc(a.tp):''].filter(Boolean).join(' · ');
+    return `<div class="row" style="white-space:normal;align-items:start"><span>${tm?String(tm.getUTCDate()).padStart(2,'0')+' '+MON[tm.getUTCMonth()]+' '+String(tm.getUTCHours()).padStart(2,'0')+':'+String(tm.getUTCMinutes()).padStart(2,'0'):''}</span><span class="mid" style="white-space:normal"><span style="color:${SC2[a.source]||'#9aa5b5'};font-weight:700">${esc(a.source||'')}</span> <span class="x">${esc(EV[a.event]||(a.event||'').toUpperCase())}</span> ${esc(a.symbol||'')} ${a.action?`<span class="${a.action==='buy'?'L':'S'}">${esc(a.action.toUpperCase())}</span>`:''} ${a.lot?esc(a.lot)+' lot':''}${lv?` <span style="color:var(--dim)">${lv}</span>`:''}${a.note?`<br><span style="color:${bad?'var(--down)':'var(--dim)'}">${esc(a.note)}</span>`:''}</span><span class="${bad?'S':ok?'L':'w'}">${esc(st)}</span></div>`}).join(''):'<div class="empty">no activity on my account yet</div>';
+  const re=$('#rows');if(re._h!==html){const atEnd=re.scrollTop+re.clientHeight>=re.scrollHeight-30;re.innerHTML=html;re._h=html;if(atEnd)re.scrollTop=re.scrollHeight}
+  // agent feed: only what the agents are thinking about the market (no Desk-account lots or profits)
+  setText($('#feedT'),'AGENT FEED · market');
+  const fe=$('#feed');const fh=feed.filter(e=>(e.agent==='scout'||e.agent==='check')&&!/\$|lot/i.test(e.message||'')&&!/BTC/.test(e.symbol||e.message||'')).slice(-30).map(e=>{const tm=e.at?new Date(e.at):null;return `<div class="e"><span>${tm?String(tm.getUTCHours()).padStart(2,'0')+':'+String(tm.getUTCMinutes()).padStart(2,'0'):''}</span><span style="color:${AGC[e.agent]||'#67e8f9'}">${esc(e.agent.toUpperCase())}</span><span>${esc(short(e.message))}</span></div>`}).join('')||'<div class="e"><span></span><span></span><span>no market notes yet</span></div>';
+  if(fe._h!==fh){const atEnd=fe.scrollTop+fe.clientHeight>=fe.scrollHeight-30;fe.innerHTML=fh;fe._h=fh;if(atEnd)fe.scrollTop=fe.scrollHeight}
+  setText($('#disc'),'Your own MT5 account · real prices · Not financial advice');
+}
+
 function frame(ms){
   const t=ms/1000, now=performance.now();
   let act=null,best=0;for(const a of AG){const u=activeUntil[a.id]||0;if(u>now&&u>best){best=u;act=a}}
@@ -586,7 +663,7 @@ function frame(ms){
   const dx=chief.tx-chief.x,dy=chief.ty-chief.y,dd=Math.hypot(dx,dy),sp=Math.min(dd,0.045);if(dd>0.01){chief.x+=dx/dd*sp;chief.y+=dy/dd*sp}
   render(t);
   drawOffice(t);
-  if(R&&R.state){drawCandles();drawBal()}
+  if(R&&R.state){drawCandles();if(!UM())drawBal()}
   requestAnimationFrame(frame);
 }
 // When shown inside the NolimitzBots dashboard (iframe), tell the dashboard our height
@@ -604,7 +681,7 @@ if(EMBED){let lastH=0;
   setTimeout(()=>{setText($('#bootS'),'6 agents online')},180+lis.length*170);
   setTimeout(()=>{boot.classList.add('done');document.documentElement.classList.remove('booting');setTimeout(()=>boot.remove(),700)},180+lis.length*170+650);
 })();
-poll(); play(); requestAnimationFrame(frame);
+poll(); play(); pollView(); requestAnimationFrame(frame);
 })();
 </script>
 </body>

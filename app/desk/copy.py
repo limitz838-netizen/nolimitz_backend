@@ -36,7 +36,7 @@ from app.models import (ClientMT5Account, CopierTradeEvent, ExpertAdvisor, Licen
 
 log = logging.getLogger("desk.copy")
 TICKET_PREFIX = "DESK-"
-LABEL = "Nolimitz Desk"
+LABEL = "Nolimitz AI"   # comment on the user's MT5 position: Desk trades are the AI's trades
 
 
 def _aware(dt):
@@ -106,7 +106,7 @@ def fan_out(db: Session, event: str, desk_ticket: str, symbol: str, action: Opti
             if lic is None or not licence_live(lic, now):
                 skipped.append((acct.license_id, "licence inactive or expired"))
                 continue
-            if not open_to(lic):
+            if not open_to(lic, acct.login):
                 skipped.append((lic.id, "not a NOLIMITZ PRO licence or Desk not open to it yet"))
                 continue
             setting = _symbol_setting(db, lic.id, symbol)
@@ -141,6 +141,12 @@ def fan_out(db: Session, event: str, desk_ticket: str, symbol: str, action: Opti
     else:
         return {"queued": 0, "error": f"unknown event {event}"}
 
+    if event == "open" and skipped:
+        from app.desk.models import DeskUserLog
+        for lid, why in skipped:
+            if lid and why != "already queued":
+                db.add(DeskUserLog(license_id=lid, symbol=symbol, action=action,
+                                   message=f"AI {action.upper() if action else ''} {symbol} not placed on your account: {why}"[:240]))
     db.commit()
     log.info("desk copy %s %s: queued %d, skipped %d", event, master_ticket, len(queued), len(skipped))
     return {"event": event, "master_ticket": master_ticket, "queued": len(queued),

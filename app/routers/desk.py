@@ -217,6 +217,11 @@ def _desk_open_to(lic) -> bool:
     return open_to(lic)
 
 
+def st_open(db: Session, lic) -> bool:
+    acct = _account(db, lic)
+    return open_to(lic, acct.login if acct else None)
+
+
 def _account(db: Session, lic):
     from app.models import ClientMT5Account
     return (db.query(ClientMT5Account).filter(ClientMT5Account.license_id == lic.id,
@@ -272,7 +277,7 @@ def _desk_status(db: Session, lic) -> dict:
     rows = (db.query(TradeExecution).filter(TradeExecution.license_id == lic.id,
                                             TradeExecution.master_ticket.like("DESK-%"))
             .order_by(TradeExecution.id.desc()).limit(30).all())
-    available = open_to(lic)
+    available = open_to(lic, acct.login if acct else None)
     ready = all(c["ok"] for c in checks[:4])
     return {
         "pro": pro,
@@ -308,7 +313,7 @@ def client_desk_start(data: DeskLicence, db: Session = Depends(get_db)):
     lic = _desk_licence(db, data.license_key)
     if not is_pro(lic):
         raise HTTPException(status_code=403, detail="The Desk is for NOLIMITZ PRO licences")
-    if not open_to(lic):
+    if not st_open(db, lic):
         raise HTTPException(status_code=403, detail="The Desk is not open for new accounts yet")
     st = _desk_status(db, lic)
     missing = [c["text"] for c in st["checks"][:4] if not c["ok"]]
@@ -354,6 +359,52 @@ def _money(x):
         return f"${float(x):,.2f}"
     except (TypeError, ValueError):
         return "-"
+
+
+def _source(master_ticket) -> str:
+    mt = str(master_ticket or "")
+    if mt.startswith("DESK-"):
+        return "AI"
+    if mt.startswith("TG"):
+        return "TELEGRAM"
+    return "MASTER"
+
+
+def _lvl(v):
+    """Executor level encodings -> words: 'dist:20.6' -> '20.60 from entry', 'off:0' -> 'entry +0.00'."""
+    if v in (None, ""):
+        return None
+    v = str(v)
+    try:
+        if v.startswith("dist:"):
+            return f"{float(v[5:]):.2f} from entry"
+        if v.startswith("off:"):
+            o = float(v[4:])
+            return "breakeven (entry)" if abs(o) < 1e-9 else f"entry {o:+.2f}"
+        return f"{float(v):.2f}"
+    except ValueError:
+        return v
+
+
+def _my_activity(db: Session, lic, limit: int = 60) -> list:
+    """Everything that happened on this user's MT5 through NolimitzBots: master copier trades, the AI (Desk)
+    trades, Telegram trades, stop moves, closes, failures, and why the AI skipped their account."""
+    from app.models import TradeExecution
+    from app.desk.models import DeskUserLog
+    out = []
+    for r in (db.query(TradeExecution).filter(TradeExecution.license_id == lic.id)
+              .order_by(TradeExecution.id.desc()).limit(limit).all()):
+        out.append({"at": r.created_at.isoformat() if r.created_at else None, "source": _source(r.master_ticket),
+                    "event": r.event_type, "symbol": r.symbol, "action": r.action, "lot": r.lot_size,
+                    "sl": _lvl(r.sl), "tp": _lvl(r.tp), "price": r.price, "status": r.status,
+                    "note": r.error_message, "ticket": r.client_ticket})
+    for n in (db.query(DeskUserLog).filter(DeskUserLog.license_id == lic.id)
+              .order_by(DeskUserLog.id.desc()).limit(20).all()):
+        out.append({"at": n.created_at.isoformat() if n.created_at else None, "source": "AI", "event": "skipped",
+                    "symbol": n.symbol, "action": n.action, "lot": None, "sl": None, "tp": None, "price": None,
+                    "status": "not placed", "note": n.message, "ticket": None})
+    out.sort(key=lambda a: a["at"] or "", reverse=True)
+    return out[:limit]
 
 
 @router.get("/api/client/desk/view")
@@ -403,7 +454,15 @@ def client_desk_view(license_key: str = Query(..., max_length=128), db: Session 
         if state:
             mgmt.append(state)
 
-    off_reason = next((c["text"] for c in st["checks"] if not c["ok"]), None)
+    NEED = {"NOLIMITZ PRO licence": "needs a NOLIMITZ PRO licence", "Licence active": "your licence has expired",
+            "MT5 account connected and verified": "connect and verify your MT5 account",
+            "Gold (XAUUSD) enabled with a lot size": "set a gold (XAUUSD) lot size",
+            "AI Auto Trader switched ON": "turn the AI Auto Trader ON"}
+    sources = {str(m.client_ticket): {"source": _source(m.master_ticket), "master_ticket": m.master_ticket}
+               for m in db.query(TradeTicketMap).filter(TradeTicketMap.license_id == lic.id,
+                                                        TradeTicketMap.is_closed == False)  # noqa: E712
+               if m.client_ticket}
+    off_reason = next((NEED.get(c["text"], c["text"]) for c in st["checks"] if not c["ok"]), None)
     if not st["available"] and st["pro"]:
         off_reason = "Desk not open to your account yet"
 
@@ -473,5 +532,6 @@ def client_desk_view(license_key: str = Query(..., max_length=128), db: Session 
                    "guard": guard()},
         "gold": {"bias": xau.get("bias"), "bid": xau.get("bid"), "ask": xau.get("ask")},
         "open_trades": open_list,
-        "activity": st["activity"],
+        "position_sources": sources,         # MT5 ticket -> AI | MASTER | TELEGRAM, for labelling live positions
+        "activity": _my_activity(db, lic),
     }

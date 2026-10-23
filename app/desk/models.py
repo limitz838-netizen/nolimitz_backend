@@ -84,3 +84,19 @@ class DeskFollower(Base):
     enabled = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class DeskUserLog(Base):
+    """Why the Desk (the AI) did NOT put a trade on a user's account (Oct 2026, step 14).
+
+    One row per skipped account per Desk entry, e.g. "gold not enabled or no lot set". The user's
+    Desk page shows these next to their real trades so "why no trade?" always has an answer.
+    """
+    __tablename__ = "desk_user_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    license_id = Column(Integer, nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    symbol = Column(String(32), nullable=True)
+    action = Column(String(8), nullable=True)
+    message = Column(String(240), nullable=False)
