@@ -526,8 +526,8 @@ function render(t){
   const shadow=st&&st.mode&&st.mode.shadow;
   badge.className='badge '+(!R.online?'off':shadow?'shadow':'live');
   setText(badge,!R.online?'OFFLINE':shadow?'SHADOW':'LIVE');
-  $('#btcTag').classList.toggle('off',UM()||!(st&&st.mode&&(st.mode.symbols||[]).includes('BTCUSD')));
-  if(UM()){badge.className='badge '+(!R.online?'off':VIEW.following?'live':'shadow');setText(badge,!R.online?'OFFLINE':VIEW.following?'ON MY ACCOUNT':'OFF');}
+  $('#btcTag').classList.toggle('off',!(st&&st.mode&&(st.mode.symbols||[]).includes('BTCUSD')));
+  if(UM()){badge.className='badge '+(!R.online?'off':'live');setText(badge,!R.online?'OFFLINE':'LIVE');}
   if(!st) return;
 
   if(UM()){ renderUser(dn,ss); return; }
