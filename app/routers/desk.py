@@ -34,13 +34,13 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.desk.models import DeskEvent, DeskFollower, DeskState, DeskTrade
 
-router = APIRouter(prefix="/api/desk", tags=["desk"])
+router = APIRouter(tags=["desk"])   # full paths below: /api/desk/* and /api/client/desk/*
 
 STALE_AFTER_SEC = 60
 PAGE = Path(__file__).resolve().parent.parent / "desk" / "static" / "desk.html"
 
 
-@router.get("/live", response_class=HTMLResponse, include_in_schema=False)
+@router.get("/api/desk/live", response_class=HTMLResponse, include_in_schema=False)
 def desk_page():
     """The live Desk page. It polls /api/desk/state on the same domain."""
     return HTMLResponse(PAGE.read_text(encoding="utf-8"), headers={"Cache-Control": "no-cache"})
@@ -72,7 +72,7 @@ def _summary(rows) -> dict:
     }
 
 
-@router.get("/state")
+@router.get("/api/desk/state")
 def desk_state(
     worker: str = Query("desk-1", max_length=64),
     after_id: int = Query(0, ge=0),
@@ -145,7 +145,7 @@ class DeskCopyEvent(BaseModel):
     price: Optional[float] = None
 
 
-@router.post("/copy/event", include_in_schema=False)
+@router.post("/api/desk/copy/event", include_in_schema=False)
 def desk_copy_event(payload: DeskCopyEvent, x_worker_token: str = Header(None), db: Session = Depends(get_db)):
     """The Desk worker reports a real trade event; queue it for every follower's account."""
     _require_worker(x_worker_token)
@@ -159,7 +159,7 @@ class DeskFollowRequest(BaseModel):
     enabled: bool = True
 
 
-@router.post("/copy/follow", include_in_schema=False)
+@router.post("/api/desk/copy/follow", include_in_schema=False)
 def desk_copy_follow(payload: DeskFollowRequest, x_worker_token: str = Header(None), db: Session = Depends(get_db)):
     """Switch the Desk on or off for one MT5 account (by login). Admin/test tool until the
     in-app switch exists. Turning it off stops new entries only; open copies are still managed."""
@@ -182,9 +182,142 @@ def desk_copy_follow(payload: DeskFollowRequest, x_worker_token: str = Header(No
             "verified": bool(acct.is_verified), "risk_level": acct.risk_level}
 
 
-@router.get("/copy/followers", include_in_schema=False)
+@router.get("/api/desk/copy/followers", include_in_schema=False)
 def desk_copy_followers(x_worker_token: str = Header(None), db: Session = Depends(get_db)):
     _require_worker(x_worker_token)
     return [{"license_id": r.license_id, "mt5_login": r.mt5_login, "enabled": r.enabled,
              "since": r.created_at.isoformat() if r.created_at else None}
             for r in db.query(DeskFollower).order_by(DeskFollower.id).all()]
+
+
+# =====================================================================================
+# USER SWITCH (step 11) -- /api/client/desk/*, authenticated by the user's licence key like every
+# other /api/client route (the app's proxy only relays /api/client/...). A user switches the Desk on
+# for THEIR OWN account; their own gold lot and risk mode decide the size.
+# Gate while testing: DESK_PUBLIC_ENABLED=true opens it to everyone; otherwise only the licence ids or
+# keys listed in DESK_BETA_LICENSES (comma separated) can switch it on.
+# =====================================================================================
+DESK_PUBLIC = os.getenv("DESK_PUBLIC_ENABLED", "false").strip().lower() == "true"
+DESK_BETA = {x.strip() for x in os.getenv("DESK_BETA_LICENSES", "").split(",") if x.strip()}
+TRADES_PER_MODE = {"normal": 1, "medium": 3, "aggressive": 5}
+
+
+class DeskLicence(BaseModel):
+    license_key: str
+
+
+def _desk_licence(db: Session, license_key: str):
+    from app.models import License
+    lic = db.query(License).filter(License.license_key == (license_key or "").strip()).first()
+    if lic is None:
+        raise HTTPException(status_code=400, detail="Invalid license key")
+    return lic
+
+
+def _desk_open_to(lic) -> bool:
+    return DESK_PUBLIC or str(lic.id) in DESK_BETA or lic.license_key in DESK_BETA
+
+
+def _desk_status(db: Session, lic) -> dict:
+    from app.models import ClientMT5Account, ClientSymbolSetting, TradeExecution
+    from app.routers.copier import find_symbol_setting
+    now = datetime.now(timezone.utc)
+    exp = lic.expires_at if (lic.expires_at is None or lic.expires_at.tzinfo) else lic.expires_at.replace(tzinfo=timezone.utc)
+    acct = (db.query(ClientMT5Account).filter(ClientMT5Account.license_id == lic.id, ClientMT5Account.is_active == True)  # noqa: E712
+            .order_by(ClientMT5Account.id.desc()).first())
+    gold = find_symbol_setting(db, lic.id, "XAUUSD")
+    fol = db.query(DeskFollower).filter(DeskFollower.license_id == lic.id).first()
+    mode = ((acct.risk_level if acct else None) or "medium").lower()
+    per_signal = TRADES_PER_MODE.get(mode, 3)
+    lot = None
+    try:
+        lot = float(gold.lot_size) if gold else None
+    except (TypeError, ValueError):
+        lot = None
+    checks = [
+        {"ok": bool(lic.is_active and (exp is None or exp > now)), "text": "Licence active"},
+        {"ok": bool(acct and acct.is_verified), "text": "MT5 account connected and verified"},
+        {"ok": bool(acct and acct.ai_auto_trade), "text": "Robot switched ON"},
+        {"ok": bool(lot and lot > 0), "text": "Gold (XAUUSD) enabled with a lot size"},
+    ]
+    # rough risk preview: gold stop = 1.5 x the Desk's current H1 ATR; 0.01 lot ~ $1 per $1 move
+    est = None
+    st = db.query(DeskState).filter(DeskState.worker == "desk-1").first()
+    try:
+        atr = float(((st.payload or {}).get("symbols") or {}).get("XAUUSD", {}).get("atr") or 0) if st else 0
+    except (TypeError, ValueError, AttributeError):
+        atr = 0
+    if atr and lot:
+        stop = 1.5 * atr
+        risk = stop * lot * 100 * per_signal
+        bal = float(acct.balance or 0) if acct else 0
+        est = {"stop_points": round(stop, 2), "risk_usd": round(risk, 2),
+               "risk_pct": round(100 * risk / bal, 1) if bal > 0 else None,
+               "high_risk": bool(bal > 0 and risk / bal > 0.10), "blocked": bool(bal > 0 and risk > bal)}
+    rows = (db.query(TradeExecution).filter(TradeExecution.license_id == lic.id,
+                                            TradeExecution.master_ticket.like("DESK-%"))
+            .order_by(TradeExecution.id.desc()).limit(30).all())
+    return {
+        "available": _desk_open_to(lic),
+        "following": bool(fol and fol.enabled),
+        "ready": all(c["ok"] for c in checks),
+        "checks": checks,
+        "account": None if acct is None else {
+            "login": (str(acct.login)[:2] + "***" + str(acct.login)[-3:]) if acct.login else None,
+            "server": acct.server, "broker": getattr(acct, "broker_name", None),
+            "balance": acct.balance, "equity": acct.equity, "verified": bool(acct.is_verified),
+            "robot_on": bool(acct.ai_auto_trade)},
+        "risk_mode": mode, "trades_per_signal": per_signal, "gold_lot": lot,
+        "estimate": est,
+        "activity": [{"at": r.created_at.isoformat() if r.created_at else None, "event": r.event_type,
+                      "symbol": r.symbol, "action": r.action, "lot": r.lot_size, "status": r.status,
+                      "note": r.error_message, "ticket": r.client_ticket} for r in rows],
+    }
+
+
+@router.get("/api/client/desk/status")
+def client_desk_status(license_key: str = Query(..., max_length=128), db: Session = Depends(get_db)):
+    """Everything the Desk tab needs to show the Start switch for THIS user."""
+    return _desk_status(db, _desk_licence(db, license_key))
+
+
+@router.post("/api/client/desk/start")
+def client_desk_start(data: DeskLicence, db: Session = Depends(get_db)):
+    lic = _desk_licence(db, data.license_key)
+    if not _desk_open_to(lic):
+        raise HTTPException(status_code=403, detail="The Desk is not open for new accounts yet")
+    st = _desk_status(db, lic)
+    missing = [c["text"] for c in st["checks"] if not c["ok"]]
+    if missing:
+        raise HTTPException(status_code=409, detail="Before starting the Desk: " + "; ".join(missing))
+    if st["estimate"] and st["estimate"]["blocked"]:
+        raise HTTPException(status_code=409, detail=(
+            f"Your gold lot x {st['trades_per_signal']} trades would risk about ${st['estimate']['risk_usd']:.2f} "
+            "per Desk trade, more than your balance. Lower the gold lot or set risk mode to Normal."))
+    from app.models import ClientMT5Account
+    acct = (db.query(ClientMT5Account).filter(ClientMT5Account.license_id == lic.id, ClientMT5Account.is_active == True)  # noqa: E712
+            .order_by(ClientMT5Account.id.desc()).first())
+    row = db.query(DeskFollower).filter(DeskFollower.license_id == lic.id).first()
+    if row is None:
+        row = DeskFollower(license_id=lic.id, mt5_login=str(acct.login) if acct else None, enabled=True)
+        db.add(row)
+    else:
+        row.enabled = True
+        row.mt5_login = str(acct.login) if acct else row.mt5_login
+    db.commit()
+    out = _desk_status(db, lic)
+    out["message"] = "Desk started: its next trade will open on your account with your own lot and risk mode."
+    return out
+
+
+@router.post("/api/client/desk/stop")
+def client_desk_stop(data: DeskLicence, db: Session = Depends(get_db)):
+    """Stops NEW Desk trades on this account. Trades already open keep being managed until they close."""
+    lic = _desk_licence(db, data.license_key)
+    row = db.query(DeskFollower).filter(DeskFollower.license_id == lic.id).first()
+    if row is not None:
+        row.enabled = False
+        db.commit()
+    out = _desk_status(db, lic)
+    out["message"] = "Desk stopped: no new Desk trades. Open Desk trades are still managed until they close."
+    return out
