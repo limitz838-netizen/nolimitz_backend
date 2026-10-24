@@ -198,3 +198,47 @@ def manage_stop(direction: int, entry: float, stop: float, initial_risk: float,
         trail = best_price - direction * TRAIL_ATR * atr_at_entry
         new = max(new, trail) if direction > 0 else min(new, trail)
     return new if abs(new - stop) > 1e-12 else None
+
+
+# ---------------------------------------------------------------------------------------------------
+# PAPER CANDIDATES (23 Oct 2026). From the per-symbol test (desk_research/symbols): these two came
+# closest to passing and are paper-traded on the live Desk to collect forward evidence. They never send
+# an order while their symbol is in DESK_SHADOW_SYMBOLS.
+#   squeeze_r7n12  BTCUSD: quiet ATR < 0.7x, break of the 12-hour range   (DEV +13.1R, VAL flat)
+#   squeeze_r8n12  USDJPY: quiet ATR < 0.8x, break of the 12-hour range   (DEV +15.1R, 85 trades)
+# Same stop/target/breakeven as SQUEEZE above.
+# ---------------------------------------------------------------------------------------------------
+def _squeeze_variant(ratio_max: float, lookback: int):
+    def run(h1_closed: List[dict], bias: int = 0) -> Decision:
+        d = Decision(bias=bias, strategy=f"squeeze_r{int(ratio_max * 10)}n{lookback}", stop_mult=SQUEEZE_STOP_ATR,
+                     target_mult=SQUEEZE_TARGET_ATR, trail=False, flip_exit=False)
+        if len(h1_closed) < MIN_H1_BARS:
+            d.scout = f"warming up ({len(h1_closed)}/{MIN_H1_BARS} H1 bars)"
+            return d
+        a = atr(h1_closed)
+        last = h1_closed[-1]
+        d.atr, d.close = a[-1], last["c"]
+        med = median(a[-ATR_MEDIAN_LEN:])
+        d.atr_ratio = a[-1] / med if med > 0 else 9.0
+        d.entry_hour_utc = int(((last["t"] + 3600) // 3600) % 24)
+        prior = h1_closed[-lookback - 1:-1]
+        hi, lo = max(b["h"] for b in prior), min(b["l"] for b in prior)
+        quiet = d.atr_ratio < ratio_max
+        d.checks = {"quiet": quiet, "range_high": hi, "range_low": lo,
+                    "break_up": last["c"] > hi, "break_down": last["c"] < lo}
+        if not quiet:
+            d.scout = f"ATR {d.atr_ratio:.2f}x normal · waiting for a quiet market"
+        elif d.checks["break_up"]:
+            d.signal, d.scout = 1, f"quiet ({d.atr_ratio:.2f}x) · broke the {lookback}h high · signal: long"
+        elif d.checks["break_down"]:
+            d.signal, d.scout = -1, f"quiet ({d.atr_ratio:.2f}x) · broke the {lookback}h low · signal: short"
+        else:
+            d.scout = f"quiet ({d.atr_ratio:.2f}x) · inside the {lookback}h range"
+        return d
+    return run
+
+
+STRATEGIES["squeeze_r7n12"] = _squeeze_variant(0.7, 12)
+STRATEGIES["squeeze_r8n12"] = _squeeze_variant(0.8, 12)
+RULES_TEXT["squeeze_r7n12"] = "H1 squeeze breakout · quiet ATR < 0.7x · 12h range · 1.5/3 ATR · paper"
+RULES_TEXT["squeeze_r8n12"] = "H1 squeeze breakout · quiet ATR < 0.8x · 12h range · 1.5/3 ATR · paper"

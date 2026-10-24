@@ -148,6 +148,12 @@ def fan_out(db: Session, event: str, desk_ticket: str, symbol: str, action: Opti
                 db.add(DeskUserLog(license_id=lid, symbol=symbol, action=action,
                                    message=f"AI {action.upper() if action else ''} {symbol} not placed on your account: {why}"[:240]))
     db.commit()
+    if event == "open" and queued:
+        try:
+            from app.desk.notify import schedule
+            schedule(master_ticket, symbol, action)
+        except Exception as e:                       # a notification must never break copying
+            log.warning("desk notify schedule failed: %s", e)
     log.info("desk copy %s %s: queued %d, skipped %d", event, master_ticket, len(queued), len(skipped))
     return {"event": event, "master_ticket": master_ticket, "queued": len(queued),
             "skipped": [{"license_id": a, "reason": b} for a, b in skipped]}

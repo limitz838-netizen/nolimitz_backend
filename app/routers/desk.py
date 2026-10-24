@@ -407,6 +407,31 @@ def _my_activity(db: Session, lic, limit: int = 60) -> list:
     return out[:limit]
 
 
+def _next_setup(xau: dict, online: bool, mkt_open: bool, in_trade: bool) -> str:
+    """One plain sentence: what the AI is waiting for before its next gold trade."""
+    if not online:
+        return "The Desk is reconnecting."
+    if not mkt_open:
+        return "Gold is closed. The AI starts watching again when the market reopens."
+    if in_trade:
+        return "The AI is managing your open gold trade: stop to breakeven at +1R, then a trailing stop."
+    c = xau.get("checks") or {}
+    b = xau.get("bias") or 0
+    e = xau.get("ema20")
+    side, verb = ("up", "buys") if b > 0 else ("down", "sells")
+    lvl = f"{e:,.2f}" if isinstance(e, (int, float)) else "its 1-hour average"
+    if not b:
+        return "No clear 4-hour trend in gold. The AI waits for one before trading."
+    if c and not c.get("session", True):
+        return f"Gold trend is {side}. The AI trades from 07:00 to 20:00 UTC and resumes then."
+    if c and not c.get("regime", True):
+        return f"Gold trend is {side}, but the market is moving unusually. The AI waits for normal conditions."
+    if not c.get("pullback"):
+        return f"Gold trend is {side}. The AI {verb} when price pulls back to about {lvl} and turns {'up' if b > 0 else 'down'}."
+    return (f"Gold has pulled back to about {lvl}. The AI {verb} as soon as a 1-hour candle closes "
+            f"{'above the previous high' if b > 0 else 'below the previous low'}.")
+
+
 @router.get("/api/client/desk/view")
 def client_desk_view(license_key: str = Query(..., max_length=128), db: Session = Depends(get_db)):
     """The Desk as THIS user sees it: their own balance, their own Desk trades, and each agent's card
@@ -521,6 +546,7 @@ def client_desk_view(license_key: str = Query(..., max_length=128), db: Session 
                 "blocks any trade that could cost more than your balance")
 
     return {
+        "next_setup": _next_setup(xau, online, mkt_open, bool(open_list)),
         "online": online, "market_open": mkt_open, "updated": payload.get("updated"),
         "following": st["following"], "robot_on": st["robot_on"], "available": st["available"],
         "pro": st["pro"], "ready": st["ready"], "checks": st["checks"], "off_reason": None if st["following"] else off_reason,

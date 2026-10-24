@@ -107,6 +107,7 @@ class Cfg:
 ALIASES = {
     "XAUUSD": ["XAUUSD", "XAUUSDm", "XAUUSDc", "XAUUSD.m", "GOLD", "GOLDm"],
     "BTCUSD": ["BTCUSD", "BTCUSDm", "BTCUSDc", "BTCUSD.m", "BTCUSDT"],
+    "USDJPY": ["USDJPY", "USDJPYm", "USDJPYc", "USDJPY.m"],
 }
 
 

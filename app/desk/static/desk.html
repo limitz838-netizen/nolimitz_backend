@@ -237,11 +237,20 @@ window.addEventListener('message',ev=>{
   if(!isFinite(USER.balance)||!USER.connected) USER=null;
 });
 const UM=()=>!!(LKEY&&VIEW);
+function announce(txt){
+  const b=document.createElement('div');b.textContent=txt;
+  b.style.cssText='position:fixed;left:50%;top:14px;transform:translateX(-50%);z-index:50;background:#0f2a1c;color:#4ade80;border:1px solid #4ade80;border-radius:8px;padding:10px 16px;font:700 13px "JetBrains Mono",monospace;box-shadow:0 8px 30px rgba(0,0,0,.5);max-width:92vw;text-align:center';
+  document.body.appendChild(b);setTimeout(()=>b.remove(),15000);
+}
 let viewTimer=null;
 async function pollView(){
   clearTimeout(viewTimer);
   if(LKEY){try{const r=await fetch('/api/client/desk/view?license_key='+encodeURIComponent(LKEY),{cache:'no-store'});
-    if(r.ok){VIEW=await r.json();for(const a of AG){const v=VIEW.agents&&VIEW.agents[a.id];if(v)live[a.id]=v}}}catch(e){}}
+    if(r.ok){const nv=await r.json();
+      // a NEW AI trade on the user's own account -> announce it on the Desk
+      const before=new Set(((VIEW&&VIEW.open_trades)||[]).map(o=>String(o.client_ticket)));
+      if(VIEW) (nv.open_trades||[]).forEach(o=>{if(!before.has(String(o.client_ticket)))announce(`AI opened ${(o.side||'').toUpperCase()} GOLD on your account`)});
+      VIEW=nv;for(const a of AG){const v=VIEW.agents&&VIEW.agents[a.id];if(v)live[a.id]=v}}}catch(e){}}
   viewTimer=setTimeout(pollView,5000);
 }
 if(EMBED){try{window.parent.postMessage({type:'nolimitz-desk-ready'},'*')}catch(e){}}
@@ -608,8 +617,9 @@ function renderUser(dn,ss){
   else{setText(pe,fl==null?' ':`equity $${fmt(eq)} · floating ${fl>=0?'+':'-'}$${fmt(Math.abs(fl))}`);pe.classList.toggle('neg',(fl||0)<0)}
   setText($('#acct'),`MY MT5 · ${(USER&&USER.server)||A.broker||A.server||'--'}${(USER&&USER.login)||A.login?' · '+((USER&&USER.login)||A.login):''}`);
   const note=$('#note');note.hidden=false;
-  setHTML(note,V.following?`The AI is trading <b>your account</b> · your lot ${esc(V.gold_lot)} × ${V.trades_per_signal} trade${V.trades_per_signal>1?'s':''} per signal (${esc(V.risk_mode)})`
-    :`The AI is <b>not trading your account</b> · ${esc(V.off_reason||'turn the AI Auto Trader ON')}`);
+  const nxt=V.next_setup?`<div style="margin-top:6px;color:var(--dim)">NEXT SETUP · ${esc(V.next_setup)}</div>`:'';
+  setHTML(note,(V.following?`The AI is trading <b>your account</b> · your lot ${esc(V.gold_lot)} × ${V.trades_per_signal} trade${V.trades_per_signal>1?'s':''} per signal (${esc(V.risk_mode)})`
+    :`The AI is <b>not trading your account</b> · ${esc(V.off_reason||'turn the AI Auto Trader ON')}`)+nxt);
   // EVERYTHING open on my MT5: AI (Desk), master copier and Telegram trades, with SL/TP
   const SRC=V.position_sources||{}, SC={AI:'#4ade80',MASTER:'#60a5fa',TELEGRAM:'#a78bfa',MANUAL:'#9aa5b5'};
   const lps=Object.values(LIVEPOS);
