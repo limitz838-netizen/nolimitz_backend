@@ -108,6 +108,7 @@ ALIASES = {
     "XAUUSD": ["XAUUSD", "XAUUSDm", "XAUUSDc", "XAUUSD.m", "GOLD", "GOLDm"],
     "BTCUSD": ["BTCUSD", "BTCUSDm", "BTCUSDc", "BTCUSD.m", "BTCUSDT"],
     "USDJPY": ["USDJPY", "USDJPYm", "USDJPYc", "USDJPY.m"],
+    "V100": ["Volatility 100 Index"],   # STEP23 Deriv synthetic
 }
 
 
@@ -497,7 +498,13 @@ class Desk:
                    canon, "ok", {"lot": lot, "risk_usd": round(real_risk, 2), "loss_per_lot": loss1})
 
         sl = round(stop_px, s["digits"])
-        tp = round(price + d.signal * d.target_distance, s["digits"])
+        if d.target_price is not None:                      # STEP23: e.g. mean reversion -> EMA20
+            tp = round(d.target_price, s["digits"])
+            if (tp - price) * d.signal <= 0:
+                self.event("entry", f"{canon} {side} skipped \u00b7 price already at the target", canon, "warn")
+                return
+        else:
+            tp = round(price + d.signal * d.target_distance, s["digits"])
         if self.shadow(canon):
             ticket = "paper-%d%s" % (int(now_utc().timestamp()), canon[:3])
             self.db.add(DeskTrade(worker=self.cfg.WORKER, ticket=ticket, symbol=canon, broker_symbol=s["broker"],
@@ -566,6 +573,13 @@ class Desk:
                 continue
             # best price since entry -> breakeven / trail
             opened = row.opened_at if row.opened_at.tzinfo else row.opened_at.replace(tzinfo=timezone.utc)
+            fl = S.flags(rules)                                 # STEP23
+            if fl["time_exit_h"] and now_utc() - opened >= timedelta(hours=fl["time_exit_h"]):
+                if self.close_position(pos, "time exit"):
+                    self.event("exit", f"{canon} {fl['time_exit_h']:g}h time limit \u00b7 closing", canon, "warn")
+                continue
+            if not fl["be"]:
+                continue
             m15 = mt5.copy_rates_range(s["broker"], mt5.TIMEFRAME_M15,
                                        opened + timedelta(seconds=self.offset_sec),
                                        now_utc() + timedelta(seconds=self.offset_sec + 900))
@@ -624,7 +638,11 @@ class Desk:
             sp = float(x["spread"]) * s["point"]
             lo, hi, op = (l, h, o) if d > 0 else (l + sp, h + sp, o + sp)
             sl = st["sl"]
-            if (d > 0 and op <= sl) or (d < 0 and op >= sl):
+            fl = S.flags(rules)                                 # STEP23
+            if fl["time_exit_h"] and t > int(opened.timestamp()) // 900 * 900 and \
+                    t >= opened.timestamp() + fl["time_exit_h"] * 3600:
+                exit_px, reason = op, "time"
+            elif (d > 0 and op <= sl) or (d < 0 and op >= sl):
                 exit_px, reason = op, "stop"
             elif (d > 0 and lo <= sl) or (d < 0 and hi >= sl):
                 exit_px = sl
@@ -636,7 +654,8 @@ class Desk:
                 exit_t = t + 900
                 break
             st["best"] = max(st["best"], h) if d > 0 else min(st["best"], l + sp)
-            new = S.manage_stop(d, entry, st["sl"], risk, st["best"], row.atr_at_entry, trail=(rules == "pullback"))
+            new = (S.manage_stop(d, entry, st["sl"], risk, st["best"], row.atr_at_entry, trail=(rules == "pullback"))
+                   if S.flags(rules)["be"] else None)           # STEP23
             if new is not None and (new - st["sl"]) * d > 0:
                 st["sl"] = new
                 row.current_stop = new
@@ -656,6 +675,8 @@ class Desk:
                     exit_px, reason = tp, "target"
                 elif rules == "pullback" and self.bias.get(row.symbol, 0) == -d:
                     exit_px, reason = px, "bias_flip"
+                elif S.flags(rules)["time_exit_h"] and now >= opened.timestamp() + S.flags(rules)["time_exit_h"] * 3600:
+                    exit_px, reason = px, "time"                # STEP23
                 exit_t = now
         if exit_px is None:
             return

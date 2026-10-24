@@ -97,6 +97,9 @@ class Decision:
     target_mult: float = TARGET_ATR
     trail: bool = True              # trail 1 x ATR after +1.5R
     flip_exit: bool = True          # close if the H4 bias flips
+    breakeven: bool = True          # stop to entry at +1R
+    target_price: Optional[float] = None   # absolute target (mean reversion: EMA20 at the signal), else target_mult x ATR
+    time_exit_h: Optional[float] = None    # close at market this many hours after the signal
 
     @property
     def stop_distance(self) -> float:
@@ -242,3 +245,57 @@ STRATEGIES["squeeze_r7n12"] = _squeeze_variant(0.7, 12)
 STRATEGIES["squeeze_r8n12"] = _squeeze_variant(0.8, 12)
 RULES_TEXT["squeeze_r7n12"] = "H1 squeeze breakout · quiet ATR < 0.7x · 12h range · 1.5/3 ATR · paper"
 RULES_TEXT["squeeze_r8n12"] = "H1 squeeze breakout · quiet ATR < 0.8x · 12h range · 1.5/3 ATR · paper"
+
+
+# ---------------------------------------------------------------------------------------------------
+# MEAN REVERSION for Deriv's Volatility 100 Index (24 Oct 2026; paper first). Passed the per-symbol test
+# (desk_research/deriv: DEV +21.7R / 194 trades, VAL +4.4R, SEALED +13.8R, 16 of 20 quarters up).
+#   REGIME  H1 ATR14 / median of the last 100 ATR values <= 1.0 (normal or quiet market).
+#   TRIGGER H1 close above SMA20 + 2.5 SD -> short; below SMA20 - 2.5 SD -> long (SD of the last 20 closes).
+#   RISK    Stop 1.5 x ATR. Target = EMA20 at the signal. No breakeven, no trailing. Close after 12 hours.
+# ---------------------------------------------------------------------------------------------------
+MR_K, MR_REGIME_MAX, MR_STOP_ATR, MR_TIME_EXIT_H = 2.5, 1.0, 1.5, 12.0
+
+
+def evaluate_meanrev(h1_closed: List[dict], bias: int = 0) -> Decision:
+    d = Decision(bias=bias, strategy="meanrev_k25", stop_mult=MR_STOP_ATR, target_mult=0.0, trail=False,
+                 flip_exit=False, breakeven=False, time_exit_h=MR_TIME_EXIT_H)
+    if len(h1_closed) < MIN_H1_BARS:
+        d.scout = f"warming up ({len(h1_closed)}/{MIN_H1_BARS} H1 bars)"
+        return d
+    closes = [b["c"] for b in h1_closed]
+    a = atr(h1_closed)
+    last = h1_closed[-1]
+    d.atr, d.close = a[-1], last["c"]
+    d.ema20 = ema(closes, H1_EMA)[-1]
+    med = median(a[-ATR_MEDIAN_LEN:])
+    d.atr_ratio = a[-1] / med if med > 0 else 9.0
+    d.entry_hour_utc = int(((last["t"] + 3600) // 3600) % 24)
+    win = closes[-20:]
+    sma = sum(win) / 20.0
+    sd = (sum((x - sma) ** 2 for x in win) / 20.0) ** 0.5          # population SD, as in the backtest
+    up, lo = sma + MR_K * sd, sma - MR_K * sd
+    calm = d.atr_ratio <= MR_REGIME_MAX
+    d.checks = {"calm": calm, "upper": up, "lower": lo, "sma20": sma}
+    if not calm:
+        d.scout = f"ATR {d.atr_ratio:.2f}x normal \u00b7 too fast for mean reversion"
+    elif d.close > up:
+        d.signal, d.target_price = -1, d.ema20
+        d.scout = f"stretched above the 2.5 SD band \u00b7 signal: short back to EMA20 {d.ema20:,.2f}"
+    elif d.close < lo:
+        d.signal, d.target_price = 1, d.ema20
+        d.scout = f"stretched below the 2.5 SD band \u00b7 signal: long back to EMA20 {d.ema20:,.2f}"
+    else:
+        d.scout = f"inside the bands ({lo:,.2f} \u2013 {up:,.2f}) \u00b7 waiting for a stretch"
+    return d
+
+
+STRATEGIES["meanrev_k25"] = evaluate_meanrev
+RULES_TEXT["meanrev_k25"] = "H1 mean reversion \u00b7 2.5 SD bands \u00b7 calm ATR \u00b7 stop 1.5 ATR \u00b7 target EMA20 \u00b7 12h max"
+STRATEGY_FLAGS = {"pullback": dict(be=True, trail=True, flip=True, time_exit_h=None),
+                  "meanrev_k25": dict(be=False, trail=False, flip=False, time_exit_h=MR_TIME_EXIT_H)}
+
+
+def flags(name: str) -> dict:
+    """Management rules per strategy (anything not listed: breakeven only, like the squeeze family)."""
+    return STRATEGY_FLAGS.get(name, dict(be=True, trail=False, flip=False, time_exit_h=None))
