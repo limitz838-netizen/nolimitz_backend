@@ -264,7 +264,8 @@ function short(msg){ // "XAUUSD H1 14:00 UTC - pullback seen..." -> "pullback se
   return String(msg||'').replace(/^(XAUUSD|BTCUSD)\s+/,'').replace(/^H1 \d\d:\d\d UTC \u00b7 /,'');
 }
 // Chart the market that is open: gold on weekdays, BTC at weekends; gold first when both are open.
-const sym=()=>{const s=R&&R.state&&R.state.symbols;if(!s)return 'XAUUSD';const k=Object.keys(s);if(!k.length)return 'XAUUSD';
+const sym=()=>{if(UM())return 'XAUUSD';   // users trade gold only: their chart is always gold, even at weekends
+  const s=R&&R.state&&R.state.symbols;if(!s)return 'XAUUSD';const k=Object.keys(s);if(!k.length)return 'XAUUSD';
   const open=k.filter(x=>s[x].open);if(open.includes('XAUUSD'))return 'XAUUSD';if(open.length)return open[0];return k.includes('XAUUSD')?'XAUUSD':k[0]};
 const symState=()=>R&&R.state&&R.state.symbols?R.state.symbols[sym()]:null;
 const digits=()=>{const s=symState();return s&&s.digits!=null?Math.min(s.digits,2):2};
