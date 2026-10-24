@@ -432,6 +432,44 @@ def _next_setup(xau: dict, online: bool, mkt_open: bool, in_trade: bool) -> str:
             f"{'above the previous high' if b > 0 else 'below the previous low'}.")
 
 
+def _account_positions(db: Session, lic, acct) -> Optional[dict]:
+    """Open MT5 positions saved by the VPS execution worker (any source). None if not available yet."""
+    if acct is None:
+        return None
+    from sqlalchemy import text as _t
+    try:
+        row = db.execute(_t("select positions_json, positions_at from client_mt5_accounts where id = :i"),
+                         {"i": acct.id}).first()
+    except Exception:
+        db.rollback()
+        return None
+    if not row or row[0] is None:
+        return None
+    import json as _json
+    try:
+        items = _json.loads(row[0]) or []
+    except Exception:
+        return None
+    from app.models import TradeTicketMap
+    src = {str(m.client_ticket): _source(m.master_ticket)
+           for m in db.query(TradeTicketMap).filter(TradeTicketMap.license_id == lic.id).all() if m.client_ticket}
+    at = row[1]
+    if isinstance(at, str):
+        try:
+            at = datetime.fromisoformat(at.replace("Z", "+00:00"))
+        except ValueError:
+            at = None
+    if at is not None and at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    for it in items:
+        c = (it.get("comment") or "").lower()
+        it["source"] = src.get(str(it.get("ticket"))) or ("AI" if "nolimitz ai" in c or "desk" in c
+                                                          else "TELEGRAM" if "telegram" in c or c.startswith("tg")
+                                                          else "MASTER" if "copier" in c else "MANUAL")
+    return {"items": items, "at": at.isoformat() if at else None,
+            "age_sec": round((datetime.now(timezone.utc) - at).total_seconds()) if at else None}
+
+
 @router.get("/api/client/desk/view")
 def client_desk_view(license_key: str = Query(..., max_length=128), db: Session = Depends(get_db)):
     """The Desk as THIS user sees it: their own balance, their own Desk trades, and each agent's card
@@ -558,6 +596,7 @@ def client_desk_view(license_key: str = Query(..., max_length=128), db: Session 
                    "guard": guard()},
         "gold": {"bias": xau.get("bias"), "bid": xau.get("bid"), "ask": xau.get("ask")},
         "open_trades": open_list,
-        "position_sources": sources,         # MT5 ticket -> AI | MASTER | TELEGRAM, for labelling live positions
+        "position_sources": sources,
+        "positions": _account_positions(db, lic, _account(db, lic)),   # all open MT5 positions, any source         # MT5 ticket -> AI | MASTER | TELEGRAM, for labelling live positions
         "activity": _my_activity(db, lic),
     }

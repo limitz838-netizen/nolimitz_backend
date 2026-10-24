@@ -623,9 +623,11 @@ function renderUser(dn,ss){
     :`The AI is <b>not trading your account</b> · ${esc(V.off_reason||'turn the AI Auto Trader ON')}`)+nxt);
   // EVERYTHING open on my MT5: AI (Desk), master copier and Telegram trades, with SL/TP
   const SRC=V.position_sources||{}, SC={AI:'#4ade80',MASTER:'#60a5fa',TELEGRAM:'#a78bfa',MANUAL:'#9aa5b5'};
-  const lps=Object.values(LIVEPOS);
+  // Prefer the account snapshot the VPS saves every cycle (all sources); fall back to what the dashboard sent.
+  const snap=V.positions&&V.positions.items&&(V.positions.age_sec==null||V.positions.age_sec<900)?V.positions:null;
+  const lps=snap?snap.items:Object.values(LIVEPOS);
   const ot=V.open_trades||[];
-  let list=lps.map(p=>{const src=(SRC[String(p.ticket)]||{}).source||'MANUAL';return {src,sym:p.symbol,side:(p.side||p.type||'').toLowerCase(),lot:p.lot,entry:p.entry,sl:p.sl,tp:p.tp,profit:p.profit==null?null:+p.profit,mg:null,ticket:String(p.ticket)}});
+  let list=lps.map(p=>{const src=p.source||(SRC[String(p.ticket)]||{}).source||'MANUAL';return {src,sym:p.symbol,side:(p.side||p.type||'').toLowerCase(),lot:p.lot,entry:p.entry,sl:p.sl,tp:p.tp,profit:p.profit==null?null:+p.profit,mg:null,ticket:String(p.ticket)}});
   // AI trades the dashboard has not reported yet still show
   ot.forEach(o=>{if(!list.some(x=>x.ticket===String(o.client_ticket)))list.push({src:'AI',sym:o.symbol,side:o.side,lot:null,entry:null,sl:null,tp:null,profit:null,ticket:String(o.client_ticket)})});
   list.forEach(x=>{const o=ot.find(o=>String(o.client_ticket)===x.ticket);if(o&&o.management)x.mg=o.management});
@@ -633,12 +635,12 @@ function renderUser(dn,ss){
   setText($('#posTitle'),'MY MT5 POSITIONS');
   setText($('#posEq'),fmt(eq)+' $');
   const nAI=list.filter(x=>x.src==='AI').length;
-  setText($('#posMeta'),`${list.length} open · ${nAI} by the AI`);
+  setText($('#posMeta'),`${list.length} open \u00b7 ${nAI} by the AI${snap&&snap.age_sec!=null?` \u00b7 updated ${snap.age_sec<90?snap.age_sec+'s':Math.round(snap.age_sec/60)+' min'} ago`:''}`);
   const pc=$('#posChg');setText(pc,known?(tot>=0?'+':'-')+fmt(Math.abs(tot))+' $':' ');pc.style.color=tot>=0?'var(--up)':'var(--down)';
   setText($('#posCash'),`balance ${fmt(bal)} $`);
   const pp=$('#posPct');setText(pp,fl==null?' ':`floating ${fl>=0?'+':'-'}${fmt(Math.abs(fl))} $`);pp.style.color=(fl||0)>=0?'var(--up)':'var(--down)';
   const nm=x=>esc(String(x||'').replace(/USD.*$/i,m=>m.length>3?'':''))||'--';
-  setHTML($('#posList'),list.length?list.map(x=>{const dg=/XAU|BTC|US30|NAS|SPX|GER/i.test(x.sym||'')?2:/JPY/i.test(x.sym||'')?3:5;const buy=/buy|long|^0$/.test(x.side);const sell=/sell|short|^1$/.test(x.side);
+  setHTML($('#posList'),list.length?list.map(x=>{const dg=/XAU|GOLD|XAG|SILVER|BTC|US30|NAS|SPX|GER|USTEC/i.test(x.sym||'')?2:/JPY/i.test(x.sym||'')?3:5;const buy=/buy|long|^0$/.test(x.side);const sell=/sell|short|^1$/.test(x.side);
     return `<div class="p" style="flex-wrap:wrap"><span><span style="color:${SC[x.src]};font-weight:700">${x.src}</span> <span class="x">${esc(x.sym||'')}</span> ${buy?'<span class="L">BUY</span>':sell?'<span class="S">SELL</span>':''}${x.lot?' '+esc(x.lot):''}${x.entry?' @ '+fmt(+x.entry,dg):''}</span><span class="${(x.profit||0)>=0?'L':'S'}">${x.profit==null?'open':(x.profit>=0?'+':'-')+fmt(Math.abs(x.profit))+'$'}</span>
       <span style="flex-basis:100%;color:var(--dim);font-size:.92em">SL ${x.sl?fmt(+x.sl,dg):'--'} · TP ${x.tp?fmt(+x.tp,dg):'--'}${x.mg?' · '+esc(x.mg):''}</span></div>`}).join(''):'<div class="empty">no open trades on my account</div>');
   setText($('#posFoot'),V.gold_lot?`AI gold lot ${V.gold_lot} · ${V.risk_mode} · ${V.trades_per_signal} trade${V.trades_per_signal>1?'s':''} per signal${V.estimate?` · risk ≈ $${fmt(V.estimate.risk_usd)} per signal`:''} · change these in Settings`:'set a gold (XAUUSD) lot size in Settings');
