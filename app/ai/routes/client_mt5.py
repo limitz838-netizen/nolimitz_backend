@@ -373,6 +373,10 @@ def start_ai(data: AIToggle, db: Session = Depends(get_db)):
 
     account.ai_auto_trade = True
     account.signal_cutoff_at = datetime.utcnow()
+    # ONE switch (26 Oct): also switch the copier on (licences.execution_enabled), the flag the VPS
+    # copier checks. Before this, a failed robot/start left users "AI ON" but every trade skipped.
+    license_row.execution_enabled = True
+    license_row.execution_started_at = datetime.now(timezone.utc)
 
     db.commit()
 
@@ -400,6 +404,7 @@ def stop_ai(data: AIToggle, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="No MT5 account connected")
 
     account.ai_auto_trade = False
+    license_row.execution_enabled = False            # one switch: orb OFF pauses ALL new trades (16 Oct)
     db.commit()
     logger.info("⏹️ AI STOPPED: login=%s (open positions will continue being managed until they close)",
                account.login)

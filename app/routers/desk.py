@@ -325,6 +325,10 @@ def client_desk_start(data: DeskLicence, db: Session = Depends(get_db)):
             "per Desk trade, more than your balance. Lower the gold lot or set risk mode to Normal."))
     acct = _account(db, lic)
     acct.ai_auto_trade = True
+    # ONE switch (26 Oct): the copier only opens trades when licences.execution_enabled is on, so the orb
+    # must switch it too - otherwise users see "AI ON" while every trade is skipped as "robot stopped".
+    lic.execution_enabled = True
+    lic.execution_started_at = datetime.now(timezone.utc)
     db.commit()
     out = _desk_status(db, lic)
     out["message"] = "AI Auto Trader ON: the Desk's next gold trade opens on your account with your own lot and risk mode."
@@ -338,7 +342,8 @@ def client_desk_stop(data: DeskLicence, db: Session = Depends(get_db)):
     acct = _account(db, lic)
     if acct is not None:
         acct.ai_auto_trade = False
-        db.commit()
+    lic.execution_enabled = False                    # one switch: orb OFF pauses ALL new trades (16 Oct)
+    db.commit()
     out = _desk_status(db, lic)
     out["message"] = "AI Auto Trader OFF: no new trades. Open Desk trades are still managed until they close."
     return out
