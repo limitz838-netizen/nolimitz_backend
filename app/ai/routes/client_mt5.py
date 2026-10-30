@@ -193,6 +193,10 @@ def save_mt5_account(data: MT5AccountCreate, db: Session = Depends(get_db)):
     if not license_row:
         raise HTTPException(status_code=400, detail="Invalid license key")
 
+    # 30 Oct: the master / AI Desk logins can never become customer accounts (copy-loop incidents)
+    from app.services.protected_logins import refuse_if_protected
+    refuse_if_protected(db, data.login)
+
     risk_level = normalize_risk_level(data.risk_level)
 
     account = db.query(ClientMT5Account).filter(

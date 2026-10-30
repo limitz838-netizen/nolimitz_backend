@@ -256,6 +256,8 @@ async def save_client_mt5(
     metaapi_service: MetaApiService = Depends(get_metaapi_service),
 ):
     license_row = get_license_by_key(payload.license_key, db)
+    from app.services.protected_logins import refuse_if_protected   # 30 Oct: no master / Desk logins
+    refuse_if_protected(db, payload.mt_login)
 
     # Get or create MT5 account record
     row = db.query(ClientMT5Account).filter(
