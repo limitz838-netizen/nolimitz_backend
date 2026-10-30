@@ -419,7 +419,8 @@ def _next_setup(xau: dict, online: bool, mkt_open: bool, in_trade: bool) -> str:
     if not mkt_open:
         return "Gold is closed. The AI starts watching again when the market reopens."
     if in_trade:
-        return "The AI is managing your open gold trade: stop to breakeven at +1R, then a trailing stop."
+        return ("The AI is managing your open gold trade: it closes at the take profit (at least $13 per 0.01 lot), "
+                "at the stop loss, or early if the gold trend flips.")
     c = xau.get("checks") or {}
     b = xau.get("bias") or 0
     e = xau.get("ema20")
@@ -515,7 +516,7 @@ def client_desk_view(license_key: str = Query(..., max_length=128), db: Session 
             elif locked:
                 state = "trailing stop, profit locked"
             else:
-                state = "original stop · breakeven at +1R"
+                state = "stop loss and take profit set · closes early if the trend flips"
         open_list.append({"symbol": m.symbol, "client_ticket": m.client_ticket, "master_ticket": m.master_ticket,
                           "side": side, "management": state,
                           "opened_at": m.created_at.isoformat() if m.created_at else None})

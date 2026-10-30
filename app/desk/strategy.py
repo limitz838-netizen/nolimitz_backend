@@ -299,3 +299,28 @@ STRATEGY_FLAGS = {"pullback": dict(be=True, trail=True, flip=True, time_exit_h=N
 def flags(name: str) -> dict:
     """Management rules per strategy (anything not listed: breakeven only, like the squeeze family)."""
     return STRATEGY_FLAGS.get(name, dict(be=True, trail=False, flip=False, time_exit_h=None))
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Step 29 (30 Oct 2026): GOLD SCALP EXIT - same entries as "pullback", but the take profit is AT LEAST
+# $13 per 0.01 lot (13.0 price points on gold), or 1 x H1 ATR when gold moves faster. Stop stays 1.5 ATR,
+# no breakeven / trailing (the target is reached before +1R), still closes early if the H4 trend flips.
+# Tested on the same history as the live rule (desk_research/scalp13/tp13_test.py): win rate 61-65% (live
+# rule 35-37%); net per 0.01 lot DEV +$130 / VAL +$255 / Jan-Oct 2026 +$622 (live: +$145 / -$20 / +$531);
+# 9 of 11 quarters up. Average loss is still larger than the average win - the edge is the higher hit rate.
+# ---------------------------------------------------------------------------------------------------------
+TP_MIN_POINTS = 13.0
+
+
+def evaluate_pullback_scalp(h1_closed: List[dict], bias: int) -> Decision:
+    d = evaluate(h1_closed, bias)
+    d.strategy, d.trail, d.breakeven, d.flip_exit = "pullback_s", False, False, True
+    if d.atr > 0:
+        d.target_mult = max(TP_MIN_POINTS, d.atr) / d.atr
+    return d
+
+
+STRATEGIES["pullback_s"] = evaluate_pullback_scalp
+RULES_TEXT["pullback_s"] = ("H4 EMA50/200 bias \u00b7 H1 EMA20 pullback \u00b7 stop 1.5 ATR \u00b7 "
+                            "take profit max($13 per 0.01 lot, 1 ATR) \u00b7 closes if the H4 trend flips")
+STRATEGY_FLAGS["pullback_s"] = dict(be=False, trail=False, flip=True, time_exit_h=None)

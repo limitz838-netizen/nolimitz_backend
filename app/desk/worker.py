@@ -567,7 +567,7 @@ class Desk:
                 self.record_close(row)
                 continue
             # H4 bias flip against us -> close (pullback rules only)
-            if rules == "pullback" and self.bias.get(canon, 0) == -row.direction:
+            if S.flags(rules)["flip"] and self.bias.get(canon, 0) == -row.direction:      # STEP29
                 if self.close_position(pos, "bias flip"):
                     self.event("exit", f"{canon} H4 trend flipped \u00b7 closing", canon, "warn")
                 continue
@@ -593,7 +593,7 @@ class Desk:
                 best = min([float(x["low"]) + spread for x in (m15 if m15 is not None else [])] + [tick.ask, row.entry_price])
             risk = abs(row.entry_price - row.initial_stop)
             new = S.manage_stop(row.direction, row.entry_price, pos.sl or row.current_stop, risk, best, row.atr_at_entry,
-                                trail=(rules == "pullback"))
+                                trail=S.flags(rules)["trail"])                   # STEP29
             if new is None:
                 continue
             new = round(new, s["digits"])
@@ -654,7 +654,7 @@ class Desk:
                 exit_t = t + 900
                 break
             st["best"] = max(st["best"], h) if d > 0 else min(st["best"], l + sp)
-            new = (S.manage_stop(d, entry, st["sl"], risk, st["best"], row.atr_at_entry, trail=(rules == "pullback"))
+            new = (S.manage_stop(d, entry, st["sl"], risk, st["best"], row.atr_at_entry, trail=S.flags(rules)["trail"])
                    if S.flags(rules)["be"] else None)           # STEP23
             if new is not None and (new - st["sl"]) * d > 0:
                 st["sl"] = new
@@ -673,7 +673,7 @@ class Desk:
                     reason = "breakeven" if abs(sl - entry) < 1e-12 else ("trail" if (sl - entry) * d > 0 else "stop")
                 elif (px - tp) * d >= 0:
                     exit_px, reason = tp, "target"
-                elif rules == "pullback" and self.bias.get(row.symbol, 0) == -d:
+                elif S.flags(rules)["flip"] and self.bias.get(row.symbol, 0) == -d:   # STEP29
                     exit_px, reason = px, "bias_flip"
                 elif S.flags(rules)["time_exit_h"] and now >= opened.timestamp() + S.flags(rules)["time_exit_h"] * 3600:
                     exit_px, reason = px, "time"                # STEP23

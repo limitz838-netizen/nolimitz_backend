@@ -425,7 +425,7 @@ function drawOffice(t){
   for(let r=0;r<8;r++){const p=P(1.2,0.55,12+r*8.5);c.fillStyle=online&&(Math.sin(t*4+r*1.7)>0.2)?'#34d399':'#1d4d3a';c.fillRect(p[0]+2,p[1]-2,2,2);c.fillStyle=online&&(Math.sin(t*3+r)>0.6)?'#5ad1e6':'#163a44';c.fillRect(p[0]+7,p[1]+1,2,2)}
   { const p=P(0.75,0.75,82);c.strokeStyle='#8aa0b8';c.lineWidth=1.2;c.beginPath();c.moveTo(p[0],p[1]);c.lineTo(p[0],p[1]-10);c.stroke();c.beginPath();c.ellipse(p[0]+3,p[1]-13,7,3.5,-0.5,0,7);c.stroke();
     if(online){c.strokeStyle='rgba(90,209,230,'+(0.3+0.3*Math.sin(t*3))+')';c.beginPath();c.arc(p[0]+6,p[1]-18,5,-2.2,-0.9);c.stroke();c.beginPath();c.arc(p[0]+6,p[1]-18,9,-2.2,-0.9);c.stroke()} }
-  const now=performance.now(), asleep=!online||(UM()&&!VIEW.following);
+  const now=performance.now(), asleep=!online;   /* step 29: the office always works while the Desk is online - your account or not */
   const items=[];
   for(const a of AG){const L=LAY[a.id];
     items.push({d:L.desk[0]+L.desk[1]+1.2,f:()=>{const[x,y]=L.desk;box(c,x,y,1.7,0.9,17,'#1b2534','#121a27','#16202e','rgba(90,209,230,.12)');
@@ -443,7 +443,7 @@ function drawOffice(t){
     c.globalAlpha=1}
   for(const a of AG){const L=LAY[a.id],h=a._head;label(c,h[0],h[1],h[0]+L.lab[0],h[1]+L.lab[1],a.n,cardTxt(a.id,now),a.c,(activeUntil[a.id]||0)>now)}
   const ch=chief._head, ss=symState();
-  const chiefTxt=UM()&&!VIEW.following?'not trading your account':UM()&&R&&R.online&&!(ss&&!ss.open)?'working on YOUR account':!R?'connecting\u2026':!R.online?'Desk offline':(ss&&!ss.open)?'market closed \u00b7 resting':(ss&&ss.shadow)?'paper-trading '+sym():'watching '+sym();
+  const chiefTxt=UM()&&!VIEW.following?'working \u00b7 not on your account yet':UM()&&R&&R.online&&!(ss&&!ss.open)?'working on YOUR account':!R?'connecting\u2026':!R.online?'Desk offline':(ss&&!ss.open)?'market closed \u00b7 resting':(ss&&ss.shadow)?'paper-trading '+sym():'watching '+sym();
   label(c,ch[0],ch[1]+60,92,338,'CHIEF',chiefTxt,'#67e8f9',false);
   for(let i=fx.length-1;i>=0;i--){const f=fx[i],age=t-f.t0;if(age>2){fx.splice(i,1);continue}
     const y=f.y-age*22;c.globalAlpha=Math.min(1,(2-age)*1.5);c.font='700 13px "JetBrains Mono", monospace';const w=c.measureText(f.txt).width+14;
@@ -649,7 +649,7 @@ function renderUser(dn,ss){
   setText($('#chSym'),'XAU (Gold)');
   const ce=$('#chPx');const lv=ss&&(ss.bid||(ss.candles&&ss.candles.length?ss.candles[ss.candles.length-1][4]:null));
   setText(ce,lv?fmt(lv,dg):'--');ce.style.color=ss&&ss.open?'var(--up)':'var(--dim)';
-  setText($('#officeL'),`BOT OFFICE · ${dn} · ${V.following?'working on MY account':'idle · not on my account'}`);
+  setText($('#officeL'),`BOT OFFICE · ${dn} · ${V.following?'working on MY account':'working · live on the AI demo'}`);
   setText($('#officeR'),'XAUUSD · real candles');
   // The Desk shows only the AI agent feed. Trade activity lives in the app's Trade Activity card.
   setText($('#logT'),'AI AGENT FEED · '+dn);

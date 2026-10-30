@@ -29,6 +29,10 @@ FIX = {
                  "your risk mode in Settings if you want the AI's trades to fit alongside your other trades.",
     "robot stopped": "The AI Auto Trader is switched off on your account. Switch it on in your dashboard.",
     "margin": "Your account did not have enough free margin. Lower your lot size or add funds.",
+    "stale": "Your account's turn in the copier queue came too late to enter safely at the AI's price.",
+    "price moved": "Gold had already moved too far from the AI's entry by the time your account was reached, "
+                   "so the trade was skipped to protect you.",
+    "insufficient balance": "Your account balance is too low for this trade. Deposit to resume.",
 }
 
 
@@ -74,8 +78,8 @@ def _run(master_ticket: str, symbol: str, action: str, attempt: int = 1, only=No
                 subj = f"AI Desk opened {side} {symbol} on your account"
                 lines = [f"The AI Desk just opened {len(done)} {side} trade{'s' if len(done) > 1 else ''} on {symbol} "
                          f"on your MT5 account ({lots:.2f} lots in total, using your own lot size and risk mode).",
-                         "A stop loss and take profit were set. The AI moves the stop to breakeven at +1R and then "
-                         "trails it. Watch it live in the Desk tab of your dashboard."]
+                         "A stop loss and take profit were set (take profit at least $13 per 0.01 lot). The AI "
+                         "closes it early if the gold trend flips. Watch it live in the Desk tab of your dashboard."]
             elif bad:
                 reason = bad[0].error_message or bad[0].status
                 subj = f"AI Desk could not open a {symbol} trade on your account"
