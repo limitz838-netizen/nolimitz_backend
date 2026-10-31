@@ -708,6 +708,7 @@ def parse_signal(text, extra_symbols=None):
                 f"'{t}' is a price range, not a single entry.")
 
     accepted = [d]
+    spaced_zone = False
     for step in (-1, 1):
         i = d + step
         while 0 <= i < len(tokens):
@@ -719,7 +720,25 @@ def parse_signal(text, extra_symbols=None):
             elif tok in _STOP_WORDS:
                 entry_type = "STOP"
             elif re.fullmatch(_NUM, tok):
+                # "GOLD SELL NOW 3982 - 3986": the lone dash is stripped, so a
+                # spaced range arrives as two numbers. When the author said
+                # NOW/MARKET it is where price was, exactly like "3982-3986"
+                # above: recorded as the zone, executed at market. Without
+                # NOW it is still refused -- the order type is then unknown.
+                if spaced_zone:
+                    raise Refusal(
+                        "entry_ambiguous",
+                        "More than two prices given for the entry.")
                 if entry_price is not None:
+                    if market_explicit and entry_type == "MARKET":
+                        lo, hi = sorted((entry_price, _to_float(tok)))
+                        entry_zone = entry_zone or (
+                            f"{lo:g}-{hi:g}")
+                        entry_price = None
+                        spaced_zone = True
+                        accepted.append(i)
+                        i += step
+                        continue
                     raise Refusal(
                         "entry_ambiguous",
                         "More than one entry price. A price range cannot be "
