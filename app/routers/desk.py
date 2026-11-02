@@ -429,13 +429,13 @@ def _next_setup(xau: dict, online: bool, mkt_open: bool, in_trade: bool) -> str:
     if not b:
         return "No clear 4-hour trend in gold. The AI waits for one before trading."
     if c and not c.get("session", True):
-        return f"Gold trend is {side}. The AI trades from 07:00 to 20:00 UTC and resumes then."
+        return f"Gold trend is {side}. The AI trades from 01:00 to 21:00 UTC and resumes then."
     if c and not c.get("regime", True):
         return f"Gold trend is {side}, but the market is moving unusually. The AI waits for normal conditions."
     if not c.get("pullback"):
         return f"Gold trend is {side}. The AI {verb} when price pulls back to about {lvl} and turns {'up' if b > 0 else 'down'}."
     return (f"Gold has pulled back to about {lvl}. The AI {verb} as soon as a 1-hour candle closes "
-            f"{'above the previous high' if b > 0 else 'below the previous low'}.")
+            f"{'up, above that level' if b > 0 else 'down, below that level'}.")
 
 
 def _account_positions(db: Session, lic, acct) -> Optional[dict]:

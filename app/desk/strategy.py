@@ -110,7 +110,7 @@ class Decision:
         return self.target_mult * self.atr
 
 
-def evaluate(h1_closed: List[dict], bias: int) -> Decision:
+def evaluate(h1_closed: List[dict], bias: int, loose: bool = False, session: tuple = None) -> Decision:   # STEP33
     """Decide on the most recent CLOSED H1 bar. h1_closed is oldest first."""
     d = Decision(bias=bias)
     if len(h1_closed) < MIN_H1_BARS:
@@ -128,12 +128,17 @@ def evaluate(h1_closed: List[dict], bias: int) -> Decision:
     recent = h1_closed[-PULLBACK_LOOKBACK:]
     touched_long = min(b["l"] for b in recent) <= d.ema20
     touched_short = max(b["h"] for b in recent) >= d.ema20
-    trig_long = last["c"] > prev["h"] and last["c"] > d.ema20
-    trig_short = last["c"] < prev["l"] and last["c"] < d.ema20
+    if loose:   # STEP33: candle closes in the trend direction, no need to break the previous bar
+        trig_long = last["c"] > last["o"] and last["c"] > d.ema20
+        trig_short = last["c"] < last["o"] and last["c"] < d.ema20
+    else:
+        trig_long = last["c"] > prev["h"] and last["c"] > d.ema20
+        trig_short = last["c"] < prev["l"] and last["c"] < d.ema20
+    s0, s1 = session or (SESSION_START_UTC, SESSION_END_UTC)
 
     d.checks = {
         "bias": bias,
-        "session": SESSION_START_UTC <= d.entry_hour_utc < SESSION_END_UTC,
+        "session": s0 <= d.entry_hour_utc < s1,
         "regime": ATR_RATIO_MIN <= d.atr_ratio <= ATR_RATIO_MAX,
         "pullback": touched_long if bias > 0 else touched_short if bias < 0 else False,
         "trigger": trig_long if bias > 0 else trig_short if bias < 0 else False,
@@ -310,10 +315,16 @@ def flags(name: str) -> dict:
 # 9 of 11 quarters up. Average loss is still larger than the average win - the edge is the higher hit rate.
 # ---------------------------------------------------------------------------------------------------------
 TP_MIN_POINTS = 13.0
+# Step 33 (2 Nov 2026): more gold entries. Exness backtest, 1 trade at a time, per 0.01 lot, same exits:
+#   live (break trigger, 07-20 UTC):  -$96 / +$180 / +$292   ~5-6 trades/week
+#   this (loose trigger, 01-21 UTC):  +$250 / +$352 / +$869  ~7-9.5 trades/week, max drawdown similar
+# (periods May24-Jul25 / Aug25-Jan26 / Jan26-Oct26; desk_research/modes/session_check.py)
+PS_LOOSE_TRIGGER = True
+PS_SESSION_UTC = (1, 21)
 
 
 def evaluate_pullback_scalp(h1_closed: List[dict], bias: int) -> Decision:
-    d = evaluate(h1_closed, bias)
+    d = evaluate(h1_closed, bias, loose=PS_LOOSE_TRIGGER, session=PS_SESSION_UTC)   # STEP33
     d.strategy, d.trail, d.breakeven, d.flip_exit = "pullback_s", False, False, True
     if d.atr > 0:
         d.target_mult = max(TP_MIN_POINTS, d.atr) / d.atr
@@ -321,6 +332,6 @@ def evaluate_pullback_scalp(h1_closed: List[dict], bias: int) -> Decision:
 
 
 STRATEGIES["pullback_s"] = evaluate_pullback_scalp
-RULES_TEXT["pullback_s"] = ("H4 EMA50/200 bias \u00b7 H1 EMA20 pullback \u00b7 stop 1.5 ATR \u00b7 "
+RULES_TEXT["pullback_s"] = ("H4 EMA50/200 bias \u00b7 H1 EMA20 pullback, candle turns with the trend \u00b7 01-21 UTC \u00b7 stop 1.5 ATR \u00b7 "
                             "take profit max($13 per 0.01 lot, 1 ATR) \u00b7 closes if the H4 trend flips")
 STRATEGY_FLAGS["pullback_s"] = dict(be=False, trail=False, flip=True, time_exit_h=None)
