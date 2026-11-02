@@ -134,6 +134,9 @@ def _is_closure(upper, words):
 _ALL_WORDS = {"ALL", "EVERYTHING", "EVERY"}
 
 _NUM = r"\d+(?:[.,]\d+)?"
+_RE_TP_INDEX_COLON = re.compile(r"\b(TP|TARGET|TGT|TG)\s+([1-9])\s*[:=]", re.I)
+_RE_UPDATE_WORDS = re.compile(
+    r"\b(?:PIPS?|PROFIT|PROFITS|HIT|SECURED|BOOKED|CLOSED|RUNNING\s+\d)\b", re.I)
 
 # A labelled stop loss, with its value. Deliberately strict: the number must
 # follow the label with only punctuation between them. "SL below 2640" does NOT
@@ -531,6 +534,11 @@ def parse_signal(text, extra_symbols=None):
     market_explicit = (bool(_RE_MARKET_ANY.search(upper))
                        and not _RE_PENDING_ANY.search(upper))
 
+    # "TP 1 : 3898.70" / "TP 3 : OPEN" -- a numbered target written with a
+    # space before the colon. Unjoined, the regex below reads the INDEX as the
+    # price: TPs 1, 2 and 3 on a gold buy. Join it to "TP1:" first.
+    upper = _RE_TP_INDEX_COLON.sub(lambda mm: mm.group(1) + mm.group(2) + ":", upper)
+
     # ---- pull the labelled fields out of the whole message ----------------
     tp_unspecified = False
     stop_loss = None
@@ -587,6 +595,25 @@ def parse_signal(text, extra_symbols=None):
     # tradeable signal, and refusing it taught the user the copier was broken.
     if not take_profits and _RE_TP_MENTION.search(upper):
         tp_unspecified = True
+
+    # A target that cannot be a price for this instrument is an index or a pip
+    # count that slipped through. Judged against the stop loss, which is a real
+    # price on the same scale: gold at 3886 cannot take profit at 2.
+    if stop_loss:
+        take_profits = [t for t in take_profits
+                        if 0.5 * stop_loss <= t <= 2.0 * stop_loss]
+
+    # "GOLD SELL RUNNING 50 Pips Profit", "TP1 HIT +40 pips" -- progress posts
+    # about a trade that is already open. With no stop, no target and no entry
+    # there is nothing here to open, and reading "50" as an entry would open a
+    # second, unprotected position. (A recap listing several trades is left
+    # to the multiple_signals refusal below.)
+    if (stop_loss is None and not take_profits and entry_price_labelled is None
+            and _RE_UPDATE_WORDS.search(upper)
+            and len([w for w in re.findall(r"[A-Z]+", upper)
+                     if w in _BUY_WORDS or w in _SELL_WORDS]) == 1):
+        raise Refusal("not_a_signal",
+                      "Progress update about an open trade, not a new signal.")
 
     m = _RE_ENTRY.search(upper)
     if m:
