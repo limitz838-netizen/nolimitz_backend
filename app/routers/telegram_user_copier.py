@@ -445,6 +445,10 @@ def _order_comment(src) -> str:
 # DEFAULT_RISK is "medium", not "normal". An account with no risk_level set gets
 # three positions, not one.
 RISK_CAPS = {"normal": 1, "medium": 3, "aggressive": 5}
+
+# Lot used when a Telegram signal names an instrument the customer never set up
+# (no symbol row at all) or set up without a lot. The smallest standard lot.
+TG_DEFAULT_LOT = "0.01"
 DEFAULT_RISK = "medium"
 
 
@@ -1561,15 +1565,45 @@ def incoming_signal(data: IncomingSignal,
     # where the lot comes from, and the executor refuses a symbol with no lot.
     setting = find_setting(db, lic.id, symbol_canon)
     if not setting:
-        return finish("REFUSED_RISK",
-                      f"{symbol_raw} is not enabled in your settings")
+        # Most Telegram customers never open the MetaTrader 5 symbol page, so
+        # they have no row for the instrument at all and every signal was
+        # refused "not enabled". No row = never chosen, not "switched off":
+        # create one at the smallest lot and copy. A row the customer DID
+        # switch off is still respected.
+        if not symbol_canon:
+            return finish("REFUSED_RISK",
+                          f"{symbol_raw} is not an instrument we recognise")
+        switched_off = [
+            row for row in db.query(ClientSymbolSetting).filter(
+                ClientSymbolSetting.license_id == lic.id,
+                ClientSymbolSetting.enabled == False,  # noqa: E712
+            ).all()
+            if canonical(row.symbol_name) == symbol_canon
+        ]
+        if switched_off:
+            return finish("REFUSED_RISK",
+                          f"{symbol_raw} is switched OFF in your MetaTrader 5 "
+                          f"symbols - switch it on to copy it")
+        setting = ClientSymbolSetting(
+            license_id=lic.id,
+            symbol_name=symbol_canon,
+            enabled=True,
+            lot_size=TG_DEFAULT_LOT,
+            trade_direction="both",
+        )
+        db.add(setting)
+        db.flush()
+        logger.info("telegram: auto-enabled %s at lot %s for licence %s",
+                    symbol_canon, TG_DEFAULT_LOT, lic.id)
     try:
         lot = float(setting.lot_size or 0)
     except (TypeError, ValueError):
         lot = 0.0
     if lot <= 0:
-        return finish("REFUSED_RISK",
-                      f"no lot size set for {symbol_raw} in your settings")
+        # Enabled but no lot typed: the smallest lot rather than a refusal.
+        setting.lot_size = TG_DEFAULT_LOT
+        db.flush()
+        lot = float(TG_DEFAULT_LOT)
 
     if parsed["entry_type"] in ("LIMIT", "STOP"):
         # Parsed correctly, and refused. NEVER converted to market: a BUY LIMIT
