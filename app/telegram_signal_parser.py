@@ -670,7 +670,13 @@ def parse_signal(text, extra_symbols=None):
     # -- which is how half these channels type -- left the token as XAUUSD!!!!,
     # matched nothing, and the signal was refused with no_symbol.
     _EDGE = ".-|/!?*\"'"
-    tokens = [t.strip(_EDGE) for t in re.split(r"[\s,;:]+", head_line)
+    # A Telegram hashtag in front of the instrument -- "#XAUUSD SELL 3996" --
+    # is how many channels tag their posts. Drop a leading # or $ only when a
+    # LETTER follows, so "#XAUUSD" -> XAUUSD while "#79417760" (a ticket
+    # number) still stops the scan and can never become the entry price.
+    def _dehash(t):
+        return t.lstrip("#$") if re.fullmatch(r"[#$]+[A-Z][A-Z0-9()]*", t) else t
+    tokens = [_dehash(t.strip(_EDGE)) for t in re.split(r"[\s,;:]+", head_line)
               if t.strip(_EDGE)]
 
     dir_idx = [i for i, t in enumerate(tokens)
