@@ -49,7 +49,7 @@
 import os
 import time
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone  # STEP40
 from typing import Callable, Dict, List, Optional, Tuple
 
 import MetaTrader5 as mt5
@@ -677,6 +677,13 @@ def _client_closed_it_themselves(db: Session, row: TradeExecution) -> bool:
 # entry ("off:0" = breakeven), because brokers quote gold slightly differently: a copied price level
 # could land on the wrong side on another broker. Lot and number of trades stay the user's own.
 DESK_WARN_PCT = float(os.environ.get("DESK_WARN_PCT", "10"))
+# STEP40 risk cap (Desk rows only): all copies of one signal may lose at most DESK_RISK_PCT of equity at the
+# stop - the lot (then the number of copies) is lowered to fit, never raised. If even one minimum lot is over
+# that, ONE minimum-lot trade is still allowed up to DESK_SMALL_MAX_PCT (labelled HIGH RISK), else skipped.
+# After the account has lost DESK_DAY_STOP_PCT today, Desk entries pause until the next UTC day.
+DESK_RISK_PCT = float(os.environ.get("DESK_RISK_PCT", "5"))
+DESK_SMALL_MAX_PCT = float(os.environ.get("DESK_SMALL_MAX_PCT", "10"))
+DESK_DAY_STOP_PCT = float(os.environ.get("DESK_DAY_STOP_PCT", "10"))
 
 
 def _desk_levels(row, broker_symbol):
@@ -722,6 +729,66 @@ def _desk_guard(broker_symbol, action, lot, sl, count):
     pct = 100.0 * risk / eq
     note = f"Desk: {count} x {lot_n} lot, risk {risk:.2f} {cur} = {pct:.1f}% of {eq:.2f}"
     return True, note + (" - HIGH RISK" if pct > DESK_WARN_PCT else "")
+
+
+def _desk_today_pl(eq, bal):
+    """Today's (UTC) result on this account: closed trades + what is open now. None if unreadable."""
+    try:
+        now = datetime.now(timezone.utc)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        deals = mt5.history_deals_get(start.replace(tzinfo=None), (now + timedelta(days=1)).replace(tzinfo=None))
+        if deals is None:
+            return None
+        closed = sum(float(d.profit) + float(d.commission) + float(d.swap) + float(getattr(d, "fee", 0) or 0)
+                     for d in deals if int(d.type) in (0, 1))      # trades only - deposits/withdrawals ignored
+        return closed + (eq - bal)
+    except Exception:
+        return None
+
+
+def _desk_size(broker_symbol, action, lot, sl, count):
+    """STEP40. (allowed, note, lot, count) - the risk cap. Never raises the lot or the number of copies."""
+    tick, acc, info = mt5.symbol_info_tick(broker_symbol), mt5.account_info(), mt5.symbol_info(broker_symbol)
+    if not tick or acc is None or info is None:
+        ok, note = _desk_guard(broker_symbol, action, lot, sl, count)
+        return ok, note, lot, count
+    buy = (action or "").lower() == "buy"
+    ref = tick.ask if buy else tick.bid
+    lot_n, _ = _normalise_lot(broker_symbol, lot)
+    loss = mt5.order_calc_profit(mt5.ORDER_TYPE_BUY if buy else mt5.ORDER_TYPE_SELL,
+                                 broker_symbol, 1.0, float(ref), float(sl))
+    eq, bal, cur = float(acc.equity or 0), float(acc.balance or 0), (getattr(acc, "currency", "") or "")
+    if loss is None or eq <= 0:
+        ok, note = _desk_guard(broker_symbol, action, lot, sl, count)
+        return ok, note, lot, count
+    per_lot = abs(float(loss))                                     # loss at the stop for 1.0 lot
+    day = _desk_today_pl(eq, bal)
+    if day is not None and day < 0 and (eq - day) > 0 and -day >= DESK_DAY_STOP_PCT / 100.0 * (eq - day):
+        return False, (f"Desk paused for today: this account is down {-day:.2f} {cur} "
+                       f"({100.0 * -day / (eq - day):.1f}%) today, limit {DESK_DAY_STOP_PCT:g}% - resumes tomorrow"), lot, count
+    vmin = float(getattr(info, "volume_min", 0.01) or 0.01)
+    vstep = float(getattr(info, "volume_step", 0.01) or 0.01)
+    budget = eq * DESK_RISK_PCT / 100.0
+    use_lot, use_n = None, None
+    for n in range(int(count), 0, -1):
+        fit = int((budget / (n * per_lot) + 1e-9) / vstep) * vstep if per_lot > 0 else lot_n
+        fit = round(min(lot_n, fit), 8)
+        if fit >= vmin - 1e-9:
+            use_lot, use_n = fit, n
+            break
+    if use_lot is None:
+        risk = vmin * per_lot
+        if risk <= eq * DESK_SMALL_MAX_PCT / 100.0:
+            return True, (f"Desk: 1 x {vmin:g} lot, risk {risk:.2f} {cur} = {100.0 * risk / eq:.1f}% of {eq:.2f} - "
+                          f"HIGH RISK (small account: the 5% cap needs a bigger balance)"), vmin, 1
+        return False, (f"Desk: skipped - even 1 x {vmin:g} lot would lose {risk:.2f} {cur} "
+                       f"({100.0 * risk / eq:.1f}% of {eq:.2f}) at the stop, limit {DESK_SMALL_MAX_PCT:g}%. "
+                       f"Deposit to receive AI Desk trades"), lot, count
+    risk = use_n * use_lot * per_lot
+    cut = "" if (use_lot == lot_n and use_n == count) else \
+        f" (risk cap lowered it from {int(count)} x {lot_n:g})"
+    return True, (f"Desk: {use_n} x {use_lot:g} lot{cut}, risk {risk:.2f} {cur} = "
+                  f"{100.0 * risk / eq:.1f}% of {eq:.2f}"), use_lot, use_n
 
 
 def _desk_modify(maps, row):
@@ -819,7 +886,7 @@ def _handle_open(db: Session, row: TradeExecution, broker_symbol: str,
     wanted = min(per_signal, slots)
     desk_note = ""
     if desk is not None:
-        allowed, desk_note = _desk_guard(broker_symbol, row.action, lot, sl, wanted)
+        allowed, desk_note, lot, wanted = _desk_size(broker_symbol, row.action, lot, sl, wanted)  # STEP40
         if not allowed:
             return "skipped", None, desk_note
     tickets: List[int] = []

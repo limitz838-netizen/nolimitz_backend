@@ -1743,6 +1743,7 @@ def listener_sessions(shard_index: int = 0, shard_count: int = 1,
             s.chat_id for s in db.query(TelegramSource).filter(
                 TelegramSource.license_id == a.license_id,
                 TelegramSource.enabled == True,      # noqa: E712
+                ~TelegramSource.chat_id.like("tv:%"),   # TradingView sources arrive by webhook, not Telegram
             ).all()
         ]
         if not chats:
