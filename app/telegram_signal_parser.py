@@ -60,6 +60,7 @@
 """
 
 import re
+import unicodedata
 
 # ---------------------------------------------------------------------------
 # Vocabulary. Everything the head may contain. Anything else refuses.
@@ -413,6 +414,83 @@ def _looks_like_instrument(tok, extra):
 
 
 
+# ---- price ranges that are safe to trade at market (Nov 2026) ---------------
+#
+# ~150 refusals in two weeks were real setups written with an entry RANGE and
+# no order type, e.g.
+#
+#     Gold buy 4046.5-4043      XAUUSD SELL 4125 28      SELL XAUUSD AT 4044 - 4047
+#     SL: 4034                  TP 4122 ...              SL 4054
+#
+# A range is still refused when it is genuinely unclear. It is taken as
+# "enter at market, this is where price is" ONLY when ALL of these hold:
+#   * no pending word (LIMIT / STOP) anywhere -- a BUY LIMIT range stays refused
+#   * a numeric stop loss was given
+#   * the stop sits OUTSIDE the whole range on the losing side
+#     (BUY: below the low end, SELL: above the high end)
+#   * the range is narrow: at most 1% of price
+#   * the stop is within 5% of the range -- not a typo
+# The range is recorded in entry_zone for the feed; it is never an order price.
+_ZONE_MAX_WIDTH = 0.01
+_ZONE_MAX_STOP = 0.05
+
+
+def _expand_short(a, b):
+    """'4062/58' -> 4058, '3995-90' -> 3990, '4101 98' -> 4098 (nearest reading)."""
+    a_s, b_s = str(a), str(b)
+    a_v, b_v = _to_float(a_s), _to_float(b_s)
+    a_int = a_s.split(".")[0].split(",")[0]
+    b_int = b_s.split(".")[0].split(",")[0]
+    if len(b_int) >= len(a_int) or not b_int:
+        return b_v
+    k = len(b_int)
+    base = int(a_int[:-k] + b_s.replace(",", ".").split(".")[0]) if a_int[:-k] else int(b_int)
+    frac = b_v - int(b_int)
+    cands = [base + frac, base + frac - 10 ** k, base + frac + 10 ** k]
+    return min(cands, key=lambda c: abs(c - a_v))
+
+
+def _zone_market_ok(lo, hi, direction, stop_loss, pending):
+    if pending or stop_loss is None or not direction:
+        return False
+    lo, hi = sorted((lo, hi))
+    if lo <= 0 or hi - lo > _ZONE_MAX_WIDTH * hi:
+        return False
+    mid = (lo + hi) / 2
+    if abs(stop_loss - mid) > _ZONE_MAX_STOP * mid:
+        return False
+    return stop_loss < lo if direction == "BUY" else stop_loss > hi
+
+
+_RE_RANGE_PARTS = re.compile(rf"({_NUM})\s*[-/_]\s*({_NUM})")
+
+
+def _targets_list(upper):
+    """'TARGETS:' followed by lines that are only numbers -> TP1 ..., TP2 ...
+
+        Entry -> 4048
+        Targets:
+        4044
+        4040
+        SL -> 4060
+    """
+    lines = upper.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        if re.fullmatch(r"\s*TARGETS?\s*:?\s*", lines[i]):
+            j, n = i + 1, 0
+            while j < len(lines) and re.fullmatch(rf"\s*{_NUM}\s*", lines[j]):
+                n += 1
+                out.append(f"TP{n} {lines[j].strip()}")
+                j += 1
+            if n:
+                i = j
+                continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
 class Refusal(Exception):
     """Carries a machine-readable reason and a sentence for the user."""
 
@@ -426,6 +504,11 @@ def _clean(text):
     """Strip emoji and decoration, keep line structure and numbers intact."""
     if not text:
         return ""
+    # NFKC first (Nov 2026). Channels write in "fancy" Unicode letters -- bold
+    # 𝗚𝗢𝗟𝗗, superscript TP¹, fullwidth （XAUUSD） -- and the ASCII filter below
+    # turned every one into a blank, so "𝗚𝗢𝗟𝗗 SELL" lost its instrument and was
+    # refused as no_symbol. NFKC maps them back to plain GOLD / TP1 / (XAUUSD).
+    text = unicodedata.normalize("NFKC", text)
     out = []
     for ch in text:
         if ch == "\n":
@@ -448,6 +531,15 @@ def _clean(text):
     return s.strip()
 
 
+def _clean_plain(text):
+    """_clean without NFKC -- only used to notice that NFKC changed something."""
+    if not text:
+        return ""
+    s = "".join("\n" if ch == "\n" else (" " if (ord(ch) > 127 or ch in "*_`~|[]\"'") else ch)
+                for ch in text)
+    return re.sub(r"[ \t]+", " ", s).strip()
+
+
 def _to_float(raw):
     return float(str(raw).replace(",", "."))
 
@@ -456,7 +548,7 @@ def _numbers(blob):
     return [_to_float(m) for m in re.findall(_NUM, blob)]
 
 
-def parse_signal(text, extra_symbols=None):
+def parse_signal(text, extra_symbols=None, canonical=None, default_symbol=None):
     """Parse a Telegram message.
 
     `extra_symbols` widens what counts as an instrument name. The router passes
@@ -484,9 +576,34 @@ def parse_signal(text, extra_symbols=None):
     """
     extra = {s.upper() for s in (extra_symbols or ())}
 
+    # Two names for ONE instrument -- "BUY XAUUSD GOLD 4126" -- are not two
+    # instruments. The router passes the copier's own _canonical so the rule is
+    # the copier's; without it only the obvious gold names are folded.
+    def _same(a, b):
+        if canonical is not None:
+            try:
+                return canonical(a) == canonical(b)
+            except Exception:
+                return False
+        g = {"GOLD", "XAUUSD", "XAU", "GOLDUSD", "XAUUSDM", "GOLDSPOT"}
+        return a in g and b in g
+
     cleaned = _clean(text)
     if not cleaned:
         raise Refusal("empty_message")
+
+    # Every rule added in Nov 2026 (fancy letters, ranges, repeated titles, two
+    # names for one instrument, channel default symbol, TARGETS lists, "(SELL)")
+    # marks the parse as RELAXED. A relaxed parse must still carry a stop loss at
+    # a price, so none of the new readings can ever open a trade with no stop --
+    # "SELL XAUUSD GOLD ✅ WOW" (a results post) stays refused.
+    relaxed = [_clean(unicodedata.normalize("NFKC", text)) != _clean_plain(text)]
+
+    # A trade REPORT ("Entry 4131.57 -> Exit 4113.99 ... Net 122.77 USD") lists
+    # entry, stop and target of a trade that is already closed.
+    _u = cleaned.upper()
+    if re.search(r"\bEXIT\b\s*[:=]?\s*\d", _u) or re.search(r"\bNET\b\s*[:=]?\s*[+-]?\d", _u):
+        raise Refusal("not_a_signal", "Trade report (exit / net result), not a new signal.")
 
     upper = cleaned.upper()
 
@@ -494,6 +611,14 @@ def parse_signal(text, extra_symbols=None):
     # counts words, so every path below sees the normalised text.
     upper = _RE_DIR_PAIR.sub(lambda m: "BUY" if (m.group(1) or "") else "SELL",
                              upper)
+    # "XAUUSD (SELL)" and "GOLD SELL@ 4069" -- the bracket or the glued @ hid the
+    # direction from the head scan and both were refused as not_a_signal.
+    _before = upper
+    upper = re.sub(r"\((BUY|SELL|LONG|SHORT)\)", r" \1 ", upper)
+    upper = re.sub(r"\b(BUY|SELL|LONG|SHORT)@", r"\1 @", upper)
+    upper = _targets_list(upper)
+    if upper != _before:
+        relaxed.append(True)
     upper = _join_slash_pairs(upper)
     upper, comma_ambiguous = _strip_thousands(upper)
 
@@ -541,6 +666,7 @@ def parse_signal(text, extra_symbols=None):
 
     # ---- pull the labelled fields out of the whole message ----------------
     tp_unspecified = False
+    pending_zone = None
     stop_loss = None
     take_profits = []
     entry_price_labelled = None
@@ -581,6 +707,14 @@ def parse_signal(text, extra_symbols=None):
         if not m.group(1) and len(nums) > 1 and nums[0].is_integer() \
                 and 1 <= nums[0] <= 9:
             nums = nums[1:]
+        # "TARGET 2 COMPLETE 110 PIPS" (a superscript ² once NFKC has made it a
+        # plain 2) is an index, not a price. A lone 1-9 with no stop to judge it
+        # against is never treated as a take profit.
+        if stop_loss is None and len(nums) == 1 and nums[0].is_integer() \
+                and 1 <= nums[0] <= 9:
+            tp_unspecified = True
+            spans.append(m.span())
+            continue
         take_profits.extend(nums)
         spans.append(m.span())
     # A TP mentioned with no number -- "TP WILL BE UPDATED", "TP soon" -- is
@@ -619,8 +753,14 @@ def parse_signal(text, extra_symbols=None):
     if m:
         if _RE_RANGE_TAIL.match(upper[m.end():]):
             if not market_explicit:
-                raise Refusal("entry_ambiguous",
-                              "The entry is given as a range, not one price.")
+                tail0 = upper[m.end():].split("\n", 1)[0]
+                zt = _RE_RANGE_TAIL_FULL.match(tail0)
+                lo_hi = (_to_float(m.group(2)),
+                         _expand_short(m.group(2), re.sub(r"^[\s\-/]+", "", zt.group(0))) if zt else None)
+                if lo_hi[1] is None:
+                    raise Refusal("entry_ambiguous",
+                                  "The entry is given as a range, not one price.")
+                pending_zone = lo_hi           # decided once the direction is known
             # Market was stated, so the range is where price was, not an
             # instruction. Recorded for the feed, not used for execution.
             #
@@ -646,6 +786,8 @@ def parse_signal(text, extra_symbols=None):
     # ---- find the head ----------------------------------------------------
     head_line = None
     ignored = []
+    dir_lines = []
+    merged = False
     for raw_line in remainder.split("\n"):
         line = raw_line.strip()
         if not line:
@@ -653,7 +795,32 @@ def parse_signal(text, extra_symbols=None):
         line_words = set(re.findall(r"[A-Z@]+", line))
         has_dir = bool(line_words & (_BUY_WORDS | _SELL_WORDS))
         if has_dir:
+            dir_lines.append(line)
             if head_line is not None:
+                # "GOLD SELL" as a title, then "SELL XAUUSD 4070" -- one signal
+                # announced twice. Merged ONLY when every direction line agrees,
+                # there are at most three, and the message carries a full setup
+                # (a stop and a target at a price) with no results/pips wording.
+                # A results recap ("GOLD BUY 80 PIPS / GOLD BUY 400 PIPS") never
+                # has a stop price, so it is still refused as multiple_signals.
+                dirs = {("BUY" if (set(re.findall(r"[A-Z]+", l)) & _BUY_WORDS) else "")
+                        + ("SELL" if (set(re.findall(r"[A-Z]+", l)) & _SELL_WORDS) else "")
+                        for l in dir_lines}
+                extra_toks = [t.strip(".-|/!?*@") for t in re.split(r"[\s,;:=]+", line)]
+                extra_toks = [t for t in extra_toks if t and t not in (_BUY_WORDS | _SELL_WORDS)]
+                known = all(t in _MARKET_WORDS or t in _AT_WORDS or re.fullmatch(_NUM, t)
+                            or _RE_RANGE_PARTS.fullmatch(t)
+                            or (re.fullmatch(r"[A-Z0-9()]{2,20}", t) and _looks_like_instrument(t, extra))
+                            for t in extra_toks)
+                if (len(dirs) == 1 and next(iter(dirs)) in ("BUY", "SELL")
+                        and len(dir_lines) <= 3 and stop_loss is not None
+                        and take_profits and known
+                        and not _RE_PENDING_ANY.search(upper)
+                        and not _RE_UPDATE_WORDS.search(upper)):
+                    head_line = head_line + " " + " ".join(extra_toks)
+                    merged = True
+                    relaxed.append(True)
+                    continue
                 raise Refusal(
                     "multiple_signals",
                     "More than one BUY/SELL in this message. Send one signal "
@@ -685,6 +852,7 @@ def parse_signal(text, extra_symbols=None):
     entry_type = "MARKET"
     entry_price = None
     symbol_raw = None
+    symbol_from_default = False
 
     # Trailing punctuation must not make a known word unknown ("NOW." -> NOW),
     # and a lone dash between symbol and direction -- "XAUUSD - BUY" -- must not
@@ -696,14 +864,14 @@ def parse_signal(text, extra_symbols=None):
     # "!" and "?" belong here as much as "." does. Without them "BUY XAUUSD!!!!"
     # -- which is how half these channels type -- left the token as XAUUSD!!!!,
     # matched nothing, and the signal was refused with no_symbol.
-    _EDGE = ".-|/!?*\"'"
+    _EDGE = ".-|/!?*\"'@"
     # A Telegram hashtag in front of the instrument -- "#XAUUSD SELL 3996" --
     # is how many channels tag their posts. Drop a leading # or $ only when a
     # LETTER follows, so "#XAUUSD" -> XAUUSD while "#79417760" (a ticket
     # number) still stops the scan and can never become the entry price.
     def _dehash(t):
         return t.lstrip("#$") if re.fullmatch(r"[#$]+[A-Z][A-Z0-9()]*", t) else t
-    tokens = [_dehash(t.strip(_EDGE)) for t in re.split(r"[\s,;:]+", head_line)
+    tokens = [_dehash(t.strip(_EDGE)) for t in re.split(r"[\s,;:=]+", head_line)
               if t.strip(_EDGE)]
 
     dir_idx = [i for i, t in enumerate(tokens)
@@ -732,9 +900,17 @@ def parse_signal(text, extra_symbols=None):
         # it as commentary, quietly turning a price RANGE into a market order.
         # Refusing here is the difference between "we could not read it" and
         # "we picked an entry the author never gave".
-        if _RE_RANGE.fullmatch(t):
+        rp = _RE_RANGE_PARTS.fullmatch(t)
+        if rp:
             if market_explicit:
                 entry_zone = entry_zone or t
+                continue
+            lo_v, hi_v = _to_float(rp.group(1)), _expand_short(rp.group(1), rp.group(2))
+            if _zone_market_ok(lo_v, hi_v, direction, stop_loss,
+                               bool(_RE_PENDING_ANY.search(upper))):
+                lo_v, hi_v = sorted((lo_v, hi_v))
+                entry_zone = entry_zone or f"{lo_v:g}-{hi_v:g}"
+                relaxed.append(True)
                 continue
             raise Refusal(
                 "entry_ambiguous",
@@ -748,6 +924,8 @@ def parse_signal(text, extra_symbols=None):
             tok = tokens[i]
             if tok in _MARKET_WORDS or tok in _AT_WORDS:
                 pass
+            elif entry_zone and _RE_RANGE_PARTS.fullmatch(tok):
+                pass                     # the accepted zone, recorded above
             elif tok in _LIMIT_WORDS:
                 entry_type = "LIMIT"
             elif tok in _STOP_WORDS:
@@ -763,6 +941,22 @@ def parse_signal(text, extra_symbols=None):
                         "entry_ambiguous",
                         "More than two prices given for the entry.")
                 if entry_price is not None:
+                    second = _expand_short(str(entry_price) if entry_price != int(entry_price) else str(int(entry_price)), tok)
+                    if second == entry_price:      # the same price written twice
+                        accepted.append(i)
+                        i += step
+                        continue
+                    if (not market_explicit and entry_type == "MARKET"
+                            and _zone_market_ok(entry_price, second, direction, stop_loss,
+                                                bool(_RE_PENDING_ANY.search(upper)))):
+                        lo, hi = sorted((entry_price, second))
+                        entry_zone = entry_zone or f"{lo:g}-{hi:g}"
+                        entry_price = None
+                        spaced_zone = True
+                        relaxed.append(True)
+                        accepted.append(i)
+                        i += step
+                        continue
                     if market_explicit and entry_type == "MARKET":
                         lo, hi = sorted((entry_price, _to_float(tok)))
                         entry_zone = entry_zone or (
@@ -784,6 +978,11 @@ def parse_signal(text, extra_symbols=None):
                 symbol_raw += tok
             elif (re.fullmatch(r"[A-Z0-9()]{2,20}", tok)
                   and _looks_like_instrument(tok, extra)):
+                if symbol_raw is not None and _same(symbol_raw, tok):
+                    relaxed.append(True)
+                    accepted.append(i)
+                    i += step
+                    continue
                 if symbol_raw is not None:
                     raise Refusal("multiple_symbols",
                                   f"More than one instrument named "
@@ -831,10 +1030,23 @@ def parse_signal(text, extra_symbols=None):
             symbol_raw = labelled.group(1)
         elif len(set(alone)) == 1:
             symbol_raw = alone[0]
+        elif len(set(alone)) > 1 and all(_same(alone[0], x) for x in set(alone)):
+            symbol_raw = alone[0]
+            relaxed.append(True)
         elif len(set(alone)) > 1:
             raise Refusal("multiple_symbols",
                           "More than one instrument named "
                           f"({', '.join(sorted(set(alone)))}).")
+        elif (default_symbol and stop_loss is not None
+              and (take_profits or entry_price is not None or entry_price_labelled is not None
+                   or entry_zone or pending_zone)):
+            # The channel only ever trades one instrument and this message is a
+            # complete setup (stop + target/entry at a price) that just does not
+            # name it. The router supplies default_symbol from that channel's own
+            # accepted signals and checks the prices fit it.
+            symbol_raw = default_symbol
+            symbol_from_default = True
+            relaxed.append(True)
         else:
             raise Refusal("no_symbol", "No instrument named.")
 
@@ -844,8 +1056,26 @@ def parse_signal(text, extra_symbols=None):
                       "A price is written with a comma that could be a decimal "
                       "point or a thousands separator.")
 
+    if pending_zone is not None:
+        if (entry_type == "MARKET" and not entry_zone
+                and _zone_market_ok(pending_zone[0], pending_zone[1], direction,
+                                    stop_loss, bool(_RE_PENDING_ANY.search(upper)))):
+            lo, hi = sorted(pending_zone)
+            entry_zone = f"{lo:g}-{hi:g}"
+            relaxed.append(True)
+        else:
+            raise Refusal("entry_ambiguous",
+                          "The entry is given as a range, not one price.")
+
     if entry_price is None:
         entry_price = entry_price_labelled
+
+    if any(relaxed) and stop_loss is None:
+        raise Refusal("needs_full_setup",
+                      "Read with the extended rules, which only accept a signal "
+                      "that gives its stop loss as a price.")
+    if merged:
+        take_profits = list(dict.fromkeys(take_profits))     # a repeated post, not new targets
 
     # A pending type with no price is not a pending order, it is a word.
     # "BUY STOP" alone almost always means "buy, stop loss below" -- refuse
@@ -875,6 +1105,7 @@ def parse_signal(text, extra_symbols=None):
         # why their trade has no target.
         "tp_unspecified": tp_unspecified,
         "ignored_lines": ignored,
+        "symbol_from_default": symbol_from_default,
     }
 
 

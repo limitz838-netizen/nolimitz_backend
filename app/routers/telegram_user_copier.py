@@ -126,6 +126,56 @@ LISTENER_STALE_SEC = int(os.getenv("TELEGRAM_LISTENER_STALE_SEC", "300"))
 # fresh to the executor's MAX_OPEN_EVENT_AGE_SEC.
 MAX_SIGNAL_AGE_SEC = int(os.getenv("TELEGRAM_MAX_SIGNAL_AGE_SEC", "180"))
 
+# ---- channel default instrument (Nov 2026) -----------------------------------
+# Some channels only ever trade one instrument and stop naming it ("Buy / SL 3947 /
+# TP 3970"). If, over the last 30 days, a channel's accepted signals (any licence)
+# number at least DEFAULT_SYMBOL_MIN and are ALL on one instrument, that
+# instrument is offered to the parser -- which only uses it for a complete setup
+# with a stop loss at a price -- and the stop must then sit within
+# DEFAULT_SYMBOL_PRICE_BAND of that channel's usual stop prices, so a number on a
+# different scale can never be traded as gold. TELEGRAM_DEFAULT_SYMBOL=false
+# switches it off.
+DEFAULT_SYMBOL_ON = os.getenv("TELEGRAM_DEFAULT_SYMBOL", "true").lower() == "true"
+DEFAULT_SYMBOL_MIN = int(os.getenv("TELEGRAM_DEFAULT_SYMBOL_MIN", "3"))
+DEFAULT_SYMBOL_PRICE_BAND = float(os.getenv("TELEGRAM_DEFAULT_SYMBOL_BAND", "0.10"))
+_default_cache = {}          # chat_id -> (expires, (symbol, ref_price) | None)
+
+
+def _channel_default(db: Session, chat_id: str, canonical):
+    if not DEFAULT_SYMBOL_ON or not chat_id:
+        return None
+    now = datetime.now(timezone.utc).timestamp()
+    hit = _default_cache.get(chat_id)
+    if hit and hit[0] > now:
+        return hit[1]
+    result = None
+    try:
+        rows = db.query(TelegramSignalLog.parsed_json).filter(
+            TelegramSignalLog.chat_id == chat_id,
+            TelegramSignalLog.outcome.in_(("QUEUED", "PLACED", "SHADOW")),
+            TelegramSignalLog.received_at >= datetime.now(timezone.utc) - timedelta(days=30),
+            TelegramSignalLog.parsed_json.isnot(None),
+        ).order_by(TelegramSignalLog.id.desc()).limit(300).all()
+        syms, sls, raw = set(), [], None
+        for (pj,) in rows:
+            try:
+                d = json.loads(pj)
+            except Exception:
+                continue
+            if d.get("kind") != "OPEN" or not d.get("symbol_raw") or d.get("symbol_from_default"):
+                continue
+            syms.add(canonical(d["symbol_raw"]))
+            raw = raw or d["symbol_raw"]
+            if d.get("stop_loss"):
+                sls.append(float(d["stop_loss"]))
+        if len(syms) == 1 and len(sls) >= DEFAULT_SYMBOL_MIN:
+            sls.sort()
+            result = (raw, sls[len(sls) // 2])
+    except Exception as e:
+        logger.warning("channel default symbol lookup failed for %s: %s", chat_id, e)
+    _default_cache[chat_id] = (now + 600, result)
+    return result
+
 # Backlog guard, NOT a position limit. How many Telegram opens may be waiting
 # for a lane at once, and how far back "waiting" counts. The real ceiling on
 # concurrent positions is the executor's per-symbol risk cap (RISK_CAPS below)
@@ -1471,8 +1521,16 @@ def incoming_signal(data: IncomingSignal,
                                   is_reply=bool(data.reply_to_message_id),
                                   symbols=synonyms.keys())
 
+    chan_default = _channel_default(db, data.chat_id, canonical)
     try:
-        parsed = parse_signal(data.text, extra_symbols=synonyms.keys())
+        parsed = parse_signal(data.text, extra_symbols=synonyms.keys(), canonical=canonical,
+                              default_symbol=chan_default[0] if chan_default else None)
+        if parsed.get("symbol_from_default"):
+            ref = chan_default[1]
+            sl_v = parsed.get("stop_loss")
+            if not sl_v or abs(sl_v - ref) > DEFAULT_SYMBOL_PRICE_BAND * ref:
+                raise Refusal("no_symbol", "No instrument named, and the prices do not fit "
+                                           "this channel's usual instrument.")
     except Refusal as r:
         log.parsed_at = _now(db)
         # "Close all now", "Take profit now" carry no instrument or direction,
