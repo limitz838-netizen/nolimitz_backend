@@ -215,6 +215,15 @@ def get_symbol_aliases(symbol: str) -> list[str]:
     return [normalize_symbol(x) for x in alias_map.get(base, [base])]
 
 
+def _master_logins(db: Session) -> set:
+    """Every MT5 login registered as a master account. Never raises."""
+    try:
+        from sqlalchemy import text as _t
+        return {str(r[0]).strip().split(".")[0] for r in db.execute(_t("select mt_login from master_accounts")).fetchall() if r[0]}
+    except Exception:
+        return set()
+
+
 def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> List[TradeExecution]:
     """Fan the master event out to every eligible licence on this EA.
 
@@ -240,6 +249,13 @@ def create_execution_rows_for_event(event: CopierTradeEvent, db: Session) -> Lis
 
         if not mt5_account:
             print(f"[SKIP] license={license_row.id} reason=no_active_verified_mt5")
+            continue
+
+        # Never copy a master trade INTO a master login (9 Nov 2026): the owner may connect the master as a
+        # customer account (ALLOWED_MT5_LOGINS) to run the Telegram Copier on it; without this it would
+        # receive its own master trades back (the Oct 20-29 duplicate incidents).
+        if str(mt5_account.login).strip() in _master_logins(db):
+            print(f"[SKIP] license={license_row.id} reason=master_login_never_copies_master")
             continue
 
         symbol_setting = db.query(ClientSymbolSetting).filter(

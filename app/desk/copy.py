@@ -98,10 +98,18 @@ def fan_out(db: Session, event: str, desk_ticket: str, symbol: str, action: Opti
                                                    ClientMT5Account.ai_auto_trade == True)   # noqa: E712
                  .order_by(ClientMT5Account.id.desc()).all())
         seen = set()
+        try:                                          # 9 Nov 2026: never put AI Desk trades on a MASTER login
+            from sqlalchemy import text as _t
+            masters = {str(r[0]).strip() for r in db.execute(_t("select mt_login from master_accounts")).fetchall() if r[0]}
+        except Exception:
+            masters = set()
         for acct in accts:
             if not acct.license_id or acct.license_id in seen:
                 continue
             seen.add(acct.license_id)
+            if str(acct.login).strip() in masters:
+                skipped.append((acct.license_id, "master account - AI Desk trades are not copied to it"))
+                continue
             lic = db.query(License).filter(License.id == acct.license_id).first()
             if lic is None or not licence_live(lic, now):
                 skipped.append((acct.license_id, "licence inactive or expired"))
