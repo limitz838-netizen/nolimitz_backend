@@ -31,6 +31,7 @@ from app.routers import entitlement
 from app.routers import telegram_copier
 from app.routers import telegram_user_copier
 from app.routers import tradingview
+from app.routers import notifications  # in-app notifications (creates client_notifications)
 from app.routers import bridge_heartbeat
 from app.routers import desk as desk_routes  # Desk: live page, state API, copy routes (creates desk_* tables)
 
@@ -194,6 +195,7 @@ app.include_router(tradingview.client_router)
 app.include_router(tradingview.hook_router)  # POST /api/tv/{secret} - TradingView alerts
 app.include_router(bridge_heartbeat.router)  # VPS master bridge heartbeat (/worker/...)
 app.include_router(desk_routes.router)
+app.include_router(notifications.router)  # /api/client/notifications
 
 
 @app.get("/")

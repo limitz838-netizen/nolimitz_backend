@@ -45,6 +45,10 @@
        details.
     3. Sleep. Repeat.
 
+  STEP58 (Nov 2026): terminal always started portable (C:\\MT5\\verifier data,
+  not the 28 GB AppData profile); after a failed login it returns to a HOME
+  account with a saved password (no Login pop-up); queue grouped by server.
+
   Exponential backoff for transient failures: 1min, 2min, 5min, 15min, 30min, 1hr.
   Verified accounts: refresh every 5 min.
 ================================================================================
@@ -182,7 +186,7 @@ def _beat(db: Session, name: str, detail: str = "") -> None:
 # MT5 LIFECYCLE
 # ==============================================================================
 def init_mt5() -> bool:
-    if not mt5.initialize(path=TERMINAL_PATH, timeout=INIT_TIMEOUT_MS):
+    if not mt5.initialize(path=TERMINAL_PATH, timeout=INIT_TIMEOUT_MS, portable=True):
         logger.critical("MT5 INIT FAILED: %s", mt5.last_error())
         return False
     logger.info("✅ MT5 verifier connected")
@@ -197,7 +201,7 @@ def restart_mt5_if_needed() -> None:
         with MT5_LOCK:
             mt5.shutdown()
             time.sleep(2)
-            mt5.initialize(path=TERMINAL_PATH, timeout=LOGIN_TIMEOUT_MS)
+            mt5.initialize(path=TERMINAL_PATH, timeout=LOGIN_TIMEOUT_MS, portable=True)
         _last_mt5_restart = time.time()
 
 
@@ -230,7 +234,7 @@ def _init_with_retries() -> bool:
             pass
         time.sleep(2 * attempt)        # 2s, 4s, 6s — let the process die/relaunch
         try:
-            if mt5.initialize(path=TERMINAL_PATH, timeout=INIT_TIMEOUT_MS):
+            if mt5.initialize(path=TERMINAL_PATH, timeout=INIT_TIMEOUT_MS, portable=True):
                 if attempt > 1:
                     logger.info("✅ MT5 recovered on init attempt %d", attempt)
                 return True
@@ -256,6 +260,31 @@ def ensure_mt5_alive() -> bool:
         with MT5_LOCK:
             return _init_with_retries()
     return True
+
+
+# ==============================================================================
+# STEP58 - HOME ACCOUNT
+# After a failed customer login MT5 falls back to the PREVIOUS account; if that
+# one's password is not saved it opens a modal "Login" pop-up and stops answering
+# (-> IPC timeout -> terminal killed). Going back to a home account whose password
+# IS saved in the terminal (no password passed = use the saved one) keeps the
+# terminal in a clean state.
+# ==============================================================================
+HOME_LOGIN  = os.environ.get("VERIFIER_HOME_LOGIN", "105505352")
+HOME_SERVER = os.environ.get("VERIFIER_HOME_SERVER", "FBS-Demo")
+
+
+def _go_home() -> None:
+    """Best effort: switch the terminal to the home account. Never raises."""
+    if not HOME_LOGIN:
+        return
+    try:
+        if mt5.login(int(HOME_LOGIN), server=HOME_SERVER, timeout=LOGIN_TIMEOUT_MS):
+            logger.debug("back on home account %s", HOME_LOGIN)
+        else:
+            logger.info("home account %s login failed: %s", HOME_LOGIN, mt5.last_error())
+    except Exception as e:
+        logger.debug("home login exception: %s", e)
 
 
 # ==============================================================================
@@ -599,6 +628,13 @@ def verify_one_account(account: ClientMT5Account, db: Session) -> bool:
             pass
         return False
     finally:
+        # STEP58: after a failed login, park the terminal on the home account.
+        try:
+            if not (account.verification_status == "VERIFIED"
+                    and _last_attempt.get(login_str, 0) and _failure_count.get(login_str, 0) == 0):
+                _go_home()
+        except Exception:
+            pass
         try:
             MT5_LOCK.release()
         except RuntimeError:
@@ -682,6 +718,10 @@ def get_accounts_to_process(db: Session) -> List[ClientMT5Account]:
         if len(queue) >= MAX_ACCOUNTS_PER_LOOP:
             break
 
+    # STEP58: keep user requests first, then group the rest by server so the
+    # terminal changes broker as rarely as possible.
+    n_fresh = sum(1 for a in queue if a in fresh_requests)
+    queue = queue[:n_fresh] + sorted(queue[n_fresh:], key=lambda a: str(a.server or "").lower())
     return queue
 
 
@@ -745,6 +785,7 @@ def main_loop():
 if __name__ == "__main__":
     if not init_mt5():
         raise SystemExit(1)
+    _go_home()   # STEP58
     logger.info("🚀 MT5 Verifier started | refresh=%ds | batch=%d | login_timeout=%dms | "
                "max_transient=%d | loop_budget=%ds | restart_every=%ds",
                REFRESH_INTERVAL_SEC, MAX_ACCOUNTS_PER_LOOP, LOGIN_TIMEOUT_MS,

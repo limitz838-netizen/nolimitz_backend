@@ -3,11 +3,12 @@ app/desk/notify.py -- tell users when the AI Desk acts on THEIR account (Oct 202
 
 After the Desk opens a trade, fan_out() queues one row per eligible account. The copier on the VPS then opens
 it (status 'executed') or refuses it with a reason ('skipped' / 'failed', e.g. "risk mode medium allows 3 open
-on XAUUSD, 3 already open"). About two minutes later this module reads those outcomes and emails each user once:
+on XAUUSD, 3 already open"). About two minutes later this module reads those outcomes and tells each user once:
   opened  -> "AI Desk opened SELL XAUUSD on your account"   (lot, stop, target)
   refused -> "AI Desk could not open a trade on your account" with the reason and how to fix it
-Nothing here places or changes a trade. Email goes through the same Resend helper as licence emails.
-Off with DESK_NOTIFY_ENABLED=false.
+Nothing here places or changes a trade.
+Step 66: the message goes to the dashboard bell (client_notifications), NOT email - the per-trade emails were
+using up the daily Resend quota. DESK_NOTIFY_EMAIL=true brings the email back. Off with DESK_NOTIFY_ENABLED=false.
 """
 from __future__ import annotations
 
@@ -20,6 +21,10 @@ log = logging.getLogger("desk.notify")
 DELAY_SEC = float(os.getenv("DESK_NOTIFY_DELAY_SEC", "120"))
 
 
+def email_too() -> bool:
+    return os.getenv("DESK_NOTIFY_EMAIL", "false").strip().lower() == "true"
+
+
 def enabled() -> bool:
     return os.getenv("DESK_NOTIFY_ENABLED", "true").strip().lower() == "true"
 
@@ -29,7 +34,8 @@ FIX = {
                  "your risk mode in Settings if you want the AI's trades to fit alongside your other trades.",
     "robot stopped": "The AI Auto Trader is switched off on your account. Switch it on in your dashboard.",
     "margin": "Your account did not have enough free margin. Lower your lot size or add funds.",
-    "stale": "Your account's turn in the copier queue came too late to enter safely at the AI's price.",
+    "stale": "Your account was reached too late to enter safely at the AI's price, so the trade was skipped to "
+             "protect you. Nothing is wrong with your account; the next AI trade will try again.",
     "price moved": "Gold had already moved too far from the AI's entry by the time your account was reached, "
                    "so the trade was skipped to protect you.",
     "insufficient balance": "Your account balance is too low for this trade. Deposit to resume.",
@@ -56,6 +62,7 @@ def _run(master_ticket: str, symbol: str, action: str, attempt: int = 1, only=No
     from app.database import SessionLocal
     from app.models import License, TradeExecution
     from app.routers.license import send_email
+    from app.routers.notifications import notify
     db = SessionLocal()
     try:
         rows = (db.query(TradeExecution).filter(TradeExecution.master_ticket == master_ticket,
@@ -69,27 +76,35 @@ def _run(master_ticket: str, symbol: str, action: str, attempt: int = 1, only=No
             if only is not None and lid not in only:
                 continue
             lic = db.query(License).filter(License.id == lid).first()
-            if lic is None or not lic.client_email:
+            if lic is None:
                 continue
             done = [r for r in rs if (r.status or "").lower() in ("executed", "done", "success", "filled")]
             bad = [r for r in rs if (r.status or "").lower() in ("skipped", "failed", "error", "rejected")]
             if done:
                 lots = sum(float(r.lot_size or 0) for r in done)
                 subj = f"AI Desk opened {side} {symbol} on your account"
+                kind = "success"
                 lines = [f"The AI Desk just opened {len(done)} {side} trade{'s' if len(done) > 1 else ''} on {symbol} "
                          f"on your MT5 account ({lots:.2f} lots in total, using your own lot size and risk mode).",
                          "A stop loss and take profit were set (take profit at least $13 per 0.01 lot). The AI "
                          "closes it early if the gold trend flips. Watch it live in the Desk tab of your dashboard."]
             elif bad:
                 reason = bad[0].error_message or bad[0].status
+                kind = "warning"
+                fix = _fix_for(reason)
+                if "stale" in (reason or "").lower():
+                    reason = "your account was reached too late (the price had moved on)"
                 subj = f"AI Desk could not open a {symbol} trade on your account"
                 lines = [f"The AI Desk took a {side} trade on {symbol}, but it was not opened on your account.",
-                         f"Reason: {reason}", _fix_for(reason)]
+                         f"Reason: {reason}", fix]
             else:                                 # still pending: look once more later, never guess
                 if attempt == 1:
                     retry.add(lid)
                 continue
-            ok, detail = send_email(lic.client_email, subj, _html(subj, lines))
+            ok = notify(lid, subj, "\n".join(lines), kind, db=db)
+            detail = "in-app"
+            if email_too() and lic.client_email:
+                ok, detail = send_email(lic.client_email, subj, _html(subj, lines))
             log.info("desk notify %s licence %s: %s %s", master_ticket, lid, ok, detail)
         if retry:
             t = threading.Timer(300, _run, args=(master_ticket, symbol, action, 2, retry))
