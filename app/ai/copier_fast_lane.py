@@ -85,6 +85,7 @@ from typing import Dict, List, Optional
 import MetaTrader5 as mt5
 from sqlalchemy import func, text
 
+from app.ai.mt5_liveupdate import clear_stuck_update  # STEP75
 from app.database import SessionLocal
 from app.models import ClientMT5Account, TradeExecution, TradeTicketMap
 # MAX_OPEN_EVENT_AGE_SEC is imported rather than redeclared so the reaper and
@@ -182,6 +183,9 @@ def _force_kill_terminal() -> None:
         logger.warning("force-killed wedged terminal")
     except Exception as e:
         logger.warning("force-kill failed: %s", e)
+    # STEP75: a terminal that will not start is often a stuck MT5 self-update. Clear it so the
+    # next start can finish the update instead of exiting again (lane 5 lost ~10 hours to this).
+    clear_stuck_update(TERMINAL_PATH)
 
 
 def init_terminal() -> bool:
@@ -525,6 +529,7 @@ def main() -> None:
         logger.critical("terminal not found at %s — set COPIER_LANE_TERMINAL", TERMINAL_PATH)
         sys.exit(1)
 
+    clear_stuck_update(TERMINAL_PATH)   # STEP75: start clean if an old update is stuck
     if not init_terminal():
         logger.critical("could not start terminal")
         sys.exit(1)

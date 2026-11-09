@@ -445,6 +445,18 @@ def _filling_modes(broker_symbol: str) -> List[int]:
     return modes
 
 
+# STEP75: MT5 rejects some comments outright (-2 'Invalid "comment" argument') and the trade is lost.
+# Length is not the only cause: non-ASCII text (emoji, accents, Cyrillic channel names) counts as more
+# than one byte and some brokers refuse it. So: plain printable ASCII only, at most COPIER_COMMENT_MAX
+# (30, the same ceiling Telegram comments are built to). If a broker still refuses it, the order is
+# retried once with the plain label "Nolimitz".
+_COMMENT_MAX = int(os.getenv("COPIER_COMMENT_MAX", "30"))
+def _clean_comment(text) -> str:
+    s = "".join(ch if 32 <= ord(ch) < 127 else " " for ch in str(text or ""))
+    s = " ".join(s.split())[:_COMMENT_MAX].strip()
+    return s or "Nolimitz"
+
+
 def _send_market_order(
     broker_symbol: str,
     action: str,
@@ -479,7 +491,7 @@ def _send_market_order(
         "price": float(price),
         "deviation": _DEVIATION,
         "magic": COPIER_MAGIC,
-        "comment": comment[:30],
+        "comment": _clean_comment(comment),
         "type_time": mt5.ORDER_TIME_GTC,
     }
     if sl:
@@ -497,7 +509,18 @@ def _send_market_order(
             continue
         if result is None:
             last_err = f"order_send returned None: {mt5.last_error()}"
-            continue
+            if "comment" in last_err.lower() and request["comment"] != "Nolimitz":
+                request["comment"] = "Nolimitz"          # STEP75: retry once with a plain label
+                try:
+                    result = mt5.order_send(request)
+                except Exception as e:
+                    last_err = f"order_send raised: {e}"
+                    continue
+                if result is None:
+                    last_err = f"order_send returned None: {mt5.last_error()}"
+                    continue
+            else:
+                continue
         if result.retcode == mt5.TRADE_RETCODE_DONE:
             ticket = int(getattr(result, "order", 0) or 0) or \
                      int(getattr(result, "deal", 0) or 0)
