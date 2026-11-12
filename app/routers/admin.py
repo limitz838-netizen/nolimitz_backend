@@ -424,6 +424,15 @@ def reset_license_device_lock(
 # =========================
 # MASTER MT5 ACCOUNT
 # =========================
+def _seal_master_pw(v: str) -> str:
+    """Step 100: encrypt the master MT5 password at rest (see app/routers/master_account.py)."""
+    try:
+        from app.security_utils import encrypt_secret
+        return encrypt_secret(v)
+    except Exception:
+        return v
+
+
 @router.post("/master-account/save")
 def save_master_account(
     data: dict,
@@ -445,7 +454,7 @@ def save_master_account(
             admin_id=current_admin.id,
             ea_id=int(ea_id),
             mt_login=str(mt_login),
-            mt_password=str(mt_password),
+            mt_password=_seal_master_pw(str(mt_password)),
             mt_server=str(mt_server),
             is_connected=False,
             account_name=None,
@@ -455,7 +464,7 @@ def save_master_account(
     else:
         account.ea_id = int(ea_id)
         account.mt_login = str(mt_login)
-        account.mt_password = str(mt_password)
+        account.mt_password = _seal_master_pw(str(mt_password))
         account.mt_server = str(mt_server)
         account.is_connected = False
         account.account_name = None

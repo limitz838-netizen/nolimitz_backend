@@ -39,27 +39,44 @@ except ImportError:          # cryptography not installed
     InvalidToken = Exception
 
 _PREFIX = "enc:"
-_KEY = (os.environ.get("NOLIMITZ_CRED_KEY") or "").strip()
-
 _fernet = None
-if _KEY and Fernet is not None:
-    try:
-        _fernet = Fernet(_KEY.encode() if isinstance(_KEY, str) else _KEY)
-    except Exception as e:
-        logger.error("NOLIMITZ_CRED_KEY is set but invalid (%s) — "
-                     "credentials will NOT be encrypted", e)
-        _fernet = None
-elif _KEY and Fernet is None:
-    logger.warning("NOLIMITZ_CRED_KEY is set but 'cryptography' is not "
-                   "installed — run: pip install cryptography")
-else:
-    logger.warning("NOLIMITZ_CRED_KEY not set — MT5 passwords stored in "
-                   "PLAINTEXT. Set the key on API + workers to enable "
-                   "encryption at rest.")
+_warned = False
+
+
+def _load_key():
+    """Step 100: read the key when first needed, not only at import. Some VPS programs import this module before
+    .env.local is loaded; without this they would start keyless and fail to read encrypted passwords."""
+    global _fernet, _warned
+    if _fernet is not None:
+        return _fernet
+    key = (os.environ.get("NOLIMITZ_CRED_KEY") or "").strip()
+    if not key:
+        try:
+            from dotenv import dotenv_values
+            key = (dotenv_values(".env.local").get("NOLIMITZ_CRED_KEY") or "").strip()
+        except Exception:
+            key = ""
+    if key and Fernet is not None:
+        try:
+            _fernet = Fernet(key.encode())
+            return _fernet
+        except Exception as e:
+            if not _warned:
+                logger.error("NOLIMITZ_CRED_KEY is set but invalid (%s) — credentials will NOT be encrypted", e)
+    elif key and not _warned:
+        logger.warning("NOLIMITZ_CRED_KEY is set but 'cryptography' is not installed — run: pip install cryptography")
+    elif not _warned:
+        logger.warning("NOLIMITZ_CRED_KEY not set — MT5 passwords stored in PLAINTEXT. Set the key on API + "
+                       "workers to enable encryption at rest.")
+    _warned = True
+    return None
+
+
+_load_key()
 
 
 def encryption_enabled() -> bool:
-    return _fernet is not None
+    return _load_key() is not None
 
 
 def encrypt_secret(plain: str) -> str:
@@ -69,10 +86,11 @@ def encrypt_secret(plain: str) -> str:
         return plain
     if plain.startswith(_PREFIX):        # already encrypted
         return plain
-    if _fernet is None:                  # no key -> store as-is (legacy mode)
+    f = _load_key()
+    if f is None:                        # no key -> store as-is (legacy mode)
         return plain
     try:
-        return _PREFIX + _fernet.encrypt(plain.encode("utf-8")).decode("ascii")
+        return _PREFIX + f.encrypt(plain.encode("utf-8")).decode("ascii")
     except Exception as e:
         logger.error("encrypt_secret failed (%s) — storing plaintext", e)
         return plain
@@ -84,13 +102,14 @@ def decrypt_secret(stored: str) -> str:
         return stored
     if not stored.startswith(_PREFIX):   # legacy plaintext row
         return stored
-    if _fernet is None:
+    f = _load_key()
+    if f is None:
         logger.error("Encrypted credential found but NOLIMITZ_CRED_KEY is "
                      "missing/invalid on this machine — login will fail. "
                      "Set the same key used by the API.")
         return stored
     try:
-        return _fernet.decrypt(stored[len(_PREFIX):].encode("ascii")).decode("utf-8")
+        return f.decrypt(stored[len(_PREFIX):].encode("ascii")).decode("utf-8")
     except InvalidToken:
         logger.error("decrypt_secret: token invalid (wrong key?) — "
                      "returning stored value")

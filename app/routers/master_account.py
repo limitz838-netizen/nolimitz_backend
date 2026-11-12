@@ -54,6 +54,18 @@ from app.database import get_db
 from app.models import Admin, MasterAccount
 from app.routers.admin import get_current_approved_admin
 
+# Step 100: master MT5 passwords are encrypted at rest with the same key and format as client passwords
+# ("enc:<fernet>", NOLIMITZ_CRED_KEY). Without the key both helpers pass values through unchanged, and old
+# plaintext rows still work, so nothing breaks while the key is being rolled out.
+try:
+    from app.security_utils import encrypt_secret, decrypt_secret
+except Exception:          # pragma: no cover - module always ships with the app
+    def encrypt_secret(v):
+        return v
+
+    def decrypt_secret(v):
+        return v
+
 router = APIRouter(prefix="/admin/master-account", tags=["Master Account"])
 
 
@@ -162,7 +174,7 @@ def save_master_account(
             admin_id=current_admin.id,
             ea_id=int(ea_id),
             mt_login=str(mt_login),
-            mt_password=str(mt_password),
+            mt_password=encrypt_secret(str(mt_password)),
             mt_server=str(mt_server),
             is_connected=False,
             account_name=None,
@@ -172,7 +184,7 @@ def save_master_account(
     else:
         account.ea_id = int(ea_id)
         account.mt_login = str(mt_login)
-        account.mt_password = str(mt_password)
+        account.mt_password = encrypt_secret(str(mt_password))
         account.mt_server = str(mt_server)
         # Credentials changed, so the previous connection proves nothing.
         account.is_connected = False
@@ -281,7 +293,7 @@ def worker_list_master_accounts(
                 "admin_id": r.admin_id,
                 "ea_id": r.ea_id,
                 "mt_login": r.mt_login,
-                "mt_password": r.mt_password,
+                "mt_password": decrypt_secret(r.mt_password),
                 "mt_server": r.mt_server,
                 "is_connected": bool(r.is_connected),
                 "account_name": r.account_name,

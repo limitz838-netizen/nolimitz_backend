@@ -438,8 +438,29 @@ def _connect_account(login_int: int, password: str, server: str) -> Tuple[bool, 
 # ==============================================================================
 # TRANSIENT HANDLING
 # ==============================================================================
+# STEP97: remember the exact details that just timed out, so a resubmit of the SAME details waits a while.
+RESUBMIT_COOLDOWN_SEC = int(os.environ.get("VERIFY_RESUBMIT_COOLDOWN_SEC", "600"))
+_timeout_sig = {}
+
+
+def _sig(account) -> str:
+    import hashlib
+    raw = f"{account.login}|{(account.server or '').strip().lower()}|{account.password or ''}"
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
+
+
+def _note_timeout(account) -> None:
+    _timeout_sig[str(account.login)] = (_sig(account), time.time())
+
+
+def _recent_timeout(account) -> bool:
+    hit = _timeout_sig.get(str(account.login))
+    return bool(hit) and hit[0] == _sig(account) and time.time() - hit[1] < RESUBMIT_COOLDOWN_SEC
+
+
 def _handle_transient(account: ClientMT5Account, db: Session,
                       login_str: str, reason: str) -> None:
+    _note_timeout(account)   # STEP97
     """
     Record a transient failure. Retries with backoff up to MAX_TRANSIENT_RETRIES,
     then marks the account FAILED (so the queue stops retrying it) with a
@@ -594,6 +615,7 @@ def verify_one_account(account: ClientMT5Account, db: Session) -> bool:
         # ── IPC WEDGE — this account's server keeps crashing the terminal ─────
         # Fail it fast (2 strikes) so it can't keep taking the whole queue down.
         if kind == "ipc_wedge":
+            _note_timeout(account)   # STEP97
             _failure_count[login_str] += 1
             if _failure_count[login_str] >= 2:
                 account.verification_status = "FAILED"
@@ -676,8 +698,7 @@ def get_accounts_to_process(db: Session) -> List[ClientMT5Account]:
             ClientMT5Account.verification_status == "PENDING",
             ClientMT5Account.verification_status.is_(None),
         ),
-        ClientMT5Account.is_verified == False,
-        ClientMT5Account.is_active == True,
+        ClientMT5Account.is_active == True,     # STEP97: verified rows that hit a timeout are retried too
     ).limit(MAX_ACCOUNTS_PER_LOOP).all()
 
     # 3. VERIFIED but stale → periodic balance refresh
@@ -701,8 +722,11 @@ def get_accounts_to_process(db: Session) -> List[ClientMT5Account]:
     for acc in fresh_requests:
         if acc.login in seen_logins:
             continue
-        seen_logins.add(acc.login)
         login_str = str(acc.login)
+        # STEP97: same details that just timed out -> wait out the cooldown instead of tying up the terminal
+        if _recent_timeout(acc):
+            continue
+        seen_logins.add(acc.login)
         _failure_count[login_str] = 0
         _last_attempt[login_str] = 0.0
         queue.append(acc)
