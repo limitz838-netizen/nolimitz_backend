@@ -326,7 +326,6 @@ PS_SESSION_UTC = (1, 21)
 def evaluate_pullback_scalp(h1_closed: List[dict], bias: int) -> Decision:
     d = evaluate(h1_closed, bias, loose=PS_LOOSE_TRIGGER, session=PS_SESSION_UTC)   # STEP33
     d.strategy, d.trail, d.breakeven, d.flip_exit = "pullback_s", False, False, True
-    d.time_exit_h = PS_TIME_EXIT_H                        # step 70: close at market after 4 hours
     if d.atr > 0:
         d.target_mult = max(TP_MIN_POINTS, d.atr) / d.atr
     return d
@@ -334,14 +333,5 @@ def evaluate_pullback_scalp(h1_closed: List[dict], bias: int) -> Decision:
 
 STRATEGIES["pullback_s"] = evaluate_pullback_scalp
 RULES_TEXT["pullback_s"] = ("H4 EMA50/200 bias \u00b7 H1 EMA20 pullback, candle turns with the trend \u00b7 01-21 UTC \u00b7 stop 1.5 ATR \u00b7 "
-                            "take profit max($13 per 0.01 lot, 1 ATR) \u00b7 closes after 4 hours or if the H4 trend flips")
-# Step 70 (13 Nov 2026): 4-HOUR TIME EXIT. Test of the live rule's own entries on FBS XAUUSD M1 (Jan 2024 -
-# Nov 2026, real spreads; gold-trend-rider/desk_research/improve.py): trades that closed within 1-2 H1 bars made
-# +$1,000 per 0.01 lot in total, trades that lingered 4-8 bars lost -$1,000. Closing at market 4 hours after entry
-# if neither the stop nor the target was hit: tuned on 2024-25 (+$211 -> +$229), then 2026 unseen -$348 -> +$385,
-# profit factor 0.93 -> 1.10, max drawdown -$924 -> -$386, 3 of 4 quarters positive; beats random timing with the
-# same exits in 87% of 1,000 runs. On COMEX futures 2026 it only reduced the loss (-$984 -> -$81). Neighbouring
-# values are mixed (3 bars +$148, 5 bars +$16, 6 bars -$450), so treat it as "cut lingering trades", not as a
-# tuned optimum. The worker already applies time_exit_h to live, paper and follower positions (step 23).
-PS_TIME_EXIT_H = 4.0
-STRATEGY_FLAGS["pullback_s"] = dict(be=False, trail=False, flip=True, time_exit_h=PS_TIME_EXIT_H)
+                            "take profit max($13 per 0.01 lot, 1 ATR) \u00b7 closes if the H4 trend flips")
+STRATEGY_FLAGS["pullback_s"] = dict(be=False, trail=False, flip=True, time_exit_h=None)

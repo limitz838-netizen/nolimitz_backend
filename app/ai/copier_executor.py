@@ -707,10 +707,6 @@ DESK_WARN_PCT = float(os.environ.get("DESK_WARN_PCT", "10"))
 DESK_RISK_PCT = float(os.environ.get("DESK_RISK_PCT", "5"))
 DESK_SMALL_MAX_PCT = float(os.environ.get("DESK_SMALL_MAX_PCT", "10"))
 DESK_DAY_STOP_PCT = float(os.environ.get("DESK_DAY_STOP_PCT", "10"))
-# Step 70 (13 Nov 2026): at most DESK_MAX_COPIES copies of one Desk signal per account, whatever the risk mode
-# says (normal 1 / medium 3 / aggressive 5). The gold rule's edge is thin (profit factor ~1.1 after the 4-hour
-# exit), so every extra copy mostly multiplies spread cost. Raise it once the live desk_trades record earns it.
-DESK_MAX_COPIES = int(os.environ.get("DESK_MAX_COPIES", "2"))
 
 
 def _desk_levels(row, broker_symbol):
@@ -913,7 +909,6 @@ def _handle_open(db: Session, row: TradeExecution, broker_symbol: str,
     wanted = min(per_signal, slots)
     desk_note = ""
     if desk is not None:
-        wanted = min(wanted, max(1, DESK_MAX_COPIES))                                           # step 70
         allowed, desk_note, lot, wanted = _desk_size(broker_symbol, row.action, lot, sl, wanted)  # STEP40
         if not allowed:
             return "skipped", None, desk_note
