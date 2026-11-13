@@ -1,0 +1,29 @@
+//@version=6
+// Gold Trend Rider — strategy version, so you can check the numbers in TradingView's
+// Strategy Tester. Same rules as gold_trend_rider.pine: orders are placed on a bar's
+// close and fill at the next bar's open. 0.03% commission per side, 100% of equity, no leverage.
+strategy("Gold Trend Rider — Backtest", shorttitle = "GTR-BT", overlay = true,
+     initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100,
+     commission_type = strategy.commission.percent, commission_value = 0.03,
+     process_orders_on_close = false)
+
+fastLen     = input.int(50,  "Fast EMA", minval = 1)
+slowLen     = input.int(200, "Slow EMA", minval = 2)
+allowShorts = input.bool(false, "Allow shorts")
+
+fast = ta.ema(close, fastLen)
+slow = ta.ema(close, slowLen)
+warm = bar_index >= slowLen
+
+plot(fast, "Fast EMA", color.orange, 2)
+plot(slow, "Slow EMA", color.gray, 2)
+
+if warm
+    if fast > slow
+        strategy.close("Short", comment = "COVER")
+        if strategy.position_size <= 0
+            strategy.entry("Long", strategy.long, comment = "BUY")
+    else if fast < slow
+        strategy.close("Long", comment = "EXIT")
+        if allowShorts and strategy.position_size >= 0
+            strategy.entry("Short", strategy.short, comment = "SELL")
